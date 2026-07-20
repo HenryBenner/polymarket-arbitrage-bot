@@ -1,0 +1,27 @@
+{
+  "name": "polymarket-reverse-arbitrage-bot",
+  "version": "2.0.0",
+  "description": "Polymarket reverse bot — buys cheap 7-10c reversal tokens on 15m BTC/ETH markets",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "test": "tsx --test tests/*.test.ts",
+    "audit": "npm audit --audit-level=high",
+    "check": "npm run build && npm test && npm run audit"
+  },
+  "dependencies": {
+    "@polymarket/clob-client-v2": "1.0.8",
+    "dotenv": "16.6.1",
+    "viem": "2.55.2"
+  },
+  "devDependencies": {
+    "@types/node": "22.16.5",
+    "tsx": "4.20.3",
+    "typescript": "5.8.3"
+  },
+  "overrides": {
+    "ws": "8.21.0"
+  }
+}

@@ -1,6 +1,16 @@
 export type TradeSide = "BUY" | "SELL";
-export type StrategyMode = "reverse" | "odahoa_ladder";
+export type StrategyMode =
+  | "reverse"
+  | "odahoa_ladder"
+  | "odahoa_ladder_2"
+  | "odahoa_static_maker"
+  | "ladder_v5";
 export type ExecutionMode = "dry_run" | "paper" | "live";
+export type LadderPreset = "odahoa_v1";
+export type PairLockOrderRole =
+  | "opening"
+  | "completion_maker"
+  | "completion_taker";
 
 export interface GammaMarket {
   id?: string;
@@ -45,7 +55,7 @@ export interface TokenBook {
 }
 
 export interface TradeOpportunity {
-  kind: "cheap" | "expensive";
+  kind: "cheap" | "expensive" | "maker";
   event: UpDownEvent;
   token: TokenBook;
   price: number;
@@ -56,10 +66,15 @@ export interface TradeOpportunity {
   strategyMode?: StrategyMode;
   phaseId?: string;
   pairId?: string;
+  orderPolicy?: "gtc" | "post_only" | "fak";
+  pairLockRole?: PairLockOrderRole;
+  pairLockSourceFillId?: string;
+  pairLockEntryPrice?: number;
 }
 
 export interface OrderResult {
   dryRun: boolean;
+  accepted?: boolean;
   tokenId: string;
   side: TradeSide;
   price: number;
@@ -124,6 +139,10 @@ export interface PaperOrder {
   status: PaperOrderStatus;
   phaseId?: string;
   pairId?: string;
+  orderPolicy?: "gtc" | "post_only" | "fak";
+  pairLockRole?: PairLockOrderRole;
+  pairLockSourceFillId?: string;
+  pairLockEntryPrice?: number;
   createdAt: string;
   submittedMinutesLeft?: number;
 }
@@ -137,6 +156,8 @@ export interface PaperFill {
   price: number;
   size: number;
   fee: number;
+  makerFeeEquivalent?: number;
+  estimatedMakerRebate?: number;
   liquidity: "taker" | "maker";
   timestamp: string;
 }
@@ -156,14 +177,38 @@ export interface PaperSettlement {
   payout: number;
   totalCost: number;
   totalFees: number;
+  estimatedMakerRebate?: number;
+  adjustedPnl?: number;
   realizedPnl: number;
   settledAt: string;
+}
+
+export interface MarketExecutionSnapshot {
+  marketSlug: string;
+  orders: readonly PaperOrder[];
+  openOrders: readonly PaperOrder[];
+  fills: readonly PaperFill[];
+  positions: readonly PaperPosition[];
+  books: readonly TokenBook[];
+  capitalUsed: number;
+  openCommitted: number;
+  capitalCommitted: number;
+  availableCash: number;
+  totalFees: number;
+  estimatedMakerRebate: number;
+  takerFeeRate: number;
+  takerFeeExponent: number;
+  settledPnl: number | null;
 }
 
 export interface OrderExecutor {
   init(): Promise<void>;
   placeBuy(opportunity: TradeOpportunity): Promise<OrderResult>;
   observeMarket?(event: UpDownEvent, books: TokenBook[]): Promise<void>;
+  getMarketExecutionSnapshot?(
+    marketSlug: string,
+  ): Readonly<MarketExecutionSnapshot> | null;
   reportMarket?(marketSlug: string): void;
+  cancelOrders?(orderIds: string[]): Promise<void>;
   close?(): Promise<void>;
 }

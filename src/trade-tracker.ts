@@ -4,7 +4,7 @@ export class TradeTracker {
   makeKey(
     eventSlug: string,
     outcome: string,
-    kind: "cheap" | "expensive",
+    kind: "cheap" | "expensive" | "maker",
     price: number,
   ): string {
     return `${eventSlug}:${outcome}:${kind}-${price}`;

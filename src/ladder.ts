@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { BotConfig } from "./config.js";
 import type {
+  LadderPreset,
   LadderPhase,
   LadderPhaseLock,
   TokenBook,
@@ -51,6 +52,10 @@ export const ODAHOA_V1_PHASES: readonly LadderPhase[] = [
   },
 ] as const;
 
+export function ladderPhases(preset: LadderPreset): readonly LadderPhase[] {
+  return ODAHOA_V1_PHASES;
+}
+
 interface LadderTrackerState {
   version: 1;
   locks: Record<string, LadderPhaseLock>;
@@ -76,7 +81,9 @@ function cents(price: number): number {
 }
 
 function hundredths(shares: number): number {
-  return Math.ceil((shares * 100 - Number.EPSILON) / SHARE_STEP_HUNDREDTHS);
+  // One-billionth is far below the exchange share step but large enough to
+  // absorb binary floating-point noise from a value already rounded to 0.01.
+  return Math.ceil((shares * 100 - 1e-9) / SHARE_STEP_HUNDREDTHS);
 }
 
 export function minimumShares(
@@ -119,8 +126,9 @@ export function pairedShares(
 export function projectedLadderCapital(
   scale: number,
   minimumSharesByPrice: ReadonlyMap<number, number> = new Map(),
+  preset: LadderPreset = "odahoa_v1",
 ): number {
-  const totalCents = ODAHOA_V1_PHASES.flatMap((phase) => phase.rungs).reduce(
+  const totalCents = ladderPhases(preset).flatMap((phase) => phase.rungs).reduce(
     (sum, rung) => {
       const shares = pairedShares(
         rung.lowPrice,
@@ -139,11 +147,14 @@ export function projectedLadderCapital(
 export function ladderPhaseAt(
   event: UpDownEvent,
   nowSeconds = Date.now() / 1000,
+  preset: LadderPreset = "odahoa_v1",
 ): LadderPhase | null {
   const minutesLeft = (event.windowEnd - nowSeconds) / 60;
+  const phases = ladderPhases(preset);
   return (
-    ODAHOA_V1_PHASES.find((phase) => {
-      const isFinalPhase = phase.id === "2-0";
+    phases.find((phase, index) => {
+      const isFinalPhase =
+        index === phases.length - 1 && phase.minutesLeftMin === 0;
       const belowUpperBoundary = minutesLeft <= phase.minutesLeftMax;
       const aboveLowerBoundary = isFinalPhase
         ? minutesLeft >= phase.minutesLeftMin
@@ -159,8 +170,11 @@ export class LadderTracker {
   private readonly blockedMarkets = new Set<string>();
   private readonly statePath: string;
 
-  constructor(stateDirectory: string) {
-    this.statePath = join(stateDirectory, "ladder-state.json");
+  constructor(
+    stateDirectory: string,
+    stateFileName = "ladder-state.json",
+  ) {
+    this.statePath = join(stateDirectory, stateFileName);
   }
 
   async init(): Promise<void> {
@@ -282,7 +296,7 @@ export async function findLadderOpportunities(
   books: TokenBook[],
   nowSeconds = Date.now() / 1000,
 ): Promise<TradeOpportunity[]> {
-  const phase = ladderPhaseAt(event, nowSeconds);
+  const phase = ladderPhaseAt(event, nowSeconds, config.ladderPreset);
   if (!phase) return [];
 
   const lock = await tracker.lockPhase(event, phase, books);
@@ -294,29 +308,40 @@ export async function findLadderOpportunities(
 
   const opportunities: TradeOpportunity[] = [];
   for (const rung of phase.rungs) {
-    const size = pairedShares(
+    const cheapSize = pairedShares(
       rung.lowPrice,
       rung.highPrice,
       cheap.minOrderSize,
       favorite.minOrderSize,
       config.ladderSizeScale,
     );
+    const favoriteSize = cheapSize;
     if (
-      size * rung.lowPrice + 1e-9 < 1 ||
-      size * rung.highPrice + 1e-9 < 1 ||
-      size + 1e-9 < cheap.minOrderSize ||
-      size + 1e-9 < favorite.minOrderSize
+      cheapSize * rung.lowPrice + 1e-9 < 1 ||
+      favoriteSize * rung.highPrice + 1e-9 < 1 ||
+      cheapSize + 1e-9 < cheap.minOrderSize ||
+      favoriteSize + 1e-9 < favorite.minOrderSize
     ) {
       continue;
     }
 
     const pairId = `${rung.lowPrice.toFixed(2)}-${rung.highPrice.toFixed(2)}`;
     const definitions = [
-      { token: cheap, price: rung.lowPrice, kind: "cheap" as const },
-      { token: favorite, price: rung.highPrice, kind: "expensive" as const },
+      {
+        token: cheap,
+        price: rung.lowPrice,
+        size: cheapSize,
+        kind: "cheap" as const,
+      },
+      {
+        token: favorite,
+        price: rung.highPrice,
+        size: favoriteSize,
+        kind: "expensive" as const,
+      },
     ];
 
-    for (const { token, price, kind } of definitions) {
+    for (const { token, price, size, kind } of definitions) {
       const tradeKey = tracker.makeKey(
         event.slug,
         phase.id,

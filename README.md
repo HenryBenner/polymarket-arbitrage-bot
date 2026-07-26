@@ -292,8 +292,8 @@ sides of each pair valid:
 ceilTo0.01(max(CLOB minimum shares, 1.00 / price))
 ```
 
-The maximum if every scale-1 pair fills at its limit is approximately
-`$56.60` before fees. This is capital used, not expected profit. Since each
+The maximum if every scale-1 pair fills at its limit is approximately `$56.60`
+before fees. This is capital used, not expected profit. Since each
 pair totals exactly `$1.00`, a fully filled pair returns principal before fees;
 profit is not guaranteed.
 
@@ -301,7 +301,132 @@ profit is not guaranteed.
 to displayed depth, tracks same-price queue ahead for resting fills, charges
 taker fees on crossing fills, persists orders/fills/balances, and listens for
 market resolution. Cycle summaries report committed/used capital, fill status,
-outcome inventory, fees, payout shape, and settled P/L.
+outcome inventory, fees, estimated maker rebates, payout shape, and settled
+P/L.
+
+### Ladder V5 paper candidate
+
+`STRATEGY_MODE=ladder_v5` is the isolated forward-test candidate produced by
+the 179-session audit. It does not change V1, pair-lock, static-maker, or
+reverse mode.
+
+| Guard | V5 behavior |
+|---|---|
+| Entry window | More than 2 and at most 5 minutes left |
+| Active rungs | 10 cents/90 cents and 15 cents/85 cents only |
+| Filled-share imbalance | At most 70 shares |
+| Deficient-side pair cost | At most `$0.98`, including worst-case taker fee |
+| Order style | Ordinary GTC; taker fills remain allowed |
+| Scale | Paper validation is restricted to 1-6 |
+
+Filled positions are the only hedge credit. An opposite resting order never
+reduces measured imbalance. Resting V5 orders are counted as additional
+same-side risk, cancelled if later fills make them violate the imbalance or
+pair-cost limit, and cancelled when the 5-2 window ends. The planner refreshes
+the paper ledger after every submitted order instead of approving a batch from
+one stale inventory snapshot.
+
+V5 uses separate files under `PAPER_STATE_PATH`, including
+`ladder-v5-state.json`. Use a new directory; do not point it at an earlier
+paper run. The supplied profile starts at scale 4 so both selected rungs fit
+under 70 shares without being truncated.
+
+For Command Prompt:
+
+```bat
+set "DOTENV_CONFIG_PATH=.env.ladder-v5-paper.example"
+npm.cmd start
+```
+
+The dedicated profile writes to `./data/paper-ladder-v5` with a `$2,000`
+starting paper balance. This is a forward test, not evidence that the
+post-hoc result will repeat. Keep it paper-only until it has a meaningful
+out-of-sample settlement count.
+
+### Odahoa pair-lock V2
+
+`STRATEGY_MODE=odahoa_ladder_2` keeps V1's BTC market selection, phases,
+low-price rungs, sizing, and exposure safeguards. Its openings are post-only
+GTC bids on the phase's cheap outcome. A maker fill creates a priced inventory
+lot; the strategy then:
+
+- naturally pairs profitable opposite opening lots, highest entry cost first;
+- reserves at most 10% of eligible fills at 20 cents or less on the first
+  eligible outcome only;
+- posts a post-only completion bid at the highest profitable passive tick;
+- cancels or resizes stale completion orders as fills and phases change; and
+- uses a limit-priced FAK only for visible depth whose blended pair cost,
+  including the taker fee, is at most `PAIR_LOCK_MAX_COST`.
+
+Maker rebates are excluded from pair approval. Paper and live use the same
+planner and the same post-only, cancellation, and FAK semantics. Live mode
+reconciles the bot's order IDs against authenticated CLOB open orders and
+trades, and persists that mapping in
+`PAPER_STATE_PATH/live-execution-state.json` for restart recovery.
+
+The three pair-lock settings are:
+
+```env
+PAIR_LOCK_MAX_COST=0.985
+PAIR_LOCK_RESIDUAL_FRACTION=0.10
+PAIR_LOCK_RESIDUAL_MAX_PRICE=0.20
+```
+
+For Command Prompt, run the paper implementation with:
+
+```bat
+set STRATEGY_MODE=odahoa_ladder_2
+set EXECUTION_MODE=paper
+npm start
+```
+
+Live mode uses the same strategy and also requires the existing wallet
+configuration, exposure cap, and both live acknowledgements:
+
+```bat
+set STRATEGY_MODE=odahoa_ladder_2
+set EXECUTION_MODE=live
+set LIVE_TRADING_ACK=I_UNDERSTAND_REAL_MONEY_IS_AT_RISK
+set LADDER_LIVE_ACK=I_UNDERSTAND_LADDER_MODE_CAN_LOSE_REAL_MONEY
+npm start
+```
+
+### Static maker A/B paper mode
+
+`STRATEGY_MODE=odahoa_static_maker` is a paper-only candidate based on the
+observed maker-heavy, two-sided behavior. During the first two minutes of each
+BTC window it places 90-share BUY orders at 45, 40, 35, 30, 25, 20, 15, 10,
+and 5 cents on both outcomes. A level is eligible only while it is below both
+current asks. Orders are ordinary GTC limits, so a book move between the
+eligibility check and submission can still produce a taker fill.
+
+The complete candidate ladder commits `$405`, below
+`STATIC_MAKER_MAX_USDC_PER_MARKET=500`. It never classifies an underdog,
+reprices, replenishes, or submits after 13 minutes remain.
+
+Run V1 and the candidate in separate PowerShell terminals so both observe the
+same windows:
+
+```powershell
+$env:DOTENV_CONFIG_PATH=".env.ladder-paper.example"
+npm start
+```
+
+```powershell
+$env:DOTENV_CONFIG_PATH=".env.paper-ab-static-maker.example"
+npm start
+```
+
+After at least 100 common settlements, compare the isolated ledgers:
+
+```powershell
+npm run compare:strategies -- ./data/paper-odahoa-v1 ./data/ab-static-maker
+```
+
+The comparison ranks the strategies by estimated rebate-adjusted settled P/L
+and also reports capital, ROI, payoff ratio, maker/taker execution, two-sided
+participation, drawdown, the worst market, and a paired bootstrap interval.
+The rebate is an estimate; actual wallet payouts are authoritative.
 
 Before considering live ladder mode, observe at least three complete BTC
 scale-1 paper cycles and inspect:
@@ -350,6 +475,7 @@ npm start      # run bot
 npm run dev    # run with hot reload
 npm run build  # compile TypeScript
 npm test       # regression, ladder, paper-fill, and safety tests
+npm run compare:strategies -- <baseline-dir> <candidate-dir>
 npm run check  # build, tests, and high-severity dependency audit
 ```
 

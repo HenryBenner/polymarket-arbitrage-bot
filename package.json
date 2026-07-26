@@ -8,6 +8,7 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "test": "tsx --test tests/*.test.ts",
+    "compare:strategies": "tsx src/strategy-comparison.ts",
     "audit": "npm audit --audit-level=high",
     "check": "npm run build && npm test && npm run audit"
   },

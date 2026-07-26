@@ -13,6 +13,7 @@ import { log } from "./logger.js";
 import { MarketStream, type MarketStreamEvent } from "./market-stream.js";
 import type {
   GammaMarket,
+  MarketExecutionSnapshot,
   OrderBookLevel,
   OrderExecutor,
   OrderResult,
@@ -53,7 +54,7 @@ interface PaperTraderOptions {
   stream?: Pick<MarketStream, "subscribe" | "close">;
   feeLoader?: (
     conditionId: string,
-  ) => Promise<{ rate: number; exponent: number }>;
+  ) => Promise<{ rate: number; exponent: number; rebateRate?: number }>;
   settlementLoader?: (
     event: UpDownEvent,
   ) => Promise<{ winningTokenId: string } | null>;
@@ -67,6 +68,13 @@ function round(value: number, places = 8): number {
 function parseNumber(value: unknown): number | null {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeRebateRate(value: number | undefined, fallback: number): number {
+  if (value === undefined || !Number.isFinite(value)) return fallback;
+  if (value > 100 && value <= 10_000) return value / 10_000;
+  if (value > 1 && value <= 100) return value / 100;
+  return Math.min(1, Math.max(0, value));
 }
 
 function parseLevels(value: unknown, ascending: boolean): OrderBookLevel[] {
@@ -110,7 +118,7 @@ export class PaperTrader implements OrderExecutor {
   private readonly seenEvents = new Set<string>();
   private readonly feeConfigs = new Map<
     string,
-    { rate: number; exponent: number }
+    { rate: number; exponent: number; rebateRate: number }
   >();
   private persistenceQueue: Promise<void> = Promise.resolve();
 
@@ -186,6 +194,7 @@ export class PaperTrader implements OrderExecutor {
     if (existing) {
       return {
         dryRun: true,
+        accepted: true,
         tokenId: existing.tokenId,
         side: "BUY",
         price: existing.limitPrice,
@@ -204,6 +213,27 @@ export class PaperTrader implements OrderExecutor {
     }
 
     const context = this.contexts.get(opportunity.event.slug);
+    const currentBook = context?.books.get(opportunity.token.tokenId);
+    if (
+      opportunity.orderPolicy === "post_only" &&
+      currentBook?.bestAsk !== null &&
+      currentBook?.bestAsk !== undefined &&
+      opportunity.price + 1e-9 >= currentBook.bestAsk
+    ) {
+      return {
+        dryRun: true,
+        accepted: false,
+        tokenId: opportunity.token.tokenId,
+        side: "BUY",
+        price: opportunity.price,
+        size: opportunity.size,
+        response: {
+          paper: true,
+          status: "rejected",
+          reason: "post_only_would_cross",
+        },
+      };
+    }
     const queueAhead = (context?.books.get(opportunity.token.tokenId)?.bids ?? [])
       .filter((level) => Math.abs(level.price - opportunity.price) < 1e-9)
       .reduce((sum, level) => sum + level.size, 0);
@@ -223,6 +253,10 @@ export class PaperTrader implements OrderExecutor {
       status: "open",
       phaseId: opportunity.phaseId,
       pairId: opportunity.pairId,
+      orderPolicy: opportunity.orderPolicy ?? "gtc",
+      pairLockRole: opportunity.pairLockRole,
+      pairLockSourceFillId: opportunity.pairLockSourceFillId,
+      pairLockEntryPrice: opportunity.pairLockEntryPrice,
       createdAt: now,
       submittedMinutesLeft:
         (opportunity.event.windowEnd - Date.now() / 1000) / 60,
@@ -230,31 +264,43 @@ export class PaperTrader implements OrderExecutor {
     this.state.orders.push(order);
     await this.record("order_submitted", order);
 
-    const asks =
-      context?.liquidity.get(opportunity.token.tokenId) ??
-      opportunity.token.asks.map((level) => ({ ...level }));
-    for (const level of asks) {
-      if (order.remainingSize <= 1e-8 || level.price > order.limitPrice + 1e-9) {
-        break;
+    if (opportunity.orderPolicy !== "post_only") {
+      const asks =
+        context?.liquidity.get(opportunity.token.tokenId) ??
+        opportunity.token.asks.map((level) => ({ ...level }));
+      for (const level of asks) {
+        if (
+          order.remainingSize <= 1e-8 ||
+          level.price > order.limitPrice + 1e-9
+        ) {
+          break;
+        }
+        const fillSize = Math.min(order.remainingSize, level.size);
+        if (fillSize <= 1e-8) continue;
+        await this.applyFill(
+          order,
+          level.price,
+          fillSize,
+          "taker",
+          this.feeConfig(opportunity.event.market),
+          now,
+        );
+        level.size = round(level.size - fillSize);
       }
-      const fillSize = Math.min(order.remainingSize, level.size);
-      if (fillSize <= 1e-8) continue;
-      await this.applyFill(
-        order,
-        level.price,
-        fillSize,
-        "taker",
-        this.takerFeeRate(opportunity.event.market),
-        now,
-      );
-      level.size = round(level.size - fillSize);
+      if (context) context.liquidity.set(order.tokenId, asks);
     }
-    if (context) context.liquidity.set(order.tokenId, asks);
+    if (
+      opportunity.orderPolicy === "fak" &&
+      order.remainingSize > 1e-8
+    ) {
+      order.status = "cancelled";
+    }
     await this.persist();
     this.reportMarket(order.marketSlug);
 
     return {
       dryRun: true,
+      accepted: true,
       tokenId: order.tokenId,
       side: "BUY",
       price: order.limitPrice,
@@ -267,6 +313,21 @@ export class PaperTrader implements OrderExecutor {
         queueAhead: round(order.queueAhead),
       },
     };
+  }
+
+  async cancelOrders(orderIds: string[]): Promise<void> {
+    if (orderIds.length === 0) return;
+    const targets = new Set(orderIds);
+    for (const order of this.state.orders) {
+      if (
+        targets.has(order.id) &&
+        (order.status === "open" || order.status === "partial")
+      ) {
+        order.status = "cancelled";
+        await this.record("order_cancelled", order);
+      }
+    }
+    await this.persist();
   }
 
   reportMarket(marketSlug: string): void {
@@ -304,7 +365,35 @@ export class PaperTrader implements OrderExecutor {
       (sum, order) => sum + order.limitPrice * order.originalSize,
       0,
     );
-
+    const outcomeValues = [...outcomeTotals.entries()];
+    const conservativeMatchedCost = (outcome: string, sharesToMatch: number) => {
+      let remaining = sharesToMatch;
+      let cost = 0;
+      const lots = fills
+        .filter((fill) => fill.outcome === outcome && fill.size > 0)
+        .map((fill) => ({
+          size: fill.size,
+          unitCost: (fill.price * fill.size + fill.fee) / fill.size,
+        }))
+        .sort((left, right) => right.unitCost - left.unitCost);
+      for (const lot of lots) {
+        if (remaining <= 1e-8) break;
+        const used = Math.min(lot.size, remaining);
+        cost += used * lot.unitCost;
+        remaining -= used;
+      }
+      return remaining <= 1e-8 ? cost : null;
+    };
+    const matchedCosts = outcomeValues
+      .slice(0, 2)
+      .map(([outcome]) => conservativeMatchedCost(outcome, guaranteedPayout));
+    const effectivePairCost =
+      guaranteedPayout > 0 &&
+      matchedCosts.length === 2 &&
+      matchedCosts.every((value) => value !== null)
+        ? matchedCosts.reduce((sum, value) => sum + (value ?? 0), 0) /
+          guaranteedPayout
+        : null;
     log("Paper cycle status", {
       market: marketSlug,
       ordersSubmitted: orders.length,
@@ -325,12 +414,41 @@ export class PaperTrader implements OrderExecutor {
         fills.reduce((sum, fill) => sum + fill.fee, 0),
         6,
       ),
+      makerFeeEquivalent: round(
+        fills.reduce(
+          (sum, fill) => sum + (fill.makerFeeEquivalent ?? 0),
+          0,
+        ),
+        6,
+      ),
+      estimatedMakerRebate: round(
+        fills.reduce(
+          (sum, fill) => sum + (fill.estimatedMakerRebate ?? 0),
+          0,
+        ),
+        6,
+      ),
+      matchedShares: round(guaranteedPayout, 4),
+      lockedPayout: round(guaranteedPayout, 4),
+      effectivePairedCost:
+        effectivePairCost === null ? null : round(effectivePairCost, 6),
+      lockedEdgePerShare:
+        effectivePairCost === null ? null : round(1 - effectivePairCost, 6),
+      lockedEdgeUsdc:
+        effectivePairCost === null
+          ? null
+          : round(guaranteedPayout * (1 - effectivePairCost), 4),
       settledPnl:
         this.state.settlements.find(
           (settlement) => settlement.marketSlug === marketSlug,
         )?.realizedPnl ?? null,
       profileComparison: {
-        presetPriceLevels: "odahoa_v1 public-fill approximation",
+        presetPriceLevels:
+          this.config.strategyMode === "odahoa_static_maker"
+            ? "odahoa_static_maker"
+            : this.config.strategyMode === "ladder_v5"
+              ? "ladder_v5 late 10/90 + 15/85"
+              : `${this.config.ladderPreset} public-fill approximation`,
         firstVisibleFillMinutesLeft:
           fills.length > 0
             ? round(
@@ -354,6 +472,66 @@ export class PaperTrader implements OrderExecutor {
     return structuredClone(this.state);
   }
 
+  getMarketExecutionSnapshot(
+    marketSlug: string,
+  ): Readonly<MarketExecutionSnapshot> | null {
+    const context = this.contexts.get(marketSlug);
+    if (!context) return null;
+    const orders = this.state.orders.filter(
+      (order) => order.marketSlug === marketSlug,
+    );
+    const openOrders = orders.filter(
+      (order) => order.status === "open" || order.status === "partial",
+    );
+    const fills = this.state.fills.filter(
+      (fill) => fill.marketSlug === marketSlug,
+    );
+    const positions = this.state.positions.filter(
+      (position) => position.marketSlug === marketSlug,
+    );
+    const capitalUsed = fills.reduce(
+      (sum, fill) => sum + fill.price * fill.size + fill.fee,
+      0,
+    );
+    const openCommitted = openOrders.reduce(
+      (sum, order) => sum + order.limitPrice * order.remainingSize,
+      0,
+    );
+    const feeConfig = this.feeConfig(context.event.market);
+    const books = [...context.books.values()].map((book) => ({
+      ...book,
+      bids: book.bids.map((level) => ({ ...level })),
+      asks: (context.liquidity.get(book.tokenId) ?? book.asks).map((level) => ({
+        ...level,
+      })),
+    }));
+    return structuredClone({
+      marketSlug,
+      orders,
+      openOrders,
+      fills,
+      positions,
+      books,
+      capitalUsed: round(capitalUsed),
+      openCommitted: round(openCommitted),
+      capitalCommitted: round(capitalUsed + openCommitted),
+      availableCash: this.availableCash(),
+      totalFees: round(fills.reduce((sum, fill) => sum + fill.fee, 0)),
+      estimatedMakerRebate: round(
+        fills.reduce(
+          (sum, fill) => sum + (fill.estimatedMakerRebate ?? 0),
+          0,
+        ),
+      ),
+      takerFeeRate: feeConfig.rate,
+      takerFeeExponent: feeConfig.exponent,
+      settledPnl:
+        this.state.settlements.find(
+          (settlement) => settlement.marketSlug === marketSlug,
+        )?.realizedPnl ?? null,
+    });
+  }
+
   async ingestMarketEvent(event: MarketStreamEvent): Promise<void> {
     await this.handleStreamEvent(event);
   }
@@ -368,9 +546,10 @@ export class PaperTrader implements OrderExecutor {
     return round(this.state.cash - reserved);
   }
 
-  private takerFeeRate(market: GammaMarket): {
+  private feeConfig(market: GammaMarket): {
     rate: number;
     exponent: number;
+    rebateRate: number;
   } {
     const cached = this.feeConfigs.get(market.conditionId);
     if (cached) return cached;
@@ -378,6 +557,10 @@ export class PaperTrader implements OrderExecutor {
     return {
       rate: rawRate > 1 ? rawRate / 10_000 : rawRate,
       exponent: market.feeSchedule?.exponent ?? 1,
+      rebateRate: normalizeRebateRate(
+        market.feeSchedule?.rebateRate,
+        0,
+      ),
     };
   }
 
@@ -386,7 +569,7 @@ export class PaperTrader implements OrderExecutor {
     price: number,
     size: number,
     liquidity: "taker" | "maker",
-    feeConfig: { rate: number; exponent: number },
+    feeConfig: { rate: number; exponent: number; rebateRate: number },
     timestamp: string,
   ): Promise<void> {
     const actualSize = round(Math.min(size, order.remainingSize));
@@ -400,6 +583,19 @@ export class PaperTrader implements OrderExecutor {
             5,
           )
         : 0;
+    const makerFeeEquivalent =
+      liquidity === "maker"
+        ? round(
+            actualSize *
+              feeConfig.rate *
+              Math.pow(price * (1 - price), feeConfig.exponent),
+            5,
+          )
+        : 0;
+    const estimatedMakerRebate =
+      liquidity === "maker"
+        ? round(makerFeeEquivalent * feeConfig.rebateRate, 5)
+        : 0;
     const cost = round(actualSize * price);
     if (cost + fee > this.state.cash + 1e-8) return;
 
@@ -412,6 +608,8 @@ export class PaperTrader implements OrderExecutor {
       price,
       size: actualSize,
       fee,
+      makerFeeEquivalent,
+      estimatedMakerRebate,
       liquidity,
       timestamp,
     };
@@ -551,7 +749,11 @@ export class PaperTrader implements OrderExecutor {
           (order.status === "open" || order.status === "partial") &&
           order.limitPrice + 1e-9 >= price,
       )
-      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+      .sort(
+        (left, right) =>
+          right.limitPrice - left.limitPrice ||
+          left.createdAt.localeCompare(right.createdAt),
+      );
     for (const order of orders) {
       if (remainingTradeSize <= 1e-8) break;
       const queueConsumed = Math.min(order.queueAhead, remainingTradeSize);
@@ -561,10 +763,14 @@ export class PaperTrader implements OrderExecutor {
       const fillSize = Math.min(order.remainingSize, remainingTradeSize);
       await this.applyFill(
         order,
-        price,
+        order.limitPrice,
         fillSize,
         "maker",
-        { rate: 0, exponent: 1 },
+        this.feeConfigs.get(order.conditionId) ?? {
+          rate: 0.07,
+          exponent: 1,
+          rebateRate: 0.2,
+        },
         String(event.timestamp ?? new Date().toISOString()),
       );
       remainingTradeSize = round(remainingTradeSize - fillSize);
@@ -647,10 +853,15 @@ export class PaperTrader implements OrderExecutor {
     if (this.feeConfigs.has(event.market.conditionId)) return;
     try {
       if (this.options.feeLoader) {
-        this.feeConfigs.set(
-          event.market.conditionId,
-          await this.options.feeLoader(event.market.conditionId),
-        );
+        const loaded = await this.options.feeLoader(event.market.conditionId);
+        this.feeConfigs.set(event.market.conditionId, {
+          ...loaded,
+          rebateRate: normalizeRebateRate(
+            loaded.rebateRate ?? event.market.feeSchedule?.rebateRate,
+            event.market.feeSchedule?.rebateRate ??
+              (event.slug.startsWith("btc-updown-15m") ? 0.2 : 0),
+          ),
+        });
         return;
       }
       const details = await this.publicClient.getClobMarketInfo(
@@ -660,12 +871,17 @@ export class PaperTrader implements OrderExecutor {
       this.feeConfigs.set(event.market.conditionId, {
         rate: rawRate > 1 ? rawRate / 10_000 : rawRate,
         exponent: details.fd?.e ?? 1,
+        rebateRate: normalizeRebateRate(
+          event.market.feeSchedule?.rebateRate,
+          event.slug.startsWith("btc-updown-15m") ? 0.2 : 0,
+        ),
       });
     } catch (error) {
       const fallback = event.slug.startsWith("btc-updown-15m") ? 0.07 : 0;
       this.feeConfigs.set(event.market.conditionId, {
         rate: fallback,
         exponent: 1,
+        rebateRate: event.slug.startsWith("btc-updown-15m") ? 0.2 : 0,
       });
       const message = error instanceof Error ? error.message : String(error);
       log("Paper fee lookup failed; using category fallback", {
@@ -701,6 +917,12 @@ export class PaperTrader implements OrderExecutor {
     const totalFees = round(
       marketFills.reduce((sum, fill) => sum + fill.fee, 0),
     );
+    const estimatedMakerRebate = round(
+      marketFills.reduce(
+        (sum, fill) => sum + (fill.estimatedMakerRebate ?? 0),
+        0,
+      ),
+    );
     const winningOutcome =
       winningFills[0]?.outcome ??
       this.contexts
@@ -714,6 +936,10 @@ export class PaperTrader implements OrderExecutor {
       payout,
       totalCost,
       totalFees,
+      estimatedMakerRebate,
+      adjustedPnl: round(
+        payout - totalCost - totalFees + estimatedMakerRebate,
+      ),
       realizedPnl: round(payout - totalCost - totalFees),
       settledAt: new Date().toISOString(),
     };

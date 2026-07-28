@@ -82,7 +82,7 @@ export class ReverseBot {
               : this.config.strategyMode === "ladder_v5"
                 ? "late 10/90 + 15/85 imbalance-capped ladder"
                 : this.config.strategyMode === "ladder_v6"
-                  ? "maker-cheap, fill-driven FOK pair completion"
+                  ? "competitive paired makers with maker/FOK completion"
                   : "early two-sided static maker ladder",
       strategyMode: this.config.strategyMode,
       executionMode: this.config.executionMode,
@@ -113,6 +113,14 @@ export class ReverseBot {
       ladderV6MinNetEdge:
         this.config.strategyMode === "ladder_v6"
           ? this.config.ladderV6MinNetEdge
+          : undefined,
+      ladderV6SafetyBuffer:
+        this.config.strategyMode === "ladder_v6"
+          ? this.config.ladderV6SafetyBuffer
+          : undefined,
+      ladderV6MaxRescueLoss:
+        this.config.strategyMode === "ladder_v6"
+          ? this.config.ladderV6MaxRescueLoss
           : undefined,
       staticMakerShares:
         this.config.strategyMode === "odahoa_static_maker"
@@ -450,7 +458,11 @@ export class ReverseBot {
         slug: event.slug,
         cheapFilledShares: lastPlan?.cheapFilledShares ?? 0,
         hedgedShares: lastPlan?.hedgedShares ?? 0,
+        pairedShares: lastPlan?.pairedShares ?? 0,
         unmatchedCheapShares: lastPlan?.unmatchedCheapShares ?? 0,
+        plannedOpeningBid: lastPlan?.plannedOpeningBid ?? null,
+        observedHedgeAllInPerShare:
+          lastPlan?.observedHedgeAllInPerShare ?? null,
         plannedAllInPairCost: lastPlan?.plannedAllInPairCost ?? null,
         plannedNetEdgePerPair: lastPlan?.plannedNetEdgePerPair ?? null,
       });

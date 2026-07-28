@@ -71,6 +71,10 @@ export interface TradeOpportunity {
   pairLockRole?: PairLockOrderRole;
   pairLockSourceFillId?: string;
   pairLockEntryPrice?: number;
+  referenceTokenId?: string;
+  referenceAllInPrice?: number;
+  plannedAllInPairCost?: number;
+  plannedNetEdgePerPair?: number;
 }
 
 export interface OrderResult {
@@ -144,6 +148,10 @@ export interface PaperOrder {
   pairLockRole?: PairLockOrderRole;
   pairLockSourceFillId?: string;
   pairLockEntryPrice?: number;
+  referenceTokenId?: string;
+  referenceAllInPrice?: number;
+  plannedAllInPairCost?: number;
+  plannedNetEdgePerPair?: number;
   createdAt: string;
   submittedMinutesLeft?: number;
 }

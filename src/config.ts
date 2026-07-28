@@ -74,6 +74,8 @@ export interface BotConfig {
   ladderV5MaxPairCost: number;
   ladderV6MaxUnmatchedShares: number;
   ladderV6MinNetEdge: number;
+  ladderV6SafetyBuffer: number;
+  ladderV6MaxRescueLoss: number;
   paperStartingUsdc: number;
   paperStatePath: string;
 }
@@ -165,6 +167,8 @@ export function loadConfig(): BotConfig {
       40,
     ),
     ladderV6MinNetEdge: envNumber("LADDER_V6_MIN_NET_EDGE", 0.01),
+    ladderV6SafetyBuffer: envNumber("LADDER_V6_SAFETY_BUFFER", 0.01),
+    ladderV6MaxRescueLoss: envNumber("LADDER_V6_MAX_RESCUE_LOSS", 0.02),
     paperStartingUsdc: envNumber("PAPER_STARTING_USDC", 100),
     paperStatePath: envString("PAPER_STATE_PATH", "./data/paper"),
   };
@@ -261,6 +265,24 @@ export function validateTradingConfig(config: BotConfig): void {
   ) {
     throw new Error(
       "LADDER_V6_MIN_NET_EDGE must be greater than 0 and less than 1",
+    );
+  }
+  if (
+    !Number.isFinite(config.ladderV6SafetyBuffer) ||
+    config.ladderV6SafetyBuffer < 0 ||
+    config.ladderV6SafetyBuffer >= 1
+  ) {
+    throw new Error(
+      "LADDER_V6_SAFETY_BUFFER must be at least 0 and less than 1",
+    );
+  }
+  if (
+    !Number.isFinite(config.ladderV6MaxRescueLoss) ||
+    config.ladderV6MaxRescueLoss < 0 ||
+    config.ladderV6MaxRescueLoss >= 1
+  ) {
+    throw new Error(
+      "LADDER_V6_MAX_RESCUE_LOSS must be at least 0 and less than 1",
     );
   }
   if (

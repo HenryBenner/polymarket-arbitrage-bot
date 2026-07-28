@@ -34,6 +34,8 @@ export function testConfig(overrides: Partial<BotConfig> = {}): BotConfig {
     ladderV5MaxPairCost: 0.98,
     ladderV6MaxUnmatchedShares: 40,
     ladderV6MinNetEdge: 0.01,
+    ladderV6SafetyBuffer: 0.01,
+    ladderV6MaxRescueLoss: 0.02,
     paperStartingUsdc: 100,
     paperStatePath: "./data/test-paper",
     ...overrides,

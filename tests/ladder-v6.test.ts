@@ -116,48 +116,99 @@ async function withTracker(
   }
 }
 
-test("ladder_v6 posts only two cheap maker orders with 40 total shares", async () => {
+test("ladder_v6 posts competitive two-sided maker quotes under the pair cap", async () => {
   await withTracker(async (tracker, directory) => {
     const event = testEvent();
-    const plan = await planLadderV6(
+    const books = testBooks(0.4, 0.6);
+    const config = testConfig({
+      strategyMode: "ladder_v6",
+      paperStatePath: directory,
+    });
+    const first = await planLadderV6(
+      config,
+      tracker,
+      event,
+      snapshot(books),
+      event.windowEnd - 4 * 60,
+    );
+    assert.deepEqual(
+      first.opportunities.map((opportunity) => [
+        opportunity.token.outcome,
+        opportunity.price,
+        opportunity.size,
+        opportunity.orderPolicy,
+      ]),
+      [["Up", 0.39, 40, "post_only"]],
+    );
+
+    const up = openingOrder("up-opening", 0.39, 40);
+    const second = await planLadderV6(
+      config,
+      tracker,
+      event,
+      snapshot(books, [up]),
+      event.windowEnd - 4 * 60,
+    );
+    assert.deepEqual(
+      second.opportunities.map((opportunity) => [
+        opportunity.token.outcome,
+        opportunity.price,
+        opportunity.size,
+        opportunity.orderPolicy,
+      ]),
+      [["Down", 0.59, 40, "post_only"]],
+    );
+    assert.equal(second.plannedAllInPairCost, 0.98);
+    assert.ok((second.plannedNetEdgePerPair ?? 0) >= 0.02);
+    assert.equal(
+      second.opportunities[0]?.referenceTokenId,
+      "up-token",
+    );
+  });
+});
+
+test("V6 refuses opening quotes when competitive bids exceed the pair cap", async () => {
+  await withTracker(async (tracker, directory) => {
+    const event = testEvent();
+    const books = testBooks(0.4, 0.6);
+    books[0]!.bestBid = 0.4;
+    books[1]!.bestBid = 0.59;
+    const cancel = await planLadderV6(
       testConfig({
         strategyMode: "ladder_v6",
         paperStatePath: directory,
       }),
       tracker,
       event,
-      snapshot(testBooks(0.4, 0.6)),
+      snapshot(books),
       event.windowEnd - 4 * 60,
     );
-    assert.deepEqual(
-      plan.opportunities.map((opportunity) => [
-        opportunity.token.outcome,
-        opportunity.price,
-        opportunity.size,
-        opportunity.orderPolicy,
-      ]),
-      [
-        ["Up", 0.1, 20, "post_only"],
-        ["Up", 0.15, 20, "post_only"],
-      ],
-    );
-    assert.equal(
-      plan.opportunities.reduce(
-        (sum, opportunity) => sum + opportunity.size,
-        0,
-      ),
-      40,
-    );
+    assert.deepEqual(cancel.opportunities, []);
   });
 });
 
-test("first cheap fill cancels openings and creates an exact profitable FOK hedge", async () => {
+test("opening fill cancels the quote and creates an exact profitable FOK hedge", async () => {
   await withTracker(async (tracker, directory) => {
     const event = testEvent();
     const cheap = openingOrder("cheap-10", 0.1, 20, "filled");
     const other = openingOrder("cheap-15", 0.15);
     const books = testBooks(0.4, 0.88);
     books[1]!.asks = [{ price: 0.88, size: 20 }];
+    const cancel = await planLadderV6(
+      testConfig({
+        strategyMode: "ladder_v6",
+        paperStatePath: directory,
+        ladderV6MinNetEdge: 0.01,
+      }),
+      tracker,
+      event,
+      snapshot(books, [cheap, other], [fill("cheap-fill", cheap)]),
+      event.windowEnd - 4 * 60,
+    );
+    assert.deepEqual(cancel.cancelOrderIds, [other.id]);
+    assert.deepEqual(cancel.opportunities, []);
+
+    other.status = "cancelled";
     const plan = await planLadderV6(
       testConfig({
         strategyMode: "ladder_v6",
@@ -169,7 +220,6 @@ test("first cheap fill cancels openings and creates an exact profitable FOK hedg
       snapshot(books, [cheap, other], [fill("cheap-fill", cheap)]),
       event.windowEnd - 4 * 60,
     );
-    assert.deepEqual(plan.cancelOrderIds, [other.id]);
     const hedge = plan.opportunities[0]!;
     assert.equal(hedge.token.outcome, "Down");
     assert.equal(hedge.orderPolicy, "fok");
@@ -179,7 +229,119 @@ test("first cheap fill cancels openings and creates an exact profitable FOK hedg
   });
 });
 
-test("V6 waits when depth is incomplete or the one-cent edge is unavailable", async () => {
+test("V6 cancels and replaces stale opening quotes", async () => {
+  await withTracker(async (tracker, directory) => {
+    const event = testEvent();
+    const stale = openingOrder("stale", 0.2, 40);
+    const books = testBooks(0.4, 0.72);
+    books[0]!.asks[0]!.size = 40;
+    books[1]!.asks[0]!.size = 40;
+    const config = testConfig({
+      strategyMode: "ladder_v6",
+      paperStatePath: directory,
+    });
+
+    const cancel = await planLadderV6(
+      config,
+      tracker,
+      event,
+      snapshot(books, [stale]),
+      event.windowEnd - 4 * 60,
+    );
+    assert.deepEqual(cancel.cancelOrderIds, [stale.id]);
+    assert.equal(cancel.plannedAllInPairCost, 0.98);
+
+    stale.status = "cancelled";
+    const replace = await planLadderV6(
+      config,
+      tracker,
+      event,
+      snapshot(books, [stale]),
+      event.windowEnd - 4 * 60,
+    );
+    assert.equal(replace.opportunities.length, 1);
+    assert.equal(replace.opportunities[0]?.price, 0.39);
+    assert.equal(replace.opportunities[0]?.size, 40);
+  });
+});
+
+test("V6 posts the highest profitable maker completion when FOK is unavailable", async () => {
+  await withTracker(async (tracker, directory) => {
+    const event = testEvent();
+    const opening = openingOrder("opening", 0.1, 20, "filled");
+    const books = testBooks(0.4, 0.95);
+    books[1]!.asks = [{ price: 0.95, size: 20 }];
+    const plan = await planLadderV6(
+      testConfig({
+        strategyMode: "ladder_v6",
+        paperStatePath: directory,
+      }),
+      tracker,
+      event,
+      snapshot(books, [opening], [fill("opening-fill", opening)]),
+      event.windowEnd - 4 * 60,
+    );
+    assert.equal(plan.opportunities.length, 1);
+    assert.equal(plan.opportunities[0]?.token.outcome, "Down");
+    assert.equal(plan.opportunities[0]?.orderPolicy, "post_only");
+    assert.equal(plan.opportunities[0]?.pairLockRole, "completion_maker");
+    assert.equal(plan.opportunities[0]?.price, 0.89);
+  });
+});
+
+test("V6 preserves an already-correct opposite quote after the first fill", async () => {
+  await withTracker(async (tracker, directory) => {
+    const event = testEvent();
+    const opening = openingOrder("up-opening", 0.39, 40, "filled");
+    const counterpart = openingOrder("down-opening", 0.59, 40);
+    counterpart.tokenId = "down-token";
+    counterpart.outcome = "Down";
+    const plan = await planLadderV6(
+      testConfig({
+        strategyMode: "ladder_v6",
+        paperStatePath: directory,
+      }),
+      tracker,
+      event,
+      snapshot(
+        testBooks(0.4, 0.6),
+        [opening, counterpart],
+        [fill("up-fill", opening)],
+      ),
+      event.windowEnd - 4 * 60,
+    );
+    assert.deepEqual(plan.cancelOrderIds, []);
+    assert.deepEqual(plan.opportunities, []);
+    assert.equal(plan.plannedOpeningBid, 0.59);
+    assert.equal(plan.plannedAllInPairCost, 0.98);
+  });
+});
+
+test("V6 caps an unmatched leg with a small-loss FOK rescue at two minutes", async () => {
+  await withTracker(async (tracker, directory) => {
+    const event = testEvent();
+    const opening = openingOrder("opening", 0.1, 20, "filled");
+    const books = testBooks(0.4, 0.91);
+    books[1]!.asks = [{ price: 0.91, size: 20 }];
+    const plan = await planLadderV6(
+      testConfig({
+        strategyMode: "ladder_v6",
+        paperStatePath: directory,
+        ladderV6MaxRescueLoss: 0.02,
+      }),
+      tracker,
+      event,
+      snapshot(books, [opening], [fill("opening-fill", opening)]),
+      event.windowEnd - 1.9 * 60,
+    );
+    assert.equal(plan.opportunities.length, 1);
+    assert.equal(plan.opportunities[0]?.orderPolicy, "fok");
+    assert.ok((plan.plannedNetEdgePerPair ?? 0) < 0);
+    assert.ok((plan.plannedNetEdgePerPair ?? -1) >= -0.02);
+  });
+});
+
+test("V6 falls back to maker completion when profitable FOK depth is unavailable", async () => {
   await withTracker(async (tracker, directory) => {
     const event = testEvent();
     const cheap = openingOrder("cheap", 0.1, 20, "filled");
@@ -199,7 +361,11 @@ test("V6 waits when depth is incomplete or the one-cent edge is unavailable", as
       snapshot(shallow, [cheap], [cheapFill]),
       event.windowEnd - 4 * 60,
     );
-    assert.deepEqual(noDepth.opportunities, []);
+    assert.equal(noDepth.opportunities[0]?.orderPolicy, "post_only");
+    assert.equal(
+      noDepth.opportunities[0]?.pairLockRole,
+      "completion_maker",
+    );
 
     const expensive = testBooks(0.4, 0.89);
     expensive[1]!.asks = [{ price: 0.89, size: 20 }];
@@ -210,7 +376,11 @@ test("V6 waits when depth is incomplete or the one-cent edge is unavailable", as
       snapshot(expensive, [cheap], [cheapFill]),
       event.windowEnd - 4 * 60,
     );
-    assert.deepEqual(noEdge.opportunities, []);
+    assert.equal(noEdge.opportunities[0]?.orderPolicy, "post_only");
+    assert.equal(
+      noEdge.opportunities[0]?.pairLockRole,
+      "completion_maker",
+    );
   });
 });
 
@@ -250,7 +420,11 @@ test("V6 retries a failed FOK only after relevant depth changes", async () => {
       snapshot(books, [cheap, failed], [cheapFill]),
       event.windowEnd - 4 * 60,
     );
-    assert.deepEqual(unchanged.opportunities, []);
+    assert.equal(unchanged.opportunities[0]?.orderPolicy, "post_only");
+    assert.equal(
+      unchanged.opportunities[0]?.pairLockRole,
+      "completion_maker",
+    );
 
     const changedBooks = structuredClone(books);
     changedBooks[1]!.asks = [

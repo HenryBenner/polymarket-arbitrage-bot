@@ -345,31 +345,43 @@ out-of-sample settlement count.
 
 ### Ladder V6 paper candidate
 
-`STRATEGY_MODE=ladder_v6` replaces V5's simultaneous two-sided orders with a
-fill-driven sequence:
+`STRATEGY_MODE=ladder_v6` is an inventory-controlled, two-sided maker strategy:
 
-1. During the 5-2 minute window, identify and lock the currently cheap
-   outcome.
-2. Post only maker-only GTC bids on that outcome at 10 and 15 cents.
-3. Split the default 40-share unmatched cap across the two rungs, 20 shares
-   each, so even a same-tick fill race cannot exceed the cap.
-4. On the first actual maker fill, cancel every remaining cheap opening.
-5. Recalculate the visible favorite depth, taker fees, and exact all-in pair
-   cost.
-6. Submit one exact-share FOK hedge only when the completed pair retains at
-   least `LADDER_V6_MIN_NET_EDGE` after fees.
-7. If FOK cannot complete, retry only after the relevant displayed depth
-   changes. Cancel everything when two minutes remain.
+1. During the 5-2 minute window, post one competitive post-only quote on each
+   outcome when their combined price is no more than the configured pair cap.
+2. Allocate available price slack across both quotes so they join or improve
+   the current best bids instead of waiting at fixed 10/15-cent rungs.
+3. Limit each side to the configured 40-share cap and stop opening new
+   inventory after the first fill.
+4. Preserve the opposite opening quote when it is already the correct
+   profitable completion order, retaining its queue priority.
+5. If the opposite executable asks can complete the filled inventory with the
+   required edge after fees, submit an exact-share FOK immediately.
+6. Otherwise, post the highest profitable completion-maker price and keep
+   repricing it as the book changes.
+7. At two minutes, cancel resting quotes and permit an exact-share FOK rescue
+   only when it caps the locked loss at `LADDER_V6_MAX_RESCUE_LOSS` or less.
 
-The default balanced edge is one cent:
+The opening maker-pair cap is:
+
+```text
+$1 - required net edge - safety buffer
+```
+
+The default profile targets two cents of maker-pair edge, requires at least
+one cent on taker completions, and caps a cutoff rescue at two cents:
 
 ```env
 LADDER_V6_MAX_UNMATCHED_SHARES=40
 LADDER_V6_MIN_NET_EDGE=0.01
+LADDER_V6_SAFETY_BUFFER=0.01
+LADDER_V6_MAX_RESCUE_LOSS=0.02
 ```
 
 Set the edge to `0.02` for the conservative experiment or `0.005` for the
-aggressive experiment, always using a separate `PAPER_STATE_PATH`.
+aggressive experiment. A larger safety buffer increases locked maker-pair
+profit but reduces quote competitiveness. Always use a separate
+`PAPER_STATE_PATH`.
 
 V6 is paper-only. Its paper executor uses the market WebSocket to wake the
 planner immediately after simulated maker fills and relevant book changes;

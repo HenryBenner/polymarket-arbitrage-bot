@@ -175,6 +175,8 @@ test("ladder_v6 is paper-only with a 40-share cap and positive edge", () => {
     executionMode: "paper",
     ladderV6MaxUnmatchedShares: 40,
     ladderV6MinNetEdge: 0.01,
+    ladderV6SafetyBuffer: 0.01,
+    ladderV6MaxRescueLoss: 0.02,
   });
   assert.doesNotThrow(() => validateTradingConfig(config));
   assert.throws(
@@ -185,6 +187,14 @@ test("ladder_v6 is paper-only with a 40-share cap and positive edge", () => {
         dryRun: false,
       }),
     /paper-only/,
+  );
+  assert.throws(
+    () => validateTradingConfig({ ...config, ladderV6SafetyBuffer: -0.01 }),
+    /LADDER_V6_SAFETY_BUFFER/,
+  );
+  assert.throws(
+    () => validateTradingConfig({ ...config, ladderV6MaxRescueLoss: -0.01 }),
+    /LADDER_V6_MAX_RESCUE_LOSS/,
   );
   assert.throws(
     () =>

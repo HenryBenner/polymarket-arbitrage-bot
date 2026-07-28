@@ -296,6 +296,10 @@ export class PaperTrader implements OrderExecutor {
       pairLockRole: opportunity.pairLockRole,
       pairLockSourceFillId: opportunity.pairLockSourceFillId,
       pairLockEntryPrice: opportunity.pairLockEntryPrice,
+      referenceTokenId: opportunity.referenceTokenId,
+      referenceAllInPrice: opportunity.referenceAllInPrice,
+      plannedAllInPairCost: opportunity.plannedAllInPairCost,
+      plannedNetEdgePerPair: opportunity.plannedNetEdgePerPair,
       createdAt: now,
       submittedMinutesLeft:
         (opportunity.event.windowEnd - Date.now() / 1000) / 60,
@@ -486,7 +490,7 @@ export class PaperTrader implements OrderExecutor {
             : this.config.strategyMode === "ladder_v5"
               ? "ladder_v5 late 10/90 + 15/85"
               : this.config.strategyMode === "ladder_v6"
-                ? "ladder_v6 maker cheap / FOK pair"
+                ? "ladder_v6 paired makers / maker-FOK completion"
                 : `${this.config.ladderPreset} public-fill approximation`,
         firstVisibleFillMinutesLeft:
           fills.length > 0

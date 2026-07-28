@@ -4,7 +4,8 @@ export type StrategyMode =
   | "odahoa_ladder"
   | "odahoa_ladder_2"
   | "odahoa_static_maker"
-  | "ladder_v5";
+  | "ladder_v5"
+  | "ladder_v6";
 export type ExecutionMode = "dry_run" | "paper" | "live";
 export type LadderPreset = "odahoa_v1";
 export type PairLockOrderRole =
@@ -66,7 +67,7 @@ export interface TradeOpportunity {
   strategyMode?: StrategyMode;
   phaseId?: string;
   pairId?: string;
-  orderPolicy?: "gtc" | "post_only" | "fak";
+  orderPolicy?: "gtc" | "post_only" | "fak" | "fok";
   pairLockRole?: PairLockOrderRole;
   pairLockSourceFillId?: string;
   pairLockEntryPrice?: number;
@@ -139,7 +140,7 @@ export interface PaperOrder {
   status: PaperOrderStatus;
   phaseId?: string;
   pairId?: string;
-  orderPolicy?: "gtc" | "post_only" | "fak";
+  orderPolicy?: "gtc" | "post_only" | "fak" | "fok";
   pairLockRole?: PairLockOrderRole;
   pairLockSourceFillId?: string;
   pairLockEntryPrice?: number;
@@ -204,6 +205,9 @@ export interface MarketExecutionSnapshot {
 export interface OrderExecutor {
   init(): Promise<void>;
   placeBuy(opportunity: TradeOpportunity): Promise<OrderResult>;
+  setExecutionWakeHandler?(
+    handler: (marketSlug: string) => void | Promise<void>,
+  ): void;
   observeMarket?(event: UpDownEvent, books: TokenBook[]): Promise<void>;
   getMarketExecutionSnapshot?(
     marketSlug: string,

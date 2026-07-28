@@ -168,3 +168,34 @@ test("ladder_v5 is paper-only and enforces its statistical guardrails", () => {
     /LADDER_V5_MAX_PAIR_COST/,
   );
 });
+
+test("ladder_v6 is paper-only with a 40-share cap and positive edge", () => {
+  const config = testConfig({
+    strategyMode: "ladder_v6",
+    executionMode: "paper",
+    ladderV6MaxUnmatchedShares: 40,
+    ladderV6MinNetEdge: 0.01,
+  });
+  assert.doesNotThrow(() => validateTradingConfig(config));
+  assert.throws(
+    () =>
+      validateTradingConfig({
+        ...config,
+        executionMode: "live",
+        dryRun: false,
+      }),
+    /paper-only/,
+  );
+  assert.throws(
+    () =>
+      validateTradingConfig({
+        ...config,
+        ladderV6MaxUnmatchedShares: 0,
+      }),
+    /LADDER_V6_MAX_UNMATCHED_SHARES/,
+  );
+  assert.throws(
+    () => validateTradingConfig({ ...config, ladderV6MinNetEdge: 0 }),
+    /LADDER_V6_MIN_NET_EDGE/,
+  );
+});

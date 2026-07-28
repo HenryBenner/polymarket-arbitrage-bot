@@ -72,6 +72,8 @@ export interface BotConfig {
   pairLockResidualMaxPrice: number;
   ladderV5MaxImbalance: number;
   ladderV5MaxPairCost: number;
+  ladderV6MaxUnmatchedShares: number;
+  ladderV6MinNetEdge: number;
   paperStartingUsdc: number;
   paperStatePath: string;
 }
@@ -83,10 +85,11 @@ export function loadConfig(): BotConfig {
     strategyRaw !== "odahoa_ladder" &&
     strategyRaw !== "odahoa_ladder_2" &&
     strategyRaw !== "odahoa_static_maker" &&
-    strategyRaw !== "ladder_v5"
+    strategyRaw !== "ladder_v5" &&
+    strategyRaw !== "ladder_v6"
   ) {
     throw new Error(
-      "STRATEGY_MODE must be reverse, odahoa_ladder, odahoa_ladder_2, odahoa_static_maker, or ladder_v5",
+      "STRATEGY_MODE must be reverse, odahoa_ladder, odahoa_ladder_2, odahoa_static_maker, ladder_v5, or ladder_v6",
     );
   }
 
@@ -157,6 +160,11 @@ export function loadConfig(): BotConfig {
     ),
     ladderV5MaxImbalance: envNumber("LADDER_V5_MAX_IMBALANCE", 70),
     ladderV5MaxPairCost: envNumber("LADDER_V5_MAX_PAIR_COST", 0.98),
+    ladderV6MaxUnmatchedShares: envNumber(
+      "LADDER_V6_MAX_UNMATCHED_SHARES",
+      40,
+    ),
+    ladderV6MinNetEdge: envNumber("LADDER_V6_MIN_NET_EDGE", 0.01),
     paperStartingUsdc: envNumber("PAPER_STARTING_USDC", 100),
     paperStatePath: envString("PAPER_STATE_PATH", "./data/paper"),
   };
@@ -241,6 +249,21 @@ export function validateTradingConfig(config: BotConfig): void {
     );
   }
   if (
+    !Number.isFinite(config.ladderV6MaxUnmatchedShares) ||
+    config.ladderV6MaxUnmatchedShares <= 0
+  ) {
+    throw new Error("LADDER_V6_MAX_UNMATCHED_SHARES must be greater than 0");
+  }
+  if (
+    !Number.isFinite(config.ladderV6MinNetEdge) ||
+    config.ladderV6MinNetEdge <= 0 ||
+    config.ladderV6MinNetEdge >= 1
+  ) {
+    throw new Error(
+      "LADDER_V6_MIN_NET_EDGE must be greater than 0 and less than 1",
+    );
+  }
+  if (
     config.strategyMode === "ladder_v5" &&
     config.ladderSizeScale > 6
   ) {
@@ -271,6 +294,14 @@ export function validateTradingConfig(config: BotConfig): void {
   ) {
     throw new Error(
       "ladder_v5 is paper-only until its forward results are reviewed",
+    );
+  }
+  if (
+    config.strategyMode === "ladder_v6" &&
+    config.executionMode !== "paper"
+  ) {
+    throw new Error(
+      "ladder_v6 is paper-only until its fill-driven FOK results are reviewed",
     );
   }
   if (!Number.isInteger(config.signatureType) || config.signatureType < 0 || config.signatureType > 3) {

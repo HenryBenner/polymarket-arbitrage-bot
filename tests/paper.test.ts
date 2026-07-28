@@ -282,6 +282,105 @@ test("paper executor mirrors live post-only rejection, cancellation, and FAK rem
   }
 });
 
+test("paper FOK fills the exact size or fills nothing", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paper-fok-"));
+  try {
+    const trader = new PaperTrader(
+      testConfig({
+        strategyMode: "ladder_v6",
+        paperStatePath: directory,
+        paperStartingUsdc: 100,
+      }),
+      {
+        stream: fakeStream,
+        feeLoader: async () => ({ rate: 0.07, exponent: 1 }),
+        settlementLoader: async () => null,
+      },
+    );
+    await trader.init();
+    const books = testBooks(0.4, 0.6);
+    books[1]!.asks = [
+      { price: 0.6, size: 2 },
+      { price: 0.62, size: 10 },
+    ];
+    await trader.observeMarket(testEvent(), books);
+
+    await trader.placeBuy({
+      ...opportunity(books[1]!, "fok-insufficient", 0.6, 5),
+      strategyMode: "ladder_v6",
+      orderPolicy: "fok",
+    });
+    let state = trader.snapshot();
+    assert.equal(state.orders[0]?.status, "cancelled");
+    assert.equal(state.orders[0]?.remainingSize, 5);
+    assert.equal(state.fills.length, 0);
+
+    await trader.placeBuy({
+      ...opportunity(books[1]!, "fok-complete", 0.62, 5),
+      strategyMode: "ladder_v6",
+      orderPolicy: "fok",
+    });
+    state = trader.snapshot();
+    assert.equal(state.orders[1]?.status, "filled");
+    assert.equal(state.orders[1]?.remainingSize, 0);
+    assert.equal(
+      state.fills.reduce((sum, fill) => sum + fill.size, 0),
+      5,
+    );
+    assert.ok(state.fills.every((fill) => fill.liquidity === "taker"));
+    await trader.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("paper market events wake V6 immediately after a maker fill", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paper-v6-wake-"));
+  try {
+    const trader = new PaperTrader(
+      testConfig({
+        strategyMode: "ladder_v6",
+        paperStatePath: directory,
+      }),
+      {
+        stream: fakeStream,
+        feeLoader: async () => ({ rate: 0.07, exponent: 1 }),
+        settlementLoader: async () => null,
+      },
+    );
+    await trader.init();
+    const books = testBooks(0.5, 0.6);
+    books[0]!.bids = [];
+    await trader.observeMarket(testEvent(), books);
+    await trader.placeBuy({
+      ...opportunity(books[0]!, "v6-opening", 0.1, 20),
+      strategyMode: "ladder_v6",
+      orderPolicy: "post_only",
+      pairId: "ladder-v6:opening:0.10",
+      pairLockRole: "opening",
+    });
+
+    const wakeFillCounts: number[] = [];
+    trader.setExecutionWakeHandler((marketSlug) => {
+      wakeFillCounts.push(
+        trader.getMarketExecutionSnapshot(marketSlug)?.fills.length ?? -1,
+      );
+    });
+    await trader.ingestMarketEvent({
+      event_type: "last_trade_price",
+      asset_id: "up-token",
+      side: "SELL",
+      price: "0.1",
+      size: "20",
+      timestamp: "1767225600",
+    });
+    assert.deepEqual(wakeFillCounts, [1]);
+    await trader.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("paper settlement pays the winning shares and persists across restart", async () => {
   const directory = await mkdtemp(join(tmpdir(), "paper-settle-"));
   try {

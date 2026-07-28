@@ -343,6 +343,54 @@ starting paper balance. This is a forward test, not evidence that the
 post-hoc result will repeat. Keep it paper-only until it has a meaningful
 out-of-sample settlement count.
 
+### Ladder V6 paper candidate
+
+`STRATEGY_MODE=ladder_v6` replaces V5's simultaneous two-sided orders with a
+fill-driven sequence:
+
+1. During the 5-2 minute window, identify and lock the currently cheap
+   outcome.
+2. Post only maker-only GTC bids on that outcome at 10 and 15 cents.
+3. Split the default 40-share unmatched cap across the two rungs, 20 shares
+   each, so even a same-tick fill race cannot exceed the cap.
+4. On the first actual maker fill, cancel every remaining cheap opening.
+5. Recalculate the visible favorite depth, taker fees, and exact all-in pair
+   cost.
+6. Submit one exact-share FOK hedge only when the completed pair retains at
+   least `LADDER_V6_MIN_NET_EDGE` after fees.
+7. If FOK cannot complete, retry only after the relevant displayed depth
+   changes. Cancel everything when two minutes remain.
+
+The default balanced edge is one cent:
+
+```env
+LADDER_V6_MAX_UNMATCHED_SHARES=40
+LADDER_V6_MIN_NET_EDGE=0.01
+```
+
+Set the edge to `0.02` for the conservative experiment or `0.005` for the
+aggressive experiment, always using a separate `PAPER_STATE_PATH`.
+
+V6 is paper-only. Its paper executor uses the market WebSocket to wake the
+planner immediately after simulated maker fills and relevant book changes;
+it does not wait for the scanner poll. Real-money V6 remains disabled until an
+authenticated user-stream implementation and forward paper evidence exist.
+
+For Command Prompt:
+
+```bat
+set "DOTENV_CONFIG_PATH=.env.ladder-v6-paper.example"
+npm.cmd start
+```
+
+For Linux or a VPS:
+
+```bash
+DOTENV_CONFIG_PATH=.env.ladder-v6-paper.example npm start
+```
+
+The isolated ledger is `./data/paper-ladder-v6`.
+
 ### Odahoa pair-lock V2
 
 `STRATEGY_MODE=odahoa_ladder_2` keeps V1's BTC market selection, phases,

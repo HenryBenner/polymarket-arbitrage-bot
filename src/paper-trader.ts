@@ -120,6 +120,9 @@ export class PaperTrader implements OrderExecutor {
     string,
     { rate: number; exponent: number; rebateRate: number }
   >();
+  private executionWakeHandler:
+    | ((marketSlug: string) => void | Promise<void>)
+    | undefined;
   private persistenceQueue: Promise<void> = Promise.resolve();
 
   constructor(
@@ -163,6 +166,12 @@ export class PaperTrader implements OrderExecutor {
         .length,
       fills: this.state.fills.length,
     });
+  }
+
+  setExecutionWakeHandler(
+    handler: (marketSlug: string) => void | Promise<void>,
+  ): void {
+    this.executionWakeHandler = handler;
   }
 
   async observeMarket(event: UpDownEvent, books: TokenBook[]): Promise<void> {
@@ -234,6 +243,36 @@ export class PaperTrader implements OrderExecutor {
         },
       };
     }
+    const asks =
+      context?.liquidity.get(opportunity.token.tokenId) ??
+      opportunity.token.asks.map((level) => ({ ...level }));
+    const feeConfig = this.feeConfig(opportunity.event.market);
+    let fokCanFill = opportunity.orderPolicy !== "fok";
+    if (opportunity.orderPolicy === "fok") {
+      let remaining = opportunity.size;
+      let totalCost = 0;
+      for (const level of asks) {
+        if (
+          remaining <= 1e-8 ||
+          level.price > opportunity.price + 1e-9
+        ) {
+          break;
+        }
+        const selected = Math.min(remaining, level.size);
+        if (selected <= 1e-8) continue;
+        const fee =
+          selected *
+          feeConfig.rate *
+          Math.pow(
+            level.price * (1 - level.price),
+            feeConfig.exponent,
+          );
+        totalCost += selected * level.price + fee;
+        remaining = round(remaining - selected);
+      }
+      fokCanFill =
+        remaining <= 1e-8 && totalCost <= available + 1e-8;
+    }
     const queueAhead = (context?.books.get(opportunity.token.tokenId)?.bids ?? [])
       .filter((level) => Math.abs(level.price - opportunity.price) < 1e-9)
       .reduce((sum, level) => sum + level.size, 0);
@@ -264,10 +303,7 @@ export class PaperTrader implements OrderExecutor {
     this.state.orders.push(order);
     await this.record("order_submitted", order);
 
-    if (opportunity.orderPolicy !== "post_only") {
-      const asks =
-        context?.liquidity.get(opportunity.token.tokenId) ??
-        opportunity.token.asks.map((level) => ({ ...level }));
+    if (opportunity.orderPolicy !== "post_only" && fokCanFill) {
       for (const level of asks) {
         if (
           order.remainingSize <= 1e-8 ||
@@ -282,7 +318,7 @@ export class PaperTrader implements OrderExecutor {
           level.price,
           fillSize,
           "taker",
-          this.feeConfig(opportunity.event.market),
+          feeConfig,
           now,
         );
         level.size = round(level.size - fillSize);
@@ -290,7 +326,8 @@ export class PaperTrader implements OrderExecutor {
       if (context) context.liquidity.set(order.tokenId, asks);
     }
     if (
-      opportunity.orderPolicy === "fak" &&
+      (opportunity.orderPolicy === "fak" ||
+        opportunity.orderPolicy === "fok") &&
       order.remainingSize > 1e-8
     ) {
       order.status = "cancelled";
@@ -448,7 +485,9 @@ export class PaperTrader implements OrderExecutor {
             ? "odahoa_static_maker"
             : this.config.strategyMode === "ladder_v5"
               ? "ladder_v5 late 10/90 + 15/85"
-              : `${this.config.ladderPreset} public-fill approximation`,
+              : this.config.strategyMode === "ladder_v6"
+                ? "ladder_v6 maker cheap / FOK pair"
+                : `${this.config.ladderPreset} public-fill approximation`,
         firstVisibleFillMinutesLeft:
           fills.length > 0
             ? round(
@@ -645,14 +684,17 @@ export class PaperTrader implements OrderExecutor {
     const eventType = String(event.event_type ?? "");
     if (eventType === "book") {
       this.handleBookEvent(event);
+      await this.notifyExecutionWake(event);
       return;
     }
     if (eventType === "price_change") {
       this.handlePriceChanges(event);
+      await this.notifyExecutionWake(event);
       return;
     }
     if (eventType === "last_trade_price") {
       await this.handleTradeEvent(event);
+      await this.notifyExecutionWake(event);
       return;
     }
     if (eventType === "market_resolved") {
@@ -660,6 +702,29 @@ export class PaperTrader implements OrderExecutor {
         event.winning_asset_id ?? event.asset_id ?? "",
       );
       if (winningTokenId) await this.settleWinningToken(winningTokenId);
+    }
+  }
+
+  private async notifyExecutionWake(
+    event: MarketStreamEvent,
+  ): Promise<void> {
+    if (!this.executionWakeHandler) return;
+    const tokenIds = new Set<string>();
+    const direct = String(event.asset_id ?? "");
+    if (direct) tokenIds.add(direct);
+    if (Array.isArray(event.price_changes)) {
+      for (const change of event.price_changes as PriceChange[]) {
+        const tokenId = String(change.asset_id ?? "");
+        if (tokenId) tokenIds.add(tokenId);
+      }
+    }
+    const marketSlugs = new Set<string>();
+    for (const tokenId of tokenIds) {
+      const marketSlug = this.tokenToMarket.get(tokenId);
+      if (marketSlug) marketSlugs.add(marketSlug);
+    }
+    for (const marketSlug of marketSlugs) {
+      await this.executionWakeHandler(marketSlug);
     }
   }
 

@@ -1,6 +1,7 @@
 import { ReverseBot } from "./bot.js";
 import { loadConfig, validateTradingConfig } from "./config.js";
 import { logError } from "./logger.js";
+import { KalshiTrader } from "./kalshi-trader.js";
 import { PaperTrader } from "./paper-trader.js";
 import { Trader } from "./trader.js";
 
@@ -11,6 +12,8 @@ async function main(): Promise<void> {
   const executor =
     config.executionMode === "paper"
       ? new PaperTrader(config)
+      : config.exchange === "kalshi"
+        ? new KalshiTrader(config)
       : new Trader(config);
   const bot = new ReverseBot(config, executor);
   await bot.init();

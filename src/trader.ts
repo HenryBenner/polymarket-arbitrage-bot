@@ -387,6 +387,7 @@ export class Trader implements OrderExecutor {
       totalFees: round(fills.reduce((sum, fill) => sum + fill.fee, 0)),
       estimatedMakerRebate: 0,
       takerFeeRate: context.feeRate,
+      makerFeeRate: 0,
       takerFeeExponent: context.feeExponent,
       settledPnl: null,
     });

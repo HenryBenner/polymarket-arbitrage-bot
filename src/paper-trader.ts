@@ -9,6 +9,8 @@ import {
 import { dirname, join } from "node:path";
 import { ClobClient } from "@polymarket/clob-client-v2";
 import type { BotConfig } from "./config.js";
+import { KalshiClient, kalshiTokenId } from "./kalshi-api.js";
+import { KalshiMarketStream } from "./kalshi-market-stream.js";
 import { log } from "./logger.js";
 import { MarketStream, type MarketStreamEvent } from "./market-stream.js";
 import type {
@@ -54,7 +56,12 @@ interface PaperTraderOptions {
   stream?: Pick<MarketStream, "subscribe" | "close">;
   feeLoader?: (
     conditionId: string,
-  ) => Promise<{ rate: number; exponent: number; rebateRate?: number }>;
+  ) => Promise<{
+    rate: number;
+    makerRate?: number;
+    exponent: number;
+    rebateRate?: number;
+  }>;
   settlementLoader?: (
     event: UpDownEvent,
   ) => Promise<{ winningTokenId: string } | null>;
@@ -110,7 +117,8 @@ export class PaperTrader implements OrderExecutor {
   private readonly statePath: string;
   private readonly eventLogPath: string;
   private readonly stream: Pick<MarketStream, "subscribe" | "close">;
-  private readonly publicClient: ClobClient;
+  private readonly publicClient: ClobClient | null;
+  private readonly kalshiClient: KalshiClient | null;
   private readonly contexts = new Map<string, MarketContext>();
   private readonly tokenToMarket = new Map<string, string>();
   private readonly fallbackChecks = new Map<string, number>();
@@ -118,7 +126,7 @@ export class PaperTrader implements OrderExecutor {
   private readonly seenEvents = new Set<string>();
   private readonly feeConfigs = new Map<
     string,
-    { rate: number; exponent: number; rebateRate: number }
+    { rate: number; makerRate: number; exponent: number; rebateRate: number }
   >();
   private executionWakeHandler:
     | ((marketSlug: string) => void | Promise<void>)
@@ -134,11 +142,20 @@ export class PaperTrader implements OrderExecutor {
     this.eventLogPath = join(config.paperStatePath, "paper-events.jsonl");
     this.stream =
       options.stream ??
-      new MarketStream((event) => this.ingestMarketEvent(event));
-    this.publicClient = new ClobClient({
-      host: config.clobHost,
-      chain: config.chainId,
-    });
+      (config.exchange === "kalshi"
+        ? new KalshiMarketStream(config, (event) =>
+            this.ingestMarketEvent(event),
+          )
+        : new MarketStream((event) => this.ingestMarketEvent(event)));
+    this.publicClient =
+      config.exchange === "polymarket"
+        ? new ClobClient({
+            host: config.clobHost,
+            chain: config.chainId,
+          })
+        : null;
+    this.kalshiClient =
+      config.exchange === "kalshi" ? new KalshiClient(config) : null;
   }
 
   async init(): Promise<void> {
@@ -192,7 +209,7 @@ export class PaperTrader implements OrderExecutor {
     this.scheduleSettlementFallback(event);
 
     if (Date.now() / 1000 >= event.windowEnd) {
-      await this.checkGammaSettlement(event);
+      await this.checkSettlement(event);
     }
   }
 
@@ -567,6 +584,7 @@ export class PaperTrader implements OrderExecutor {
         ),
       ),
       takerFeeRate: feeConfig.rate,
+      makerFeeRate: feeConfig.makerRate,
       takerFeeExponent: feeConfig.exponent,
       settledPnl:
         this.state.settlements.find(
@@ -591,6 +609,7 @@ export class PaperTrader implements OrderExecutor {
 
   private feeConfig(market: GammaMarket): {
     rate: number;
+    makerRate: number;
     exponent: number;
     rebateRate: number;
   } {
@@ -599,6 +618,7 @@ export class PaperTrader implements OrderExecutor {
     const rawRate = market.feeSchedule?.rate ?? 0;
     return {
       rate: rawRate > 1 ? rawRate / 10_000 : rawRate,
+      makerRate: market.feeSchedule?.makerRate ?? 0,
       exponent: market.feeSchedule?.exponent ?? 1,
       rebateRate: normalizeRebateRate(
         market.feeSchedule?.rebateRate,
@@ -612,20 +632,24 @@ export class PaperTrader implements OrderExecutor {
     price: number,
     size: number,
     liquidity: "taker" | "maker",
-    feeConfig: { rate: number; exponent: number; rebateRate: number },
+    feeConfig: {
+      rate: number;
+      makerRate: number;
+      exponent: number;
+      rebateRate: number;
+    },
     timestamp: string,
   ): Promise<void> {
     const actualSize = round(Math.min(size, order.remainingSize));
     if (actualSize <= 0) return;
-    const fee =
-      liquidity === "taker"
-        ? round(
-            actualSize *
-              feeConfig.rate *
-              Math.pow(price * (1 - price), feeConfig.exponent),
-            5,
-          )
-        : 0;
+    const feeRate =
+      liquidity === "taker" ? feeConfig.rate : feeConfig.makerRate;
+    const fee = round(
+      actualSize *
+        feeRate *
+        Math.pow(price * (1 - price), feeConfig.exponent),
+      5,
+    );
     const makerFeeEquivalent =
       liquidity === "maker"
         ? round(
@@ -837,6 +861,7 @@ export class PaperTrader implements OrderExecutor {
         "maker",
         this.feeConfigs.get(order.conditionId) ?? {
           rate: 0.07,
+          makerRate: 0,
           exponent: 1,
           rebateRate: 0.2,
         },
@@ -849,7 +874,7 @@ export class PaperTrader implements OrderExecutor {
     if (marketSlug) this.reportMarket(marketSlug);
   }
 
-  private async checkGammaSettlement(event: UpDownEvent): Promise<void> {
+  private async checkSettlement(event: UpDownEvent): Promise<void> {
     if (
       this.state.settlements.some(
         (settlement) => settlement.marketSlug === event.slug,
@@ -867,6 +892,20 @@ export class PaperTrader implements OrderExecutor {
         if (result) await this.settleWinningToken(result.winningTokenId);
         return;
       }
+      if (this.config.exchange === "kalshi" && this.kalshiClient) {
+        const ticker = event.market.externalMarketId ?? event.market.id;
+        if (!ticker) return;
+        const market = await this.kalshiClient.getMarket(ticker);
+        if (
+          !market ||
+          (market.status !== "finalized" && market.status !== "settled") ||
+          (market.result !== "yes" && market.result !== "no")
+        ) {
+          return;
+        }
+        await this.settleWinningToken(kalshiTokenId(ticker, market.result));
+        return;
+      }
       const url = new URL(
         `/markets/${encodeURIComponent(event.market.id)}`,
         this.config.gammaApiHost,
@@ -882,7 +921,8 @@ export class PaperTrader implements OrderExecutor {
       if (winningTokenId) await this.settleWinningToken(winningTokenId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      log("Gamma paper settlement check failed", {
+      log("Paper settlement check failed", {
+        exchange: this.config.exchange,
         market: event.slug,
         error: message,
       });
@@ -901,7 +941,7 @@ export class PaperTrader implements OrderExecutor {
     const firstDelay = Math.max(0, event.windowEnd * 1000 - Date.now() + 2_000);
     const schedule = (delay: number): void => {
       const timer = setTimeout(() => {
-        void this.checkGammaSettlement(event).finally(() => {
+        void this.checkSettlement(event).finally(() => {
           if (
             !this.state.settlements.some(
               (settlement) => settlement.marketSlug === event.slug,
@@ -925,6 +965,8 @@ export class PaperTrader implements OrderExecutor {
         const loaded = await this.options.feeLoader(event.market.conditionId);
         this.feeConfigs.set(event.market.conditionId, {
           ...loaded,
+          makerRate:
+            loaded.makerRate ?? event.market.feeSchedule?.makerRate ?? 0,
           rebateRate: normalizeRebateRate(
             loaded.rebateRate ?? event.market.feeSchedule?.rebateRate,
             event.market.feeSchedule?.rebateRate ??
@@ -933,12 +975,25 @@ export class PaperTrader implements OrderExecutor {
         });
         return;
       }
+      if (this.config.exchange === "kalshi") {
+        this.feeConfigs.set(event.market.conditionId, {
+          rate: this.config.kalshiTakerFeeRate,
+          makerRate: this.config.kalshiMakerFeeRate,
+          exponent: 1,
+          rebateRate: 0,
+        });
+        return;
+      }
+      if (!this.publicClient) {
+        throw new Error("Polymarket public client is not initialized");
+      }
       const details = await this.publicClient.getClobMarketInfo(
         event.market.conditionId,
       );
       const rawRate = details.fd?.r ?? 0;
       this.feeConfigs.set(event.market.conditionId, {
         rate: rawRate > 1 ? rawRate / 10_000 : rawRate,
+        makerRate: 0,
         exponent: details.fd?.e ?? 1,
         rebateRate: normalizeRebateRate(
           event.market.feeSchedule?.rebateRate,
@@ -949,6 +1004,10 @@ export class PaperTrader implements OrderExecutor {
       const fallback = event.slug.startsWith("btc-updown-15m") ? 0.07 : 0;
       this.feeConfigs.set(event.market.conditionId, {
         rate: fallback,
+        makerRate:
+          this.config.exchange === "kalshi"
+            ? this.config.kalshiMakerFeeRate
+            : 0,
         exponent: 1,
         rebateRate: event.slug.startsWith("btc-updown-15m") ? 0.2 : 0,
       });

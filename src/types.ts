@@ -7,6 +7,7 @@ export type StrategyMode =
   | "ladder_v5"
   | "ladder_v6";
 export type ExecutionMode = "dry_run" | "paper" | "live";
+export type ExchangeName = "polymarket" | "kalshi";
 export type LadderPreset = "odahoa_v1";
 export type PairLockOrderRole =
   | "opening"
@@ -14,6 +15,8 @@ export type PairLockOrderRole =
   | "completion_taker";
 
 export interface GammaMarket {
+  exchange?: ExchangeName;
+  externalMarketId?: string;
   id?: string;
   question: string;
   conditionId: string;
@@ -27,6 +30,7 @@ export interface GammaMarket {
   feeSchedule?: {
     exponent?: number;
     rate?: number;
+    makerRate?: number;
     takerOnly?: boolean;
     rebateRate?: number;
   };
@@ -206,6 +210,7 @@ export interface MarketExecutionSnapshot {
   totalFees: number;
   estimatedMakerRebate: number;
   takerFeeRate: number;
+  makerFeeRate?: number;
   takerFeeExponent: number;
   settledPnl: number | null;
 }

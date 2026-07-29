@@ -3,6 +3,7 @@ import type { TokenBook, UpDownEvent } from "../src/types.js";
 
 export function testConfig(overrides: Partial<BotConfig> = {}): BotConfig {
   return {
+    exchange: "polymarket",
     strategyMode: "odahoa_ladder",
     executionMode: "paper",
     pollIntervalMs: 5_000,
@@ -22,6 +23,12 @@ export function testConfig(overrides: Partial<BotConfig> = {}): BotConfig {
     clobHost: "https://clob.polymarket.com",
     chainId: 137,
     gammaApiHost: "https://gamma-api.polymarket.com",
+    kalshiApiHost: "https://external-api.kalshi.com/trade-api/v2",
+    kalshiWsHost: "wss://external-api-ws.kalshi.com/trade-api/ws/v2",
+    kalshiSeriesTickers: ["KXBTC15M"],
+    kalshiSubaccount: 0,
+    kalshiTakerFeeRate: 0.07,
+    kalshiMakerFeeRate: 0,
     ladderPreset: "odahoa_v1",
     ladderSizeScale: 1,
     ladderLiveMaxUsdcPerMarket: 65,

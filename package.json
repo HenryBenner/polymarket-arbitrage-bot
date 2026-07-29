@@ -15,7 +15,8 @@
   "dependencies": {
     "@polymarket/clob-client-v2": "1.0.8",
     "dotenv": "16.6.1",
-    "viem": "2.55.2"
+    "viem": "2.55.2",
+    "ws": "8.21.0"
   },
   "devDependencies": {
     "@types/node": "22.16.5",

@@ -1,6 +1,11 @@
 import "dotenv/config";
 import { projectedLadderCapital } from "./ladder.js";
-import type { ExecutionMode, LadderPreset, StrategyMode } from "./types.js";
+import type {
+  ExchangeName,
+  ExecutionMode,
+  LadderPreset,
+  StrategyMode,
+} from "./types.js";
 
 function envString(key: string, fallback?: string): string {
   const value = process.env[key] ?? fallback;
@@ -36,6 +41,7 @@ function envList(key: string, fallback: string[]): string[] {
 }
 
 export interface BotConfig {
+  exchange: ExchangeName;
   strategyMode: StrategyMode;
   executionMode: ExecutionMode;
   pollIntervalMs: number;
@@ -61,6 +67,14 @@ export interface BotConfig {
   clobSecret?: string;
   clobPassphrase?: string;
   gammaApiHost: string;
+  kalshiApiHost: string;
+  kalshiWsHost: string;
+  kalshiApiKeyId?: string;
+  kalshiPrivateKeyPem?: string;
+  kalshiSeriesTickers: string[];
+  kalshiSubaccount: number;
+  kalshiTakerFeeRate: number;
+  kalshiMakerFeeRate: number;
   ladderPreset: LadderPreset;
   ladderSizeScale: number;
   ladderLiveMaxUsdcPerMarket: number;
@@ -81,6 +95,10 @@ export interface BotConfig {
 }
 
 export function loadConfig(): BotConfig {
+  const exchange = envString("EXCHANGE", "polymarket");
+  if (exchange !== "polymarket" && exchange !== "kalshi") {
+    throw new Error("EXCHANGE must be polymarket or kalshi");
+  }
   const strategyRaw = envString("STRATEGY_MODE", "reverse");
   if (
     strategyRaw !== "reverse" &&
@@ -114,6 +132,7 @@ export function loadConfig(): BotConfig {
   }
 
   return {
+    exchange,
     strategyMode: strategyRaw,
     executionMode,
     pollIntervalMs: envNumber("POLL_INTERVAL_MS", 5000),
@@ -142,6 +161,20 @@ export function loadConfig(): BotConfig {
     clobSecret: process.env.CLOB_SECRET,
     clobPassphrase: process.env.CLOB_PASSPHRASE,
     gammaApiHost: envString("GAMMA_API_HOST", "https://gamma-api.polymarket.com"),
+    kalshiApiHost: envString(
+      "KALSHI_API_HOST",
+      "https://external-api.kalshi.com/trade-api/v2",
+    ),
+    kalshiWsHost: envString(
+      "KALSHI_WS_HOST",
+      "wss://external-api-ws.kalshi.com/trade-api/ws/v2",
+    ),
+    kalshiApiKeyId: process.env.KALSHI_API_KEY_ID,
+    kalshiPrivateKeyPem: process.env.KALSHI_PRIVATE_KEY,
+    kalshiSeriesTickers: envList("KALSHI_SERIES_TICKERS", ["KXBTC15M"]),
+    kalshiSubaccount: envNumber("KALSHI_SUBACCOUNT", 0),
+    kalshiTakerFeeRate: envNumber("KALSHI_TAKER_FEE_RATE", 0.07),
+    kalshiMakerFeeRate: envNumber("KALSHI_MAKER_FEE_RATE", 0),
     ladderPreset: ladderPreset as LadderPreset,
     ladderSizeScale: envNumber("LADDER_SIZE_SCALE", 1),
     ladderLiveMaxUsdcPerMarket: envNumber("LADDER_LIVE_MAX_USDC_PER_MARKET", 65),
@@ -175,6 +208,9 @@ export function loadConfig(): BotConfig {
 }
 
 export function validateTradingConfig(config: BotConfig): void {
+  if (config.exchange !== "polymarket" && config.exchange !== "kalshi") {
+    throw new Error("EXCHANGE must be polymarket or kalshi");
+  }
   if (!Number.isInteger(config.ladderSizeScale) || config.ladderSizeScale < 1) {
     throw new Error("LADDER_SIZE_SCALE must be an integer of at least 1");
   }
@@ -330,17 +366,77 @@ export function validateTradingConfig(config: BotConfig): void {
     throw new Error("SIGNATURE_TYPE must be one of 0, 1, 2, or 3");
   }
 
-  if (config.chainId !== 137) {
-    throw new Error("CHAIN_ID must be 137 for Polygon mainnet");
-  }
-
-  const clobUrl = new URL(config.clobHost);
-  const gammaUrl = new URL(config.gammaApiHost);
-  if (clobUrl.protocol !== "https:" || clobUrl.hostname !== "clob.polymarket.com") {
-    throw new Error("CLOB_HOST must be https://clob.polymarket.com");
-  }
-  if (gammaUrl.protocol !== "https:" || gammaUrl.hostname !== "gamma-api.polymarket.com") {
-    throw new Error("GAMMA_API_HOST must be https://gamma-api.polymarket.com");
+  if (config.exchange === "polymarket") {
+    if (config.chainId !== 137) {
+      throw new Error("CHAIN_ID must be 137 for Polygon mainnet");
+    }
+    const clobUrl = new URL(config.clobHost);
+    const gammaUrl = new URL(config.gammaApiHost);
+    if (clobUrl.protocol !== "https:" || clobUrl.hostname !== "clob.polymarket.com") {
+      throw new Error("CLOB_HOST must be https://clob.polymarket.com");
+    }
+    if (gammaUrl.protocol !== "https:" || gammaUrl.hostname !== "gamma-api.polymarket.com") {
+      throw new Error("GAMMA_API_HOST must be https://gamma-api.polymarket.com");
+    }
+  } else {
+    const apiUrl = new URL(config.kalshiApiHost);
+    const wsUrl = new URL(config.kalshiWsHost);
+    const allowedApiHosts = new Set([
+      "external-api.kalshi.com",
+      "external-api.demo.kalshi.co",
+    ]);
+    const allowedWsHosts = new Set([
+      "external-api-ws.kalshi.com",
+      "external-api-ws.demo.kalshi.co",
+    ]);
+    if (
+      apiUrl.protocol !== "https:" ||
+      !allowedApiHosts.has(apiUrl.hostname) ||
+      !apiUrl.pathname.endsWith("/trade-api/v2")
+    ) {
+      throw new Error(
+        "KALSHI_API_HOST must be an official production or demo /trade-api/v2 endpoint",
+      );
+    }
+    if (
+      wsUrl.protocol !== "wss:" ||
+      !allowedWsHosts.has(wsUrl.hostname) ||
+      !wsUrl.pathname.endsWith("/trade-api/ws/v2")
+    ) {
+      throw new Error(
+        "KALSHI_WS_HOST must be an official production or demo /trade-api/ws/v2 endpoint",
+      );
+    }
+    if (config.kalshiSeriesTickers.length === 0) {
+      throw new Error("KALSHI_SERIES_TICKERS must contain at least one series");
+    }
+    if (
+      !Number.isInteger(config.kalshiSubaccount) ||
+      config.kalshiSubaccount < 0 ||
+      config.kalshiSubaccount > 63
+    ) {
+      throw new Error("KALSHI_SUBACCOUNT must be an integer from 0 through 63");
+    }
+    for (const [name, value] of [
+      ["KALSHI_TAKER_FEE_RATE", config.kalshiTakerFeeRate],
+      ["KALSHI_MAKER_FEE_RATE", config.kalshiMakerFeeRate],
+    ] as const) {
+      if (!Number.isFinite(value) || value < 0 || value >= 1) {
+        throw new Error(`${name} must be at least 0 and less than 1`);
+      }
+    }
+    const hasKeyId = Boolean(config.kalshiApiKeyId);
+    const hasPrivateKey = Boolean(config.kalshiPrivateKeyPem);
+    if (hasKeyId !== hasPrivateKey) {
+      throw new Error(
+        "KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY must be set together",
+      );
+    }
+    if (config.executionMode !== "dry_run" && (!hasKeyId || !hasPrivateKey)) {
+      throw new Error(
+        "Kalshi paper/live mode requires KALSHI_API_KEY_ID and a private key because its WebSocket requires authentication",
+      );
+    }
   }
 
   if (config.executionMode !== "live") return;
@@ -368,6 +464,15 @@ export function validateTradingConfig(config: BotConfig): void {
         "Live ladder mode is locked. Set LADDER_LIVE_ACK=I_UNDERSTAND_LADDER_MODE_CAN_LOSE_REAL_MONEY only after paper verification.",
       );
     }
+  }
+
+  if (config.exchange === "kalshi") {
+    if (config.liveTradingAck !== "I_UNDERSTAND_REAL_MONEY_IS_AT_RISK") {
+      throw new Error(
+        "Live trading is locked. Set LIVE_TRADING_ACK=I_UNDERSTAND_REAL_MONEY_IS_AT_RISK only after completing paper verification.",
+      );
+    }
+    return;
   }
 
   const providedApiCreds = [

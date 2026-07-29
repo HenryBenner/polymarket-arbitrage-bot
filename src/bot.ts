@@ -72,6 +72,7 @@ export class ReverseBot {
 
   async run(): Promise<void> {
     log("Reverse bot starting", {
+      exchange: this.config.exchange,
       strategy:
         this.config.strategyMode === "reverse"
           ? "buy cheap reversal tokens on 15m BTC/ETH markets"

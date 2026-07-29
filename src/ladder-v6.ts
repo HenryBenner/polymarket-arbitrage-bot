@@ -121,6 +121,14 @@ function feePerShare(
   return rate * Math.pow(price * (1 - price), exponent);
 }
 
+function makerAllInPerShare(
+  price: number,
+  rate: number,
+  exponent: number,
+): number {
+  return price + feePerShare(price, rate, exponent);
+}
+
 function executableAskCost(
   snapshot: MarketExecutionSnapshot,
   book: TokenBook,
@@ -305,16 +313,40 @@ function openingQuotes(
 
   const pairCap =
     1 - config.ladderV6MinNetEdge - config.ladderV6SafetyBuffer;
+  const makerRate = event.market.feeSchedule?.makerRate ?? 0;
+  const makerExponent = event.market.feeSchedule?.exponent ?? 1;
   const initial = books.map((book) =>
     floorToTick(book.bestBid ?? 0, tickSize),
   );
-  if (initial[0]! + initial[1]! > pairCap + EPSILON) return null;
+  const pairCost = (prices: number[]): number =>
+    prices.reduce(
+      (sum, price) =>
+        sum + makerAllInPerShare(price, makerRate, makerExponent),
+      0,
+    );
+  if (pairCost(initial) > pairCap + EPSILON) return null;
   const prices = distributeQuoteSlack(
     books,
     initial,
     pairCap,
     tickSize,
   );
+  while (pairCost(prices) > pairCap + EPSILON) {
+    const candidates = [0, 1].filter(
+      (index) => prices[index]! - tickSize > 0,
+    );
+    if (candidates.length === 0) return null;
+    const selected =
+      candidates.length === 1
+        ? candidates[0]!
+        : prices[0]! >= prices[1]!
+          ? 0
+          : 1;
+    prices[selected] = floorToTick(
+      prices[selected]! - tickSize,
+      tickSize,
+    );
+  }
   if (
     prices.some(
       (price, index) =>
@@ -328,7 +360,7 @@ function openingQuotes(
   return {
     prices,
     size,
-    pairCost: round(prices[0]! + prices[1]!),
+    pairCost: round(pairCost(prices)),
   };
 }
 
@@ -523,10 +555,26 @@ export async function planLadderV6(
     }
 
     const tickSize = Number(tickSizeFromMarket(event.market));
-    const makerMaximum = floorToTick(
+    let makerMaximum = floorToTick(
       1 - entryCostPerShare - config.ladderV6MinNetEdge,
       tickSize,
     );
+    const makerRate = snapshot.makerFeeRate ?? 0;
+    while (
+      makerMaximum > tickSize &&
+      entryCostPerShare +
+          makerAllInPerShare(
+            makerMaximum,
+            makerRate,
+            snapshot.takerFeeExponent,
+          ) >
+        1 - config.ladderV6MinNetEdge + EPSILON
+    ) {
+      makerMaximum = floorToTick(
+        makerMaximum - tickSize,
+        tickSize,
+      );
+    }
     const makerPrice = floorToTick(
       Math.min(
         makerMaximum,
@@ -559,11 +607,22 @@ export async function planLadderV6(
         plannedAllInPairCost:
           matchingMaker === undefined
             ? null
-            : entryCostPerShare + matchingMaker.limitPrice,
+            : entryCostPerShare +
+              makerAllInPerShare(
+                matchingMaker.limitPrice,
+                makerRate,
+                snapshot.takerFeeExponent,
+              ),
         plannedNetEdgePerPair:
           matchingMaker === undefined
             ? null
-            : 1 - entryCostPerShare - matchingMaker.limitPrice,
+            : 1 -
+              entryCostPerShare -
+              makerAllInPerShare(
+                matchingMaker.limitPrice,
+                makerRate,
+                snapshot.takerFeeExponent,
+              ),
       };
     }
 
@@ -593,14 +652,39 @@ export async function planLadderV6(
           pairLockEntryPrice: entryCostPerShare,
           referenceTokenId: surplus.book.tokenId,
           referenceAllInPrice: entryCostPerShare,
-          plannedAllInPairCost: entryCostPerShare + makerPrice,
+          plannedAllInPairCost:
+            entryCostPerShare +
+            makerAllInPerShare(
+              makerPrice,
+              makerRate,
+              snapshot.takerFeeExponent,
+            ),
           plannedNetEdgePerPair:
-            1 - entryCostPerShare - makerPrice,
+            1 -
+            entryCostPerShare -
+            makerAllInPerShare(
+              makerPrice,
+              makerRate,
+              snapshot.takerFeeExponent,
+            ),
         },
       ],
       plannedOpeningBid: makerPrice,
-      plannedAllInPairCost: entryCostPerShare + makerPrice,
-      plannedNetEdgePerPair: 1 - entryCostPerShare - makerPrice,
+      plannedAllInPairCost:
+        entryCostPerShare +
+        makerAllInPerShare(
+          makerPrice,
+          makerRate,
+          snapshot.takerFeeExponent,
+        ),
+      plannedNetEdgePerPair:
+        1 -
+        entryCostPerShare -
+        makerAllInPerShare(
+          makerPrice,
+          makerRate,
+          snapshot.takerFeeExponent,
+        ),
     };
   }
 

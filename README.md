@@ -1,6 +1,8 @@
-# Polymarket Reverse Arbitrage Bot
+# Polymarket / Kalshi Reverse Arbitrage Bot
 
-TypeScript automation for my Polymarket reverse strategy on **15-minute BTC/ETH Up or Down** markets.
+TypeScript automation for the reverse and paired-ladder strategies on binary
+crypto markets. Set `EXCHANGE=polymarket` or `EXCHANGE=kalshi`; the strategy
+layer consumes the same normalized Up/Down books on either venue.
 
 ---
 
@@ -173,6 +175,58 @@ npm install
 cp .env.example .env
 npm start          # dry-run: logs orders, no submission
 ```
+
+### Run the same strategy on Kalshi
+
+Kalshi's 15-minute Bitcoin series is `KXBTC15M`. The adapter maps Kalshi
+YES to Up and NO to Down, reconstructs asks from the complementary bid book,
+and preserves the strategy's existing order policies (`post_only`, IOC/FAK,
+FOK, and GTC).
+
+```bash
+cp .env.kalshi-paper.example .env
+# Fill in KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY
+npm start
+```
+
+The Kalshi market-data WebSocket requires an authenticated handshake even in
+paper mode, so paper mode needs a Kalshi API key ID and RSA private key. Public
+REST discovery does not. Put the PEM in `KALSHI_PRIVATE_KEY`, surrounded by
+double quotes, with literal `\n` between lines:
+
+```env
+KALSHI_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+```
+
+Never commit a populated `.env`.
+
+Production endpoints:
+
+```env
+KALSHI_API_HOST=https://external-api.kalshi.com/trade-api/v2
+KALSHI_WS_HOST=wss://external-api-ws.kalshi.com/trade-api/ws/v2
+```
+
+Demo endpoints:
+
+```env
+KALSHI_API_HOST=https://external-api.demo.kalshi.co/trade-api/v2
+KALSHI_WS_HOST=wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2
+```
+
+Kalshi fees can differ by series. `KALSHI_TAKER_FEE_RATE` and
+`KALSHI_MAKER_FEE_RATE` are the coefficients in
+`contracts × rate × price × (1-price)`. Confirm them against the current fee
+disclosure before trusting paper P/L. Defaults are `0.07` taker and `0` maker.
+
+For live Kalshi orders, switch to `EXECUTION_MODE=live` and set:
+
+```env
+LIVE_TRADING_ACK=I_UNDERSTAND_REAL_MONEY_IS_AT_RISK
+KALSHI_SUBACCOUNT=0
+```
+
+Polymarket wallet and CLOB credentials are ignored in Kalshi mode.
 
 ### Type 3 (`POLY_1271`) deposit wallet setup
 

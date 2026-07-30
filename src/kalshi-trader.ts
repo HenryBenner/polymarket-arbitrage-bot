@@ -7,6 +7,10 @@ import {
   type KalshiFill,
 } from "./kalshi-api.js";
 import { log } from "./logger.js";
+import {
+  minimumOrderRejection,
+  validateOrderMinimum,
+} from "./utils/order-validation.js";
 import type {
   MarketExecutionSnapshot,
   OrderExecutor,
@@ -105,6 +109,14 @@ export class KalshiTrader implements OrderExecutor {
   private async placeBuyLocked(
     opportunity: TradeOpportunity,
   ): Promise<OrderResult> {
+    const minimumFailure = validateOrderMinimum(opportunity);
+    if (minimumFailure) {
+      return minimumOrderRejection(
+        opportunity,
+        minimumFailure,
+        this.config.dryRun,
+      );
+    }
     if (this.config.dryRun) {
       return {
         dryRun: true,

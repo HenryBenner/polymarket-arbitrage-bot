@@ -424,7 +424,7 @@ test("paper settlement pays the winning shares and persists across restart", asy
     const books = testBooks();
     books[0]!.asks = [{ price: 0.4, size: 3 }];
     await trader.observeMarket(testEvent(), books);
-    await trader.placeBuy(opportunity(books[0]!, "winner", 0.45, 2));
+    await trader.placeBuy(opportunity(books[0]!, "winner", 0.45, 2.23));
     await trader.ingestMarketEvent({
       event_type: "market_resolved",
       winning_asset_id: "up-token",
@@ -432,9 +432,9 @@ test("paper settlement pays the winning shares and persists across restart", asy
 
     const settled = trader.snapshot();
     assert.equal(settled.settlements.length, 1);
-    assert.equal(settled.settlements[0]?.payout, 2);
-    assert.equal(settled.settlements[0]?.realizedPnl, 1.2);
-    assert.equal(settled.cash, 101.2);
+    assert.equal(settled.settlements[0]?.payout, 2.23);
+    assert.equal(settled.settlements[0]?.realizedPnl, 1.338);
+    assert.equal(settled.cash, 101.338);
     await trader.close();
 
     const restarted = new PaperTrader(config, {
@@ -445,7 +445,7 @@ test("paper settlement pays the winning shares and persists across restart", asy
     await restarted.init();
     assert.equal(restarted.snapshot().settlements.length, 1);
     const duplicate = await restarted.placeBuy(
-      opportunity(books[0]!, "winner", 0.45, 2),
+      opportunity(books[0]!, "winner", 0.45, 2.23),
     );
     assert.equal(
       (duplicate.response as { duplicate: boolean }).duplicate,

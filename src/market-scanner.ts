@@ -225,10 +225,21 @@ function kalshiEvent(
   config: BotConfig,
 ): UpDownEvent {
   const fees = kalshiFeeRatesForSeries(config, seriesTicker);
+  const priceRanges = (market.price_ranges ?? [])
+    .map((range) => ({
+      start: Number(range.start),
+      end: Number(range.end),
+      step: Number(range.step),
+    }))
+    .filter(
+      (range) =>
+        Number.isFinite(range.start) &&
+        Number.isFinite(range.end) &&
+        Number.isFinite(range.step) &&
+        range.step > 0,
+    );
   const tick = Math.min(
-    ...((market.price_ranges ?? [])
-      .map((range) => Number(range.step))
-      .filter((step) => Number.isFinite(step) && step > 0)),
+    ...priceRanges.map((range) => range.step),
     0.01,
   );
   return {
@@ -251,6 +262,7 @@ function kalshiEvent(
       outcomes: JSON.stringify(["Up", "Down"]),
       negRisk: false,
       orderPriceMinTickSize: tick,
+      orderPriceRanges: priceRanges,
       feesEnabled:
         fees.takerRate > 0 || fees.makerRate > 0,
       feeSchedule: {

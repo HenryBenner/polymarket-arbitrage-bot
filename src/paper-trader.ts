@@ -13,6 +13,10 @@ import { KalshiClient, kalshiTokenId } from "./kalshi-api.js";
 import { KalshiMarketStream } from "./kalshi-market-stream.js";
 import { log } from "./logger.js";
 import { MarketStream, type MarketStreamEvent } from "./market-stream.js";
+import {
+  minimumOrderRejection,
+  validateOrderMinimum,
+} from "./utils/order-validation.js";
 import type {
   GammaMarket,
   MarketExecutionSnapshot,
@@ -246,6 +250,11 @@ export class PaperTrader implements OrderExecutor {
         size: existing.originalSize,
         response: { paper: true, duplicate: true, orderId: existing.id },
       };
+    }
+
+    const minimumFailure = validateOrderMinimum(opportunity);
+    if (minimumFailure) {
+      return minimumOrderRejection(opportunity, minimumFailure, true);
     }
 
     const context = this.contexts.get(opportunity.event.slug);

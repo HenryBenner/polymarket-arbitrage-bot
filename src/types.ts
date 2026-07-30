@@ -28,6 +28,11 @@ export interface GammaMarket {
   outcomePrices?: string;
   negRisk: boolean;
   orderPriceMinTickSize: number;
+  orderPriceRanges?: Array<{
+    start: number;
+    end: number;
+    step: number;
+  }>;
   feesEnabled?: boolean;
   feeSchedule?: {
     exponent?: number;

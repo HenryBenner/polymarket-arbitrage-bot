@@ -12,6 +12,10 @@ import { createWalletClient, http } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { polygon } from "viem/chains";
 import type { BotConfig } from "./config.js";
+import {
+  minimumOrderRejection,
+  validateOrderMinimum,
+} from "./utils/order-validation.js";
 import type {
   MarketExecutionSnapshot,
   OrderExecutor,
@@ -175,6 +179,14 @@ export class Trader implements OrderExecutor {
   }
 
   async placeBuy(opportunity: TradeOpportunity): Promise<OrderResult> {
+    const minimumFailure = validateOrderMinimum(opportunity);
+    if (minimumFailure) {
+      return minimumOrderRejection(
+        opportunity,
+        minimumFailure,
+        this.config.dryRun,
+      );
+    }
     if (this.config.dryRun) {
       return {
         dryRun: true,

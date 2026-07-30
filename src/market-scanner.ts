@@ -1,4 +1,7 @@
-import type { BotConfig } from "./config.js";
+import {
+  kalshiFeeRatesForSeries,
+  type BotConfig,
+} from "./config.js";
 import {
   KalshiClient,
   kalshiTokenId,
@@ -13,6 +16,7 @@ import type {
   TokenBook,
   UpDownEvent,
 } from "./types.js";
+import { log } from "./logger.js";
 import {
   bestPrice,
   matchesSlugPrefixes,
@@ -140,35 +144,61 @@ export class MarketScanner {
   }
 
   private async scanKalshi(): Promise<UpDownEvent[]> {
-    const pages = await Promise.all(
+    const pages = await Promise.allSettled(
       this.config.kalshiSeriesTickers.map((series) =>
-        this.kalshi.getMarkets(series),
+        this.kalshi
+          .getMarkets(series)
+          .then((markets) => ({ series, markets })),
       ),
     );
     const now = Date.now() / 1_000;
     const results: UpDownEvent[] = [];
-    for (const market of pages.flat()) {
-      if (market.status !== "active" && market.status !== "open") continue;
-      const windowEnd = Date.parse(market.close_time) / 1_000;
-      if (!Number.isFinite(windowEnd)) continue;
-      const windowStart = windowEnd - WINDOW_SECONDS;
-      if (now < windowStart || now > windowEnd) continue;
-      const minutesLeft = (windowEnd - now) / 60;
-      if (
-        minutesLeft < this.config.minutesBeforeCloseMin ||
-        minutesLeft > this.config.minutesBeforeCloseMax
-      ) {
+    const seenMarketTickers = new Set<string>();
+    for (const [index, page] of pages.entries()) {
+      if (page.status === "rejected") {
+        const message =
+          page.reason instanceof Error
+            ? page.reason.message
+            : String(page.reason);
+        log("Kalshi series scan failed", {
+          series: this.config.kalshiSeriesTickers[index],
+          error: message,
+        });
         continue;
       }
-      const series =
-        this.config.kalshiSeriesTickers.find((ticker) =>
-          market.ticker.startsWith(`${ticker}-`),
-        ) ?? "KALSHI";
-      const asset =
-        series.match(/^KX([A-Z0-9]+?)15M$/)?.[1]?.toLowerCase() ?? "btc";
-      const slug = `${asset}-updown-15m-${Math.floor(windowStart)}`;
-      if (!matchesSlugPrefixes(slug, this.config.marketSlugPrefixes)) continue;
-      results.push(kalshiEvent(market, slug, windowStart, windowEnd, this.config));
+      const { series, markets } = page.value;
+      for (const market of markets) {
+        if (seenMarketTickers.has(market.ticker)) continue;
+        seenMarketTickers.add(market.ticker);
+        if (market.status !== "active" && market.status !== "open") {
+          continue;
+        }
+        const windowEnd = Date.parse(market.close_time) / 1_000;
+        if (!Number.isFinite(windowEnd)) continue;
+        const windowStart = windowEnd - WINDOW_SECONDS;
+        if (now < windowStart || now > windowEnd) continue;
+        const minutesLeft = (windowEnd - now) / 60;
+        if (
+          minutesLeft < this.config.minutesBeforeCloseMin ||
+          minutesLeft > this.config.minutesBeforeCloseMax
+        ) {
+          continue;
+        }
+        const asset =
+          series.match(/^KX([A-Z0-9]+)15M$/)?.[1]?.toLowerCase();
+        if (!asset) continue;
+        const slug = `${asset}-updown-15m-${Math.floor(windowStart)}`;
+        results.push(
+          kalshiEvent(
+            market,
+            series,
+            slug,
+            windowStart,
+            windowEnd,
+            this.config,
+          ),
+        );
+      }
     }
     return results;
   }
@@ -188,11 +218,13 @@ async function fetchOrderBook(clobHost: string, tokenId: string): Promise<OrderB
 
 function kalshiEvent(
   market: KalshiMarket,
+  seriesTicker: string,
   slug: string,
   windowStart: number,
   windowEnd: number,
   config: BotConfig,
 ): UpDownEvent {
+  const fees = kalshiFeeRatesForSeries(config, seriesTicker);
   const tick = Math.min(
     ...((market.price_ranges ?? [])
       .map((range) => Number(range.step))
@@ -207,6 +239,7 @@ function kalshiEvent(
     market: {
       exchange: "kalshi",
       externalMarketId: market.ticker,
+      seriesTicker,
       id: market.ticker,
       question: market.title || market.ticker,
       conditionId: market.ticker,
@@ -219,10 +252,10 @@ function kalshiEvent(
       negRisk: false,
       orderPriceMinTickSize: tick,
       feesEnabled:
-        config.kalshiTakerFeeRate > 0 || config.kalshiMakerFeeRate > 0,
+        fees.takerRate > 0 || fees.makerRate > 0,
       feeSchedule: {
-        rate: config.kalshiTakerFeeRate,
-        makerRate: config.kalshiMakerFeeRate,
+        rate: fees.takerRate,
+        makerRate: fees.makerRate,
         exponent: 1,
         rebateRate: 0,
       },

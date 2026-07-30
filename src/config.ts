@@ -40,6 +40,64 @@ function envList(key: string, fallback: string[]): string[] {
     .filter(Boolean);
 }
 
+function normalizedUniqueList(values: string[]): string[] {
+  return [...new Set(values.map((value) => value.trim().toUpperCase()).filter(Boolean))];
+}
+
+function kalshiSeriesFromEnv(): string[] {
+  if (process.env.CRYPTO_MARKETS !== undefined) {
+    return normalizedUniqueList((process.env.CRYPTO_MARKETS ?? "").split(","));
+  }
+  return normalizedUniqueList(
+    envList("KALSHI_SERIES_TICKERS", ["KXBTC15M"]),
+  );
+}
+
+export interface KalshiFeeRates {
+  takerRate: number;
+  makerRate: number;
+}
+
+function kalshiFeeOverridesFromEnv(): Record<string, KalshiFeeRates> {
+  const raw = process.env.KALSHI_FEE_OVERRIDES;
+  if (raw === undefined || raw.trim() === "") return {};
+  const overrides: Record<string, KalshiFeeRates> = {};
+  for (const item of raw.split(",")) {
+    const [rawSeries, rawTaker, rawMaker, ...extra] = item
+      .split(":")
+      .map((part) => part.trim());
+    const series = rawSeries?.toUpperCase();
+    const takerRate = Number(rawTaker);
+    const makerRate = Number(rawMaker);
+    if (
+      !series ||
+      rawTaker === undefined ||
+      rawMaker === undefined ||
+      extra.length > 0 ||
+      !Number.isFinite(takerRate) ||
+      !Number.isFinite(makerRate)
+    ) {
+      throw new Error(
+        `Invalid KALSHI_FEE_OVERRIDES entry: ${item}. ` +
+          "Use SERIES:TAKER_RATE:MAKER_RATE",
+      );
+    }
+    overrides[series] = { takerRate, makerRate };
+  }
+  return overrides;
+}
+
+function envNumberWithLegacy(
+  key: string,
+  legacyKey: string,
+  fallback: number,
+): number {
+  if (process.env[key] !== undefined && process.env[key] !== "") {
+    return envNumber(key, fallback);
+  }
+  return envNumber(legacyKey, fallback);
+}
+
 export interface BotConfig {
   exchange: ExchangeName;
   strategyMode: StrategyMode;
@@ -75,9 +133,10 @@ export interface BotConfig {
   kalshiSubaccount: number;
   kalshiTakerFeeRate: number;
   kalshiMakerFeeRate: number;
+  kalshiFeeOverrides: Record<string, KalshiFeeRates>;
   ladderPreset: LadderPreset;
   ladderSizeScale: number;
-  ladderLiveMaxUsdcPerMarket: number;
+  ladderMaxUsdcPerMarket: number;
   ladderLiveAck?: string;
   staticMakerMaxShares: number;
   staticMakerMaxUsdcPerMarket: number;
@@ -92,6 +151,18 @@ export interface BotConfig {
   ladderV6MaxRescueLoss: number;
   paperStartingUsdc: number;
   paperStatePath: string;
+}
+
+export function kalshiFeeRatesForSeries(
+  config: BotConfig,
+  seriesTicker: string,
+): KalshiFeeRates {
+  return (
+    config.kalshiFeeOverrides[seriesTicker] ?? {
+      takerRate: config.kalshiTakerFeeRate,
+      makerRate: config.kalshiMakerFeeRate,
+    }
+  );
 }
 
 export function loadConfig(): BotConfig {
@@ -171,13 +242,18 @@ export function loadConfig(): BotConfig {
     ),
     kalshiApiKeyId: process.env.KALSHI_API_KEY_ID,
     kalshiPrivateKeyPem: process.env.KALSHI_PRIVATE_KEY,
-    kalshiSeriesTickers: envList("KALSHI_SERIES_TICKERS", ["KXBTC15M"]),
+    kalshiSeriesTickers: kalshiSeriesFromEnv(),
     kalshiSubaccount: envNumber("KALSHI_SUBACCOUNT", 0),
     kalshiTakerFeeRate: envNumber("KALSHI_TAKER_FEE_RATE", 0.07),
     kalshiMakerFeeRate: envNumber("KALSHI_MAKER_FEE_RATE", 0),
+    kalshiFeeOverrides: kalshiFeeOverridesFromEnv(),
     ladderPreset: ladderPreset as LadderPreset,
     ladderSizeScale: envNumber("LADDER_SIZE_SCALE", 1),
-    ladderLiveMaxUsdcPerMarket: envNumber("LADDER_LIVE_MAX_USDC_PER_MARKET", 65),
+    ladderMaxUsdcPerMarket: envNumberWithLegacy(
+      "LADDER_MAX_USDC_PER_MARKET",
+      "LADDER_LIVE_MAX_USDC_PER_MARKET",
+      65,
+    ),
     ladderLiveAck: process.env.LADDER_LIVE_ACK,
     staticMakerMaxShares: envNumber("STATIC_MAKER_MAX_SHARES", 90),
     staticMakerMaxUsdcPerMarket: envNumber(
@@ -214,8 +290,8 @@ export function validateTradingConfig(config: BotConfig): void {
   if (!Number.isInteger(config.ladderSizeScale) || config.ladderSizeScale < 1) {
     throw new Error("LADDER_SIZE_SCALE must be an integer of at least 1");
   }
-  if (!Number.isFinite(config.ladderLiveMaxUsdcPerMarket) || config.ladderLiveMaxUsdcPerMarket <= 0) {
-    throw new Error("LADDER_LIVE_MAX_USDC_PER_MARKET must be greater than 0");
+  if (!Number.isFinite(config.ladderMaxUsdcPerMarket) || config.ladderMaxUsdcPerMarket <= 0) {
+    throw new Error("LADDER_MAX_USDC_PER_MARKET must be greater than 0");
   }
   if (!Number.isFinite(config.paperStartingUsdc) || config.paperStartingUsdc <= 0) {
     throw new Error("PAPER_STARTING_USDC must be greater than 0");
@@ -326,16 +402,27 @@ export function validateTradingConfig(config: BotConfig): void {
     config.ladderSizeScale > 6
   ) {
     throw new Error(
-      "ladder_v5 is limited to LADDER_SIZE_SCALE=1 through 6 during paper validation",
+      "ladder_v5 is limited to LADDER_SIZE_SCALE=1 through 6",
     );
   }
   if (
+    config.exchange === "polymarket" &&
     config.strategyMode !== "reverse" &&
     (config.marketSlugPrefixes.length !== 1 ||
       config.marketSlugPrefixes[0] !== "btc-updown-15m")
   ) {
     throw new Error(
-      "Non-reverse strategies only support MARKET_SLUG_PREFIXES=btc-updown-15m",
+      "Non-reverse Polymarket strategies only support MARKET_SLUG_PREFIXES=btc-updown-15m",
+    );
+  }
+  if (
+    config.exchange === "kalshi" &&
+    config.strategyMode === "odahoa_static_maker" &&
+    (config.kalshiSeriesTickers.length !== 1 ||
+      config.kalshiSeriesTickers[0] !== "KXBTC15M")
+  ) {
+    throw new Error(
+      "odahoa_static_maker only supports CRYPTO_MARKETS=KXBTC15M",
     );
   }
   if (
@@ -348,10 +435,14 @@ export function validateTradingConfig(config: BotConfig): void {
   }
   if (
     config.strategyMode === "ladder_v5" &&
-    config.executionMode !== "paper"
+    config.executionMode !== "paper" &&
+    !(
+      config.exchange === "kalshi" &&
+      config.executionMode === "live"
+    )
   ) {
     throw new Error(
-      "ladder_v5 is paper-only until its forward results are reviewed",
+      "ladder_v5 supports paper mode on either venue and live mode on Kalshi",
     );
   }
   if (
@@ -408,7 +499,14 @@ export function validateTradingConfig(config: BotConfig): void {
       );
     }
     if (config.kalshiSeriesTickers.length === 0) {
-      throw new Error("KALSHI_SERIES_TICKERS must contain at least one series");
+      throw new Error("CRYPTO_MARKETS must contain at least one series");
+    }
+    for (const series of config.kalshiSeriesTickers) {
+      if (!/^KX[A-Z0-9]+15M$/.test(series)) {
+        throw new Error(
+          `Invalid Kalshi crypto series "${series}"; expected KX<ASSET>15M`,
+        );
+      }
     }
     if (
       !Number.isInteger(config.kalshiSubaccount) ||
@@ -423,6 +521,25 @@ export function validateTradingConfig(config: BotConfig): void {
     ] as const) {
       if (!Number.isFinite(value) || value < 0 || value >= 1) {
         throw new Error(`${name} must be at least 0 and less than 1`);
+      }
+    }
+    for (const [series, rates] of Object.entries(
+      config.kalshiFeeOverrides,
+    )) {
+      if (!/^KX[A-Z0-9]+15M$/.test(series)) {
+        throw new Error(
+          `Invalid KALSHI_FEE_OVERRIDES series "${series}"`,
+        );
+      }
+      for (const [name, value] of [
+        ["taker", rates.takerRate],
+        ["maker", rates.makerRate],
+      ] as const) {
+        if (!Number.isFinite(value) || value < 0 || value >= 1) {
+          throw new Error(
+            `KALSHI_FEE_OVERRIDES ${series} ${name} rate must be at least 0 and less than 1`,
+          );
+        }
       }
     }
     const hasKeyId = Boolean(config.kalshiApiKeyId);
@@ -450,12 +567,18 @@ export function validateTradingConfig(config: BotConfig): void {
       new Map(),
       config.ladderPreset,
     );
-    if (projectedExposure > config.ladderLiveMaxUsdcPerMarket) {
+    if (projectedExposure > config.ladderMaxUsdcPerMarket) {
       throw new Error(
         `Ladder projected exposure $${projectedExposure.toFixed(2)} exceeds ` +
-          `LADDER_LIVE_MAX_USDC_PER_MARKET=$${config.ladderLiveMaxUsdcPerMarket.toFixed(2)}`,
+          `LADDER_MAX_USDC_PER_MARKET=$${config.ladderMaxUsdcPerMarket.toFixed(2)}`,
       );
     }
+  }
+  if (
+    config.strategyMode === "odahoa_ladder" ||
+    config.strategyMode === "odahoa_ladder_2" ||
+    config.strategyMode === "ladder_v5"
+  ) {
     if (
       config.ladderLiveAck !==
       "I_UNDERSTAND_LADDER_MODE_CAN_LOSE_REAL_MONEY"

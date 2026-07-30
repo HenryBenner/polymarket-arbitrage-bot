@@ -23,8 +23,14 @@ import type {
   UpDownEvent,
 } from "./types.js";
 import { formatReturnPct } from "./utils/prices.js";
+
+export interface MarketSource {
+  scan(): Promise<UpDownEvent[]>;
+  getTokenBooks(event: UpDownEvent): Promise<TokenBook[]>;
+}
+
 export class ReverseBot {
-  private readonly scanner: MarketScanner;
+  private readonly scanner: MarketSource;
   private readonly tracker = new TradeTracker();
   private readonly ladderTracker: LadderTracker;
   private readonly pairLockEvents = new Map<
@@ -36,13 +42,15 @@ export class ReverseBot {
     { event: UpDownEvent; books: TokenBook[] }
   >();
   private readonly ladderV6Queues = new Map<string, Promise<void>>();
+  private readonly marketQueues = new Map<string, Promise<void>>();
   private ladderTickRunning = false;
 
   constructor(
     private readonly config: BotConfig,
     private readonly trader: OrderExecutor,
+    scanner?: MarketSource,
   ) {
-    this.scanner = new MarketScanner(config);
+    this.scanner = scanner ?? new MarketScanner(config);
     this.ladderTracker = new LadderTracker(
       config.paperStatePath,
       config.strategyMode === "odahoa_ladder_2"
@@ -91,7 +99,19 @@ export class ReverseBot {
       expensiveHedge: this.config.enableExpensiveHedge
         ? `${this.config.expensiveBuyMin}-${this.config.expensiveBuyMax}`
         : "disabled",
-      markets: this.config.marketSlugPrefixes,
+      markets:
+        this.config.exchange === "kalshi"
+          ? this.config.kalshiSeriesTickers
+          : this.config.marketSlugPrefixes,
+      ladderMaxUsdcPerMarket:
+        this.config.strategyMode === "reverse" ||
+        this.config.strategyMode === "odahoa_static_maker"
+          ? undefined
+          : this.config.ladderMaxUsdcPerMarket,
+      kalshiFeeOverrides:
+        this.config.exchange === "kalshi"
+          ? this.config.kalshiFeeOverrides
+          : undefined,
       dryRun: this.config.dryRun,
       pollMs: this.config.pollIntervalMs,
       ladderPreset:
@@ -133,8 +153,12 @@ export class ReverseBot {
           : undefined,
     });
 
-    await this.scheduledTick();
+    await this.runOnce();
     setInterval(() => void this.scheduledTick(), this.config.pollIntervalMs);
+  }
+
+  async runOnce(): Promise<void> {
+    await this.scheduledTick();
   }
 
   private async scheduledTick(): Promise<void> {
@@ -164,13 +188,44 @@ export class ReverseBot {
         return;
       }
 
-      for (const event of events) {
-        await this.processEvent(event);
+      if (this.config.strategyMode === "reverse") {
+        for (const event of events) {
+          await this.processEvent(event);
+        }
+        return;
       }
+      await Promise.all(
+        events.map((event) => this.enqueueMarket(event)),
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       log("Scan error", { error: message });
     }
+  }
+
+  private enqueueMarket(event: UpDownEvent): Promise<void> {
+    const previous =
+      this.marketQueues.get(event.slug) ?? Promise.resolve();
+    const queued = previous
+      .catch(() => undefined)
+      .then(() => this.processEvent(event))
+      .catch((error) => {
+        const message =
+          error instanceof Error ? error.message : String(error);
+        log("Market processing error", {
+          market: event.slug,
+          series: event.market.seriesTicker,
+          error: message,
+        });
+      });
+    this.marketQueues.set(event.slug, queued);
+    const cleanup = () => {
+      if (this.marketQueues.get(event.slug) === queued) {
+        this.marketQueues.delete(event.slug);
+      }
+    };
+    void queued.then(cleanup, cleanup);
+    return queued;
   }
 
   private async processEvent(event: UpDownEvent): Promise<void> {
@@ -261,7 +316,8 @@ export class ReverseBot {
       potentialReturn: formatReturnPct(opportunity.price),
     });
 
-    const result = await this.trader.placeBuy(opportunity);
+    const preparedOpportunity = this.withCapitalEffect(opportunity);
+    const result = await this.trader.placeBuy(preparedOpportunity);
     if (result.accepted === false) {
       log("Order rejected", {
         tokenId: result.tokenId,
@@ -298,6 +354,48 @@ export class ReverseBot {
       response: result.response,
     });
     return true;
+  }
+
+  private withCapitalEffect(
+    opportunity: TradeOpportunity,
+  ): TradeOpportunity {
+    if (
+      opportunity.strategyMode === undefined ||
+      opportunity.strategyMode === "reverse" ||
+      opportunity.strategyMode === "odahoa_static_maker"
+    ) {
+      return opportunity;
+    }
+    if (
+      opportunity.pairLockRole === "completion_maker" ||
+      opportunity.pairLockRole === "completion_taker"
+    ) {
+      return { ...opportunity, capitalEffect: "reduce" };
+    }
+    const snapshot = this.trader.getMarketExecutionSnapshot?.(
+      opportunity.event.slug,
+    );
+    if (!snapshot) {
+      return { ...opportunity, capitalEffect: "increase" };
+    }
+    const tokenShares =
+      snapshot.positions.find(
+        (position) => position.tokenId === opportunity.token.tokenId,
+      )?.shares ?? 0;
+    const oppositeShares = Math.max(
+      0,
+      ...snapshot.positions
+        .filter(
+          (position) =>
+            position.tokenId !== opportunity.token.tokenId,
+        )
+        .map((position) => position.shares),
+    );
+    return {
+      ...opportunity,
+      capitalEffect:
+        tokenShares + 1e-8 < oppositeShares ? "reduce" : "increase",
+    };
   }
 
   private async processPairLockEvent(
@@ -380,7 +478,8 @@ export class ReverseBot {
       }
       const opportunity = plan.opportunities[0];
       if (!opportunity) break;
-      if (await this.executeOpportunity(opportunity)) submitted += 1;
+      if (!(await this.executeOpportunity(opportunity))) break;
+      submitted += 1;
     }
     if (submitted === 0 && cancelled === 0) {
       log("Watching ladder_v5 market", {
@@ -526,13 +625,13 @@ export class ReverseBot {
       minimums,
       this.config.ladderPreset,
     );
-    if (projected <= this.config.ladderLiveMaxUsdcPerMarket + 1e-9) return;
+    if (projected <= this.config.ladderMaxUsdcPerMarket + 1e-9) return;
 
     await this.ladderTracker.blockExposure(event.slug);
     log("Ladder market blocked by live exposure cap", {
       market: event.slug,
       projectedUsdc: projected,
-      capUsdc: this.config.ladderLiveMaxUsdcPerMarket,
+      capUsdc: this.config.ladderMaxUsdcPerMarket,
       reason: "live CLOB minimum size raised projected exposure",
     });
   }

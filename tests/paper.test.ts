@@ -36,6 +36,36 @@ function opportunity(
   };
 }
 
+function eventFor(asset: string): ReturnType<typeof testEvent> {
+  const base = testEvent();
+  const slug = `${asset}-updown-15m-1000000000`;
+  return {
+    ...base,
+    title: `${asset.toUpperCase()} Up or Down - Test`,
+    slug,
+    market: {
+      ...base.market,
+      id: `${asset}-market`,
+      conditionId: `${asset}-condition`,
+      slug,
+      clobTokenIds: JSON.stringify([
+        `${asset}-up-token`,
+        `${asset}-down-token`,
+      ]),
+    },
+  };
+}
+
+function booksForAsset(asset: string): TokenBook[] {
+  return testBooks(0.9, 0.9).map((book) => ({
+    ...book,
+    tokenId:
+      book.outcome === "Up"
+        ? `${asset}-up-token`
+        : `${asset}-down-token`,
+  }));
+}
+
 test("paper trading handles immediate partial fills, queue-ahead, resting fills, and deduplication", async () => {
   const directory = await mkdtemp(join(tmpdir(), "paper-fill-"));
   try {
@@ -450,6 +480,140 @@ test("paper settlement also handles the opposite outcome winning", async () => {
     assert.equal(trader.snapshot().settlements[0]?.winningOutcome, "Down");
     assert.equal(trader.snapshot().settlements[0]?.payout, 2);
     assert.equal(trader.snapshot().settlements[0]?.realizedPnl, 1);
+    await trader.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("simultaneous markets cannot overspend the shared paper balance", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paper-shared-cash-"));
+  try {
+    const trader = new PaperTrader(
+      testConfig({
+        paperStatePath: directory,
+        paperStartingUsdc: 10,
+        ladderMaxUsdcPerMarket: 65,
+      }),
+      {
+        stream: fakeStream,
+        feeLoader: async () => ({ rate: 0, exponent: 1 }),
+        settlementLoader: async () => null,
+      },
+    );
+    await trader.init();
+    const adaEvent = eventFor("ada");
+    const btcEvent = eventFor("btc");
+    const adaBooks = booksForAsset("ada");
+    const btcBooks = booksForAsset("btc");
+    await Promise.all([
+      trader.observeMarket(adaEvent, adaBooks),
+      trader.observeMarket(btcEvent, btcBooks),
+    ]);
+
+    const results = await Promise.allSettled([
+      trader.placeBuy({
+        ...opportunity(adaBooks[0]!, "ada-opening", 0.4, 15),
+        event: adaEvent,
+        token: adaBooks[0]!,
+        orderPolicy: "post_only",
+        capitalEffect: "increase",
+      }),
+      trader.placeBuy({
+        ...opportunity(btcBooks[0]!, "btc-opening", 0.4, 15),
+        event: btcEvent,
+        token: btcBooks[0]!,
+        orderPolicy: "post_only",
+        capitalEffect: "increase",
+      }),
+    ]);
+
+    assert.equal(
+      results.filter((result) => result.status === "fulfilled").length,
+      1,
+    );
+    assert.equal(
+      results.filter((result) => result.status === "rejected").length,
+      1,
+    );
+    assert.equal(trader.snapshot().orders.length, 1);
+    await trader.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("per-market caps are independent and never block a reducing hedge", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paper-market-cap-"));
+  try {
+    const trader = new PaperTrader(
+      testConfig({
+        paperStatePath: directory,
+        paperStartingUsdc: 100,
+        ladderMaxUsdcPerMarket: 5,
+      }),
+      {
+        stream: fakeStream,
+        feeLoader: async () => ({ rate: 0, exponent: 1 }),
+        settlementLoader: async () => null,
+      },
+    );
+    await trader.init();
+    const adaEvent = eventFor("ada");
+    const btcEvent = eventFor("btc");
+    const adaBooks = booksForAsset("ada");
+    const btcBooks = booksForAsset("btc");
+    await trader.observeMarket(adaEvent, adaBooks);
+    await trader.observeMarket(btcEvent, btcBooks);
+
+    const adaOpening = await trader.placeBuy({
+      ...opportunity(adaBooks[0]!, "ada-cap-opening", 0.4, 10),
+      event: adaEvent,
+      token: adaBooks[0]!,
+      orderPolicy: "post_only",
+      capitalEffect: "increase",
+    });
+    const btcOpening = await trader.placeBuy({
+      ...opportunity(btcBooks[0]!, "btc-cap-opening", 0.4, 10),
+      event: btcEvent,
+      token: btcBooks[0]!,
+      orderPolicy: "post_only",
+      capitalEffect: "increase",
+    });
+    assert.equal(adaOpening.accepted, true);
+    assert.equal(btcOpening.accepted, true);
+
+    const blocked = await trader.placeBuy({
+      ...opportunity(adaBooks[0]!, "ada-cap-blocked", 0.2, 10),
+      event: adaEvent,
+      token: adaBooks[0]!,
+      orderPolicy: "post_only",
+      capitalEffect: "increase",
+    });
+    assert.equal(blocked.accepted, false);
+    assert.equal(
+      (blocked.response as { reason: string }).reason,
+      "per_market_cap",
+    );
+
+    const hedge = await trader.placeBuy({
+      ...opportunity(adaBooks[1]!, "ada-cap-hedge", 0.4, 10),
+      event: adaEvent,
+      token: adaBooks[1]!,
+      orderPolicy: "post_only",
+      capitalEffect: "reduce",
+    });
+    assert.equal(hedge.accepted, true);
+    assert.equal(
+      trader.getMarketExecutionSnapshot(adaEvent.slug)
+        ?.capitalCommitted,
+      8,
+    );
+    assert.equal(
+      trader.getMarketExecutionSnapshot(btcEvent.slug)
+        ?.capitalCommitted,
+      4,
+    );
     await trader.close();
   } finally {
     await rm(directory, { recursive: true, force: true });

@@ -169,6 +169,7 @@ export class LadderTracker {
   private readonly submittedKeys = new Set<string>();
   private readonly blockedMarkets = new Set<string>();
   private readonly statePath: string;
+  private operationQueue: Promise<void> = Promise.resolve();
 
   constructor(
     stateDirectory: string,
@@ -209,34 +210,36 @@ export class LadderTracker {
     phase: LadderPhase,
     books: TokenBook[],
   ): Promise<LadderPhaseLock | null> {
-    const existing = this.getLock(event.slug, phase.id);
-    if (existing) return existing;
+    return this.serialize(async () => {
+      const existing = this.getLock(event.slug, phase.id);
+      if (existing) return existing;
 
-    const complete = books.filter((book) => book.bestAsk !== null);
-    if (complete.length !== 2) return null;
+      const complete = books.filter((book) => book.bestAsk !== null);
+      if (complete.length !== 2) return null;
 
-    const ranked = [...complete].sort((left, right) => {
-      const difference = (left.bestAsk ?? 1) - (right.bestAsk ?? 1);
-      return difference !== 0
-        ? difference
-        : left.outcomeIndex - right.outcomeIndex;
+      const ranked = [...complete].sort((left, right) => {
+        const difference = (left.bestAsk ?? 1) - (right.bestAsk ?? 1);
+        return difference !== 0
+          ? difference
+          : left.outcomeIndex - right.outcomeIndex;
+      });
+      const cheap = ranked[0];
+      const favorite = ranked[1];
+      if (!cheap || !favorite) return null;
+
+      const lock: LadderPhaseLock = {
+        marketSlug: event.slug,
+        phaseId: phase.id,
+        cheapTokenId: cheap.tokenId,
+        cheapOutcome: cheap.outcome,
+        favoriteTokenId: favorite.tokenId,
+        favoriteOutcome: favorite.outcome,
+        createdAt: new Date().toISOString(),
+      };
+      this.state.locks[phaseLockKey(event.slug, phase.id)] = lock;
+      await this.persist();
+      return lock;
     });
-    const cheap = ranked[0];
-    const favorite = ranked[1];
-    if (!cheap || !favorite) return null;
-
-    const lock: LadderPhaseLock = {
-      marketSlug: event.slug,
-      phaseId: phase.id,
-      cheapTokenId: cheap.tokenId,
-      cheapOutcome: cheap.outcome,
-      favoriteTokenId: favorite.tokenId,
-      favoriteOutcome: favorite.outcome,
-      createdAt: new Date().toISOString(),
-    };
-    this.state.locks[phaseLockKey(event.slug, phase.id)] = lock;
-    await this.persist();
-    return lock;
   }
 
   makeKey(
@@ -253,10 +256,12 @@ export class LadderTracker {
   }
 
   async mark(key: string): Promise<void> {
-    if (this.submittedKeys.has(key)) return;
-    this.submittedKeys.add(key);
-    this.state.submittedKeys = [...this.submittedKeys];
-    await this.persist();
+    await this.serialize(async () => {
+      if (this.submittedKeys.has(key)) return;
+      this.submittedKeys.add(key);
+      this.state.submittedKeys = [...this.submittedKeys];
+      await this.persist();
+    });
   }
 
   isExposureBlocked(marketSlug: string): boolean {
@@ -264,10 +269,21 @@ export class LadderTracker {
   }
 
   async blockExposure(marketSlug: string): Promise<void> {
-    if (this.blockedMarkets.has(marketSlug)) return;
-    this.blockedMarkets.add(marketSlug);
-    this.state.exposureBlockedMarkets = [...this.blockedMarkets];
-    await this.persist();
+    await this.serialize(async () => {
+      if (this.blockedMarkets.has(marketSlug)) return;
+      this.blockedMarkets.add(marketSlug);
+      this.state.exposureBlockedMarkets = [...this.blockedMarkets];
+      await this.persist();
+    });
+  }
+
+  private serialize<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.operationQueue.then(operation, operation);
+    this.operationQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 
   private async persist(): Promise<void> {

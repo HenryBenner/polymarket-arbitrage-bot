@@ -13,10 +13,12 @@ export type PairLockOrderRole =
   | "opening"
   | "completion_maker"
   | "completion_taker";
+export type CapitalEffect = "increase" | "reduce";
 
 export interface GammaMarket {
   exchange?: ExchangeName;
   externalMarketId?: string;
+  seriesTicker?: string;
   id?: string;
   question: string;
   conditionId: string;
@@ -79,6 +81,7 @@ export interface TradeOpportunity {
   referenceAllInPrice?: number;
   plannedAllInPairCost?: number;
   plannedNetEdgePerPair?: number;
+  capitalEffect?: CapitalEffect;
 }
 
 export interface OrderResult {

@@ -176,12 +176,20 @@ cp .env.example .env
 npm start          # dry-run: logs orders, no submission
 ```
 
-### Run the same strategy on Kalshi
+### Run the same strategy across Kalshi crypto markets
 
-Kalshi's 15-minute Bitcoin series is `KXBTC15M`. The adapter maps Kalshi
-YES to Up and NO to Down, reconstructs asks from the complementary bid book,
-and preserves the strategy's existing order policies (`post_only`, IOC/FAK,
-FOK, and GTC).
+Choose any supported 15-minute crypto series with `CRYPTO_MARKETS`. The one
+selected `STRATEGY_MODE` runs concurrently across every configured series:
+
+```env
+CRYPTO_MARKETS=KXADA15M,KXBCH15M,KXBNB15M,KXBTC15M,KXDOGE15M,KXETH15M,KXHYPE15M,KXNEAR15M,KXSOL15M,KXTON15M,KXXRP15M,KXZEC15M
+LADDER_MAX_USDC_PER_MARKET=65
+```
+
+`CRYPTO_MARKETS` supersedes the legacy `KALSHI_SERIES_TICKERS` variable. The
+adapter maps Kalshi YES to Up and NO to Down, reconstructs asks from the
+complementary bid book, and preserves the strategy's existing order policies
+(`post_only`, IOC/FAK, FOK, and GTC).
 
 ```bash
 cp .env.kalshi-paper.example .env
@@ -218,6 +226,16 @@ Kalshi fees can differ by series. `KALSHI_TAKER_FEE_RATE` and
 `KALSHI_MAKER_FEE_RATE` are the coefficients in
 `contracts × rate × price × (1-price)`. Confirm them against the current fee
 disclosure before trusting paper P/L. Defaults are `0.07` taker and `0` maker.
+Series-specific overrides use `SERIES:TAKER:MAKER`:
+
+```env
+KALSHI_FEE_OVERRIDES=KXBTC15M:0.07:0,KXETH15M:0.07:0
+```
+
+All markets share one account balance. New exposure is capped independently
+per market, while profitable completion and risk-reducing hedge orders may
+finish a pair above the cap when shared cash is available. Five active markets
+at the default cap can commit up to `$325`; twelve can commit up to `$780`.
 
 For live Kalshi orders, switch to `EXECUTION_MODE=live` and set:
 
@@ -291,6 +309,8 @@ put the private key for a primary wallet holding unrelated assets into this bot.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MARKET_SLUG_PREFIXES` | `btc-updown-15m,eth-updown-15m` | Markets to scan |
+| `CRYPTO_MARKETS` | `KXBTC15M` | Kalshi 15-minute crypto series to run concurrently |
+| `LADDER_MAX_USDC_PER_MARKET` | `65` | Independent paper/live opening-exposure cap per ladder market |
 | `POLL_INTERVAL_MS` | `5000` | Scan interval |
 | `MINUTES_BEFORE_CLOSE_MIN` | `0` | Start trading N min into window |
 | `MINUTES_BEFORE_CLOSE_MAX` | `15` | Stop trading N min before close |
@@ -311,8 +331,10 @@ MINUTES_BEFORE_CLOSE_MAX=12
 ### Timed ladder paper mode
 
 The original strategy remains the default under `STRATEGY_MODE=reverse`.
-`STRATEGY_MODE=odahoa_ladder` is a separate BTC-only mode; it does not alter
-the reverse strategy's prices, tracker keys, order submission, or GTC lifecycle.
+`STRATEGY_MODE=odahoa_ladder` is a separate mode; it remains BTC-only on
+Polymarket and can run across all configured `CRYPTO_MARKETS` on Kalshi. It
+does not alter the reverse strategy's prices, tracker keys, order submission,
+or GTC lifecycle.
 
 Start from the dedicated paper example:
 
@@ -358,7 +380,7 @@ market resolution. Cycle summaries report committed/used capital, fill status,
 outcome inventory, fees, estimated maker rebates, payout shape, and settled
 P/L.
 
-### Ladder V5 paper candidate
+### Ladder V5 paper and Kalshi live mode
 
 `STRATEGY_MODE=ladder_v5` is the isolated forward-test candidate produced by
 the 179-session audit. It does not change V1, pair-lock, static-maker, or
@@ -371,7 +393,7 @@ reverse mode.
 | Filled-share imbalance | At most 70 shares |
 | Deficient-side pair cost | At most `$0.98`, including worst-case taker fee |
 | Order style | Ordinary GTC; taker fills remain allowed |
-| Scale | Paper validation is restricted to 1-6 |
+| Scale | Validation is restricted to 1-6 |
 
 Filled positions are the only hedge credit. An opposite resting order never
 reduces measured imbalance. Resting V5 orders are counted as additional
@@ -394,8 +416,22 @@ npm.cmd start
 
 The dedicated profile writes to `./data/paper-ladder-v5` with a `$2,000`
 starting paper balance. This is a forward test, not evidence that the
-post-hoc result will repeat. Keep it paper-only until it has a meaningful
-out-of-sample settlement count.
+post-hoc result will repeat.
+
+V5 live execution is supported on Kalshi. Polymarket V5 remains paper-only
+because its general live executor does not yet maintain the fill-aware ledger
+that V5 requires. Start from the conservative single-market live profile:
+
+```bat
+set "DOTENV_CONFIG_PATH=.env.ladder-v5-kalshi-live.example"
+npm.cmd start
+```
+
+Fill in the Kalshi API key and private key before starting. Live V5 requires
+both live acknowledgements, uses authenticated fills for inventory, checks the
+available Kalshi balance before every order, and applies
+`LADDER_MAX_USDC_PER_MARKET` independently to each configured series. Add
+markets to `CRYPTO_MARKETS` only after validating them in paper mode.
 
 ### Ladder V6 paper candidate
 
@@ -559,10 +595,12 @@ LIVE_TRADING_ACK=I_UNDERSTAND_REAL_MONEY_IS_AT_RISK
 LADDER_LIVE_ACK=I_UNDERSTAND_LADDER_MODE_CAN_LOSE_REAL_MONEY
 ```
 
-Startup rejects non-integer scales, non-BTC ladder markets, and projected
-scale exposure above `LADDER_LIVE_MAX_USDC_PER_MARKET` (default `$65`). If a
-larger live CLOB minimum pushes the projection over that cap, that market is
-blocked rather than silently resized.
+Startup rejects non-integer scales, non-BTC Polymarket ladder markets, malformed
+Kalshi series, and projected scale exposure above
+`LADDER_MAX_USDC_PER_MARKET` (default `$65`). The deprecated
+`LADDER_LIVE_MAX_USDC_PER_MARKET` remains a fallback when the new variable is
+unset. If a larger live minimum pushes the projection over the cap, only that
+market is blocked.
 
 ---
 

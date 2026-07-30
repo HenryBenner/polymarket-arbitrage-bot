@@ -69,6 +69,12 @@ export interface KalshiFill {
   ts?: number;
 }
 
+export interface KalshiBalance {
+  balance: number;
+  portfolio_value: number;
+  updated_ts: number;
+}
+
 function signingPath(apiHost: string, path: string): string {
   const base = new URL(apiHost);
   const suffix = path.startsWith("/") ? path : `/${path}`;
@@ -224,6 +230,20 @@ export class KalshiClient {
       `/portfolio/fills?${query}`,
     );
     return result.fills ?? [];
+  }
+
+  async getBalance(): Promise<number> {
+    const query = new URLSearchParams({
+      subaccount: String(this.config.kalshiSubaccount),
+    });
+    const result = await this.request<KalshiBalance>(
+      `/portfolio/balance?${query}`,
+    );
+    const cents = Number(result.balance);
+    if (!Number.isFinite(cents) || cents < 0) {
+      throw new Error(`Kalshi returned an invalid balance: ${result.balance}`);
+    }
+    return cents / 100;
   }
 
   private async request<T = unknown>(

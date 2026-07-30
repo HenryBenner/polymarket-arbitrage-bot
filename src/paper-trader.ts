@@ -128,10 +128,12 @@ export class PaperTrader implements OrderExecutor {
     string,
     { rate: number; makerRate: number; exponent: number; rebateRate: number }
   >();
+  private readonly loggedFeeMarkets = new Set<string>();
   private executionWakeHandler:
     | ((marketSlug: string) => void | Promise<void>)
     | undefined;
   private persistenceQueue: Promise<void> = Promise.resolve();
+  private executionQueue: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly config: BotConfig,
@@ -206,6 +208,17 @@ export class PaperTrader implements OrderExecutor {
     for (const book of books) this.tokenToMarket.set(book.tokenId, event.slug);
     this.stream.subscribe(books.map((book) => book.tokenId));
     await this.loadFeeConfig(event);
+    if (!this.loggedFeeMarkets.has(event.slug)) {
+      const fees = this.feeConfig(event.market);
+      this.loggedFeeMarkets.add(event.slug);
+      log("Paper market fee assumptions", {
+        market: event.slug,
+        series: event.market.seriesTicker,
+        takerRate: fees.rate,
+        makerRate: fees.makerRate,
+        exponent: fees.exponent,
+      });
+    }
     this.scheduleSettlementFallback(event);
 
     if (Date.now() / 1000 >= event.windowEnd) {
@@ -214,6 +227,12 @@ export class PaperTrader implements OrderExecutor {
   }
 
   async placeBuy(opportunity: TradeOpportunity): Promise<OrderResult> {
+    return this.serializeExecution(() => this.placeBuyLocked(opportunity));
+  }
+
+  private async placeBuyLocked(
+    opportunity: TradeOpportunity,
+  ): Promise<OrderResult> {
     const existing = this.state.orders.find(
       (order) => order.tradeKey === opportunity.tradeKey,
     );
@@ -227,15 +246,6 @@ export class PaperTrader implements OrderExecutor {
         size: existing.originalSize,
         response: { paper: true, duplicate: true, orderId: existing.id },
       };
-    }
-
-    const reserveNeeded = opportunity.price * opportunity.size;
-    const available = this.availableCash();
-    if (reserveNeeded > available + 1e-8) {
-      throw new Error(
-        `Paper balance too low: $${available.toFixed(2)} available, ` +
-          `$${reserveNeeded.toFixed(2)} required`,
-      );
     }
 
     const context = this.contexts.get(opportunity.event.slug);
@@ -264,6 +274,65 @@ export class PaperTrader implements OrderExecutor {
       context?.liquidity.get(opportunity.token.tokenId) ??
       opportunity.token.asks.map((level) => ({ ...level }));
     const feeConfig = this.feeConfig(opportunity.event.market);
+    const feeRate =
+      opportunity.orderPolicy === "post_only"
+        ? feeConfig.makerRate
+        : Math.max(feeConfig.rate, feeConfig.makerRate);
+    const estimatedFee =
+      opportunity.size *
+      feeRate *
+      Math.pow(
+        opportunity.price * (1 - opportunity.price),
+        feeConfig.exponent,
+      );
+    const reserveNeeded =
+      opportunity.price * opportunity.size + estimatedFee;
+    const capitalCommitted = this.marketCapitalCommitted(
+      opportunity.event.slug,
+    );
+    const projectedCommitment = capitalCommitted + reserveNeeded;
+    const ladderCapitalEffect =
+      opportunity.strategyMode !== undefined &&
+      opportunity.strategyMode !== "reverse" &&
+      opportunity.strategyMode !== "odahoa_static_maker"
+        ? (opportunity.capitalEffect ?? "increase")
+        : undefined;
+    if (
+      ladderCapitalEffect === "increase" &&
+      projectedCommitment > this.config.ladderMaxUsdcPerMarket + 1e-8
+    ) {
+      log("Ladder order skipped by per-market cap", {
+        market: opportunity.event.slug,
+        series: opportunity.event.market.seriesTicker,
+        capitalCommitted: round(capitalCommitted, 4),
+        prospectiveCapital: round(projectedCommitment, 4),
+        capUsdc: this.config.ladderMaxUsdcPerMarket,
+        capitalEffect: ladderCapitalEffect,
+      });
+      return {
+        dryRun: true,
+        accepted: false,
+        tokenId: opportunity.token.tokenId,
+        side: "BUY",
+        price: opportunity.price,
+        size: opportunity.size,
+        response: {
+          paper: true,
+          status: "rejected",
+          reason: "per_market_cap",
+          capitalCommitted: round(capitalCommitted, 4),
+          prospectiveCapital: round(projectedCommitment, 4),
+          capUsdc: this.config.ladderMaxUsdcPerMarket,
+        },
+      };
+    }
+    const available = this.availableCash();
+    if (reserveNeeded > available + 1e-8) {
+      throw new Error(
+        `Paper balance too low: $${available.toFixed(2)} available, ` +
+          `$${reserveNeeded.toFixed(2)} required`,
+      );
+    }
     let fokCanFill = opportunity.orderPolicy !== "fok";
     if (opportunity.orderPolicy === "fok") {
       let remaining = opportunity.size;
@@ -373,7 +442,24 @@ export class PaperTrader implements OrderExecutor {
     };
   }
 
+  private serializeExecution<T>(
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const result = this.executionQueue.then(operation, operation);
+    this.executionQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
   async cancelOrders(orderIds: string[]): Promise<void> {
+    await this.serializeExecution(() =>
+      this.cancelOrdersLocked(orderIds),
+    );
+  }
+
+  private async cancelOrdersLocked(orderIds: string[]): Promise<void> {
     if (orderIds.length === 0) return;
     const targets = new Set(orderIds);
     for (const order of this.state.orders) {
@@ -419,10 +505,17 @@ export class PaperTrader implements OrderExecutor {
       (sum, value) => sum + value.cost + value.fees,
       0,
     );
-    const committed = orders.reduce(
-      (sum, order) => sum + order.limitPrice * order.originalSize,
-      0,
-    );
+    const openCommitted = orders
+      .filter(
+        (order) =>
+          order.status === "open" || order.status === "partial",
+      )
+      .reduce(
+        (sum, order) =>
+          sum + order.limitPrice * order.remainingSize,
+        0,
+      );
+    const committed = used + openCommitted;
     const outcomeValues = [...outcomeTotals.entries()];
     const conservativeMatchedCost = (outcome: string, sharesToMatch: number) => {
       let remaining = sharesToMatch;
@@ -459,6 +552,10 @@ export class PaperTrader implements OrderExecutor {
       partial: orders.filter((order) => order.status === "partial").length,
       unfilled: orders.filter((order) => order.status === "open").length,
       capitalCommitted: round(committed, 4),
+      remainingMarketCapacity: round(
+        Math.max(0, this.config.ladderMaxUsdcPerMarket - committed),
+        4,
+      ),
       capitalUsed: round(used, 4),
       byOutcome: [...outcomeTotals.entries()].map(([outcome, value]) => ({
         outcome,
@@ -468,6 +565,7 @@ export class PaperTrader implements OrderExecutor {
       })),
       guaranteedPayout: round(guaranteedPayout, 4),
       outcomeDependentPayout: round(maximumPayout - guaranteedPayout, 4),
+      unmatchedShares: round(maximumPayout - guaranteedPayout, 4),
       fees: round(
         fills.reduce((sum, fill) => sum + fill.fee, 0),
         6,
@@ -496,6 +594,17 @@ export class PaperTrader implements OrderExecutor {
         effectivePairCost === null
           ? null
           : round(guaranteedPayout * (1 - effectivePairCost), 4),
+      feeAssumptions: (() => {
+        const context = this.contexts.get(marketSlug);
+        if (!context) return null;
+        const fees = this.feeConfig(context.event.market);
+        return {
+          series: context.event.market.seriesTicker,
+          takerRate: fees.rate,
+          makerRate: fees.makerRate,
+          exponent: fees.exponent,
+        };
+      })(),
       settledPnl:
         this.state.settlements.find(
           (settlement) => settlement.marketSlug === marketSlug,
@@ -525,6 +634,7 @@ export class PaperTrader implements OrderExecutor {
     this.stream.close();
     for (const timer of this.settlementTimers.values()) clearTimeout(timer);
     this.settlementTimers.clear();
+    await this.executionQueue;
     await this.persistenceQueue;
   }
 
@@ -605,6 +715,28 @@ export class PaperTrader implements OrderExecutor {
         0,
       );
     return round(this.state.cash - reserved);
+  }
+
+  private marketCapitalCommitted(marketSlug: string): number {
+    const capitalUsed = this.state.fills
+      .filter((fill) => fill.marketSlug === marketSlug)
+      .reduce(
+        (sum, fill) =>
+          sum + fill.price * fill.size + fill.fee,
+        0,
+      );
+    const openCommitted = this.state.orders
+      .filter(
+        (order) =>
+          order.marketSlug === marketSlug &&
+          (order.status === "open" || order.status === "partial"),
+      )
+      .reduce(
+        (sum, order) =>
+          sum + order.limitPrice * order.remainingSize,
+        0,
+      );
+    return round(capitalUsed + openCommitted);
   }
 
   private feeConfig(market: GammaMarket): {
@@ -859,12 +991,20 @@ export class PaperTrader implements OrderExecutor {
         order.limitPrice,
         fillSize,
         "maker",
-        this.feeConfigs.get(order.conditionId) ?? {
-          rate: 0.07,
-          makerRate: 0,
-          exponent: 1,
-          rebateRate: 0.2,
-        },
+        this.feeConfigs.get(order.conditionId) ??
+          this.feeConfig(
+            this.contexts.get(order.marketSlug)?.event.market ?? {
+              question: order.marketTitle,
+              conditionId: order.conditionId,
+              slug: order.marketSlug,
+              clobTokenIds: "[]",
+              outcomes: "[]",
+              negRisk: false,
+              orderPriceMinTickSize: 0.01,
+              active: true,
+              closed: false,
+            },
+          ),
         String(event.timestamp ?? new Date().toISOString()),
       );
       remainingTradeSize = round(remainingTradeSize - fillSize);
@@ -977,9 +1117,13 @@ export class PaperTrader implements OrderExecutor {
       }
       if (this.config.exchange === "kalshi") {
         this.feeConfigs.set(event.market.conditionId, {
-          rate: this.config.kalshiTakerFeeRate,
-          makerRate: this.config.kalshiMakerFeeRate,
-          exponent: 1,
+          rate:
+            event.market.feeSchedule?.rate ??
+            this.config.kalshiTakerFeeRate,
+          makerRate:
+            event.market.feeSchedule?.makerRate ??
+            this.config.kalshiMakerFeeRate,
+          exponent: event.market.feeSchedule?.exponent ?? 1,
           rebateRate: 0,
         });
         return;

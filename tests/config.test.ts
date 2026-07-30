@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateTradingConfig } from "../src/config.js";
+import {
+  kalshiFeeRatesForSeries,
+  loadConfig,
+  validateTradingConfig,
+} from "../src/config.js";
 import { testConfig } from "./helpers.js";
 
 test("paper ladder mode needs no wallet secrets", () => {
@@ -19,6 +23,115 @@ test("ladder v1 rejects non-BTC or multiple market prefixes", () => {
   );
 });
 
+test("Kalshi ladder modes accept multiple validated crypto series", () => {
+  const config = testConfig({
+    exchange: "kalshi",
+    strategyMode: "ladder_v5",
+    kalshiSeriesTickers: [
+      "KXADA15M",
+      "KXBTC15M",
+      "KXETH15M",
+      "KXSOL15M",
+      "KXXRP15M",
+    ],
+    kalshiApiKeyId: "key-id",
+    kalshiPrivateKeyPem:
+      "-----BEGIN PRIVATE KEY-----\\ntest\\n-----END PRIVATE KEY-----",
+  });
+  assert.doesNotThrow(() => validateTradingConfig(config));
+  assert.throws(
+    () =>
+      validateTradingConfig({
+        ...config,
+        strategyMode: "odahoa_static_maker",
+      }),
+    /only supports CRYPTO_MARKETS=KXBTC15M/,
+  );
+  assert.throws(
+    () =>
+      validateTradingConfig({
+        ...config,
+        kalshiSeriesTickers: ["BTC15M"],
+      }),
+    /expected KX<ASSET>15M/,
+  );
+});
+
+test("CRYPTO_MARKETS takes precedence, normalizes, and deduplicates", () => {
+  const keys = [
+    "CRYPTO_MARKETS",
+    "KALSHI_SERIES_TICKERS",
+    "KALSHI_FEE_OVERRIDES",
+    "LADDER_MAX_USDC_PER_MARKET",
+    "LADDER_LIVE_MAX_USDC_PER_MARKET",
+    "LADDER_PRESET",
+  ] as const;
+  const previous = new Map(
+    keys.map((key) => [key, process.env[key]]),
+  );
+  try {
+    process.env.CRYPTO_MARKETS =
+      " kxada15m, KXBTC15M,kxada15m ";
+    process.env.KALSHI_SERIES_TICKERS = "KXETH15M";
+    process.env.KALSHI_FEE_OVERRIDES =
+      "kxada15m:0.05:0.01";
+    process.env.LADDER_MAX_USDC_PER_MARKET = "72";
+    process.env.LADDER_LIVE_MAX_USDC_PER_MARKET = "61";
+    process.env.LADDER_PRESET = "odahoa_v1";
+    const config = loadConfig();
+    assert.deepEqual(config.kalshiSeriesTickers, [
+      "KXADA15M",
+      "KXBTC15M",
+    ]);
+    assert.equal(config.ladderMaxUsdcPerMarket, 72);
+    assert.deepEqual(
+      kalshiFeeRatesForSeries(config, "KXADA15M"),
+      { takerRate: 0.05, makerRate: 0.01 },
+    );
+    assert.deepEqual(
+      kalshiFeeRatesForSeries(config, "KXBTC15M"),
+      {
+        takerRate: config.kalshiTakerFeeRate,
+        makerRate: config.kalshiMakerFeeRate,
+      },
+    );
+  } finally {
+    for (const key of keys) {
+      const value = previous.get(key);
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test("Kalshi fee overrides reject malformed or out-of-range entries", () => {
+  assert.throws(
+    () =>
+      validateTradingConfig(
+        testConfig({
+          exchange: "kalshi",
+          executionMode: "dry_run",
+          kalshiFeeOverrides: {
+            KXBTC15M: { takerRate: 1, makerRate: 0 },
+          },
+        }),
+      ),
+    /KALSHI_FEE_OVERRIDES/,
+  );
+  const previous = process.env.KALSHI_FEE_OVERRIDES;
+  const previousPreset = process.env.LADDER_PRESET;
+  try {
+    process.env.KALSHI_FEE_OVERRIDES = "KXBTC15M:not-a-rate:0";
+    process.env.LADDER_PRESET = "odahoa_v1";
+    assert.throws(() => loadConfig(), /Invalid KALSHI_FEE_OVERRIDES/);
+  } finally {
+    if (previous === undefined) delete process.env.KALSHI_FEE_OVERRIDES;
+    else process.env.KALSHI_FEE_OVERRIDES = previous;
+    if (previousPreset === undefined) delete process.env.LADDER_PRESET;
+    else process.env.LADDER_PRESET = previousPreset;
+  }
+});
+
 test("live ladder mode enforces the projected cap before wallet startup", () => {
   assert.throws(
     () =>
@@ -27,7 +140,7 @@ test("live ladder mode enforces the projected cap before wallet startup", () => 
           executionMode: "live",
           dryRun: false,
           ladderSizeScale: 2,
-          ladderLiveMaxUsdcPerMarket: 65,
+          ladderMaxUsdcPerMarket: 65,
         }),
       ),
     /projected exposure \$113\.20 exceeds/,
@@ -137,7 +250,7 @@ test("static maker is BTC paper-only with a 90-share, $500 cap", () => {
   );
 });
 
-test("ladder_v5 is paper-only and enforces its statistical guardrails", () => {
+test("ladder_v5 supports Kalshi live mode and enforces its statistical guardrails", () => {
   const config = testConfig({
     strategyMode: "ladder_v5",
     executionMode: "paper",
@@ -153,7 +266,29 @@ test("ladder_v5 is paper-only and enforces its statistical guardrails", () => {
         executionMode: "live",
         dryRun: false,
       }),
-    /paper-only/,
+    /live mode on Kalshi/,
+  );
+  const kalshiLive = {
+    ...config,
+    exchange: "kalshi" as const,
+    executionMode: "live" as const,
+    dryRun: false,
+    kalshiSeriesTickers: ["KXBTC15M", "KXETH15M"],
+    kalshiApiKeyId: "key-id",
+    kalshiPrivateKeyPem:
+      "-----BEGIN PRIVATE KEY-----\\ntest\\n-----END PRIVATE KEY-----",
+    liveTradingAck: "I_UNDERSTAND_REAL_MONEY_IS_AT_RISK",
+    ladderLiveAck:
+      "I_UNDERSTAND_LADDER_MODE_CAN_LOSE_REAL_MONEY",
+  };
+  assert.doesNotThrow(() => validateTradingConfig(kalshiLive));
+  assert.throws(
+    () =>
+      validateTradingConfig({
+        ...kalshiLive,
+        ladderLiveAck: undefined,
+      }),
+    /Live ladder mode is locked/,
   );
   assert.throws(
     () => validateTradingConfig({ ...config, ladderSizeScale: 7 }),

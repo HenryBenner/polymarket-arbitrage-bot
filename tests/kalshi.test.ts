@@ -4,6 +4,9 @@ import {
   generateKeyPairSync,
   verify,
 } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { validateTradingConfig } from "../src/config.js";
 import {
@@ -12,8 +15,14 @@ import {
   kalshiTokenId,
   parseKalshiTokenId,
 } from "../src/kalshi-api.js";
-import { kalshiBooks } from "../src/market-scanner.js";
-import { testConfig } from "./helpers.js";
+import { KalshiMarketStream } from "../src/kalshi-market-stream.js";
+import { KalshiTrader } from "../src/kalshi-trader.js";
+import {
+  kalshiBooks,
+  MarketScanner,
+} from "../src/market-scanner.js";
+import type { TradeOpportunity } from "../src/types.js";
+import { testConfig, testEvent } from "./helpers.js";
 
 test("Kalshi YES/NO bids normalize into complementary Up/Down books", () => {
   const books = kalshiBooks("KXBTC15M-TEST", {
@@ -147,6 +156,42 @@ test("Kalshi order entry maps Up to a YES bid and Down to a complementary YES as
   assert.equal(requests[1]?.time_in_force, "fill_or_kill");
 });
 
+test("Kalshi balance is loaded from the configured subaccount in dollars", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+  });
+  const originalFetch = globalThis.fetch;
+  let requestedUrl = "";
+  globalThis.fetch = async (input) => {
+    requestedUrl = String(input);
+    return new Response(
+      JSON.stringify({
+        balance: 12_345,
+        portfolio_value: 13_000,
+        updated_ts: Date.now(),
+      }),
+      { status: 200 },
+    );
+  };
+  try {
+    const client = new KalshiClient(
+      testConfig({
+        exchange: "kalshi",
+        kalshiSubaccount: 3,
+        kalshiApiKeyId: "test-key",
+        kalshiPrivateKeyPem: privateKey
+          .export({ format: "pem", type: "pkcs8" })
+          .toString(),
+      }),
+    );
+    await client.init();
+    assert.equal(await client.getBalance(), 123.45);
+    assert.match(requestedUrl, /portfolio\/balance\?subaccount=3$/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("Kalshi paper mode requires WebSocket credentials and official endpoints", () => {
   const base = testConfig({
     exchange: "kalshi",
@@ -175,4 +220,258 @@ test("Kalshi paper mode requires WebSocket credentials and official endpoints", 
       }),
     /official production or demo/,
   );
+});
+
+test("Kalshi scanner discovers multiple crypto series independently of Polymarket prefixes", async () => {
+  const originalFetch = globalThis.fetch;
+  const closeTime = new Date(Date.now() + 5 * 60_000).toISOString();
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    const series = url.searchParams.get("series_ticker");
+    if (series === "KXETH15M") {
+      return new Response(JSON.stringify({ error: "temporary failure" }), {
+        status: 503,
+      });
+    }
+    const ticker = `${series}-TEST`;
+    return new Response(
+      JSON.stringify({
+        markets: [
+          {
+            ticker,
+            event_ticker: `${series}-EVENT`,
+            market_type: "binary",
+            title: `${series} Up or Down`,
+            open_time: new Date(Date.now() - 10 * 60_000).toISOString(),
+            close_time: closeTime,
+            status: "open",
+            price_ranges: [{ start: "0", end: "1", step: "0.01" }],
+          },
+        ],
+      }),
+      { status: 200 },
+    );
+  };
+  try {
+    const scanner = new MarketScanner(
+      testConfig({
+        exchange: "kalshi",
+        executionMode: "dry_run",
+        marketSlugPrefixes: ["btc-updown-15m"],
+        kalshiSeriesTickers: [
+          "KXADA15M",
+          "KXBTC15M",
+          "KXETH15M",
+        ],
+        kalshiFeeOverrides: {
+          KXADA15M: { takerRate: 0.05, makerRate: 0.01 },
+        },
+      }),
+    );
+    const events = await scanner.scan();
+    assert.equal(events.length, 2);
+    assert.deepEqual(
+      events.map((event) => event.market.seriesTicker).sort(),
+      ["KXADA15M", "KXBTC15M"],
+    );
+    assert.ok(
+      events.some((event) =>
+        event.slug.startsWith("ada-updown-15m-"),
+      ),
+    );
+    const ada = events.find(
+      (event) => event.market.seriesTicker === "KXADA15M",
+    );
+    assert.equal(ada?.market.feeSchedule?.rate, 0.05);
+    assert.equal(ada?.market.feeSchedule?.makerRate, 0.01);
+    const btc = events.find(
+      (event) => event.market.seriesTicker === "KXBTC15M",
+    );
+    assert.equal(btc?.market.feeSchedule?.rate, 0.07);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Kalshi stream subscriptions carry all initial and newly added market tickers", () => {
+  const messages: Array<Record<string, unknown>> = [];
+  const stream = new KalshiMarketStream(
+    testConfig({ exchange: "kalshi" }),
+    () => undefined,
+  );
+  const internals = stream as unknown as {
+    socket: { readyState: number; send(value: string): void };
+    subscriptionIds: Map<string, number>;
+    sendSubscriptions(tickers: string[]): void;
+    updateSubscriptions(tickers: string[]): void;
+  };
+  internals.socket = {
+    readyState: 1,
+    send(value) {
+      messages.push(JSON.parse(value) as Record<string, unknown>);
+    },
+  };
+  internals.sendSubscriptions(["KXADA15M-ONE", "KXBTC15M-ONE"]);
+  assert.equal(messages.length, 2);
+  for (const message of messages) {
+    const params = message.params as {
+      market_tickers: string[];
+    };
+    assert.deepEqual(params.market_tickers, [
+      "KXADA15M-ONE",
+      "KXBTC15M-ONE",
+    ]);
+  }
+
+  messages.length = 0;
+  internals.subscriptionIds.set("orderbook_delta", 10);
+  internals.subscriptionIds.set("trade", 11);
+  internals.updateSubscriptions(["KXETH15M-ONE", "KXSOL15M-ONE"]);
+  assert.equal(messages.length, 2);
+  for (const message of messages) {
+    const params = message.params as {
+      action: string;
+      market_tickers: string[];
+    };
+    assert.equal(params.action, "add_markets");
+    assert.deepEqual(params.market_tickers, [
+      "KXETH15M-ONE",
+      "KXSOL15M-ONE",
+    ]);
+  }
+});
+
+test("Kalshi live executor persists and cancels Ladder V5 GTC orders", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "kalshi-v5-live-"));
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+  });
+  const originalFetch = globalThis.fetch;
+  let resting = false;
+  let cancelled = false;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    const method = init?.method ?? "GET";
+    if (url.pathname.endsWith("/portfolio/balance")) {
+      return new Response(
+        JSON.stringify({
+          balance: 100_000,
+          portfolio_value: 100_000,
+          updated_ts: Date.now(),
+        }),
+        { status: 200 },
+      );
+    }
+    if (url.pathname.endsWith("/portfolio/events/orders")) {
+      resting = true;
+      return new Response(
+        JSON.stringify({
+          order_id: "v5-live-order",
+          fill_count: "0.00",
+          remaining_count: "10.00",
+          ts_ms: Date.now(),
+        }),
+        { status: 201 },
+      );
+    }
+    if (
+      method === "DELETE" &&
+      url.pathname.endsWith("/portfolio/orders/v5-live-order")
+    ) {
+      resting = false;
+      cancelled = true;
+      return new Response("{}", { status: 200 });
+    }
+    if (url.pathname.endsWith("/portfolio/orders")) {
+      return new Response(
+        JSON.stringify({
+          orders: resting
+            ? [
+                {
+                  order_id: "v5-live-order",
+                  ticker: "KXBTC15M-TEST",
+                  status: "resting",
+                  remaining_count_fp: "10.00",
+                },
+              ]
+            : [],
+        }),
+        { status: 200 },
+      );
+    }
+    if (url.pathname.endsWith("/portfolio/fills")) {
+      return new Response(JSON.stringify({ fills: [] }), {
+        status: 200,
+      });
+    }
+    throw new Error(`Unexpected test request: ${method} ${url}`);
+  };
+  try {
+    const config = testConfig({
+      exchange: "kalshi",
+      strategyMode: "ladder_v5",
+      executionMode: "live",
+      dryRun: false,
+      paperStatePath: directory,
+      kalshiApiKeyId: "test-key",
+      kalshiPrivateKeyPem: privateKey
+        .export({ format: "pem", type: "pkcs8" })
+        .toString(),
+    });
+    const eventBase = testEvent();
+    const event = {
+      ...eventBase,
+      market: {
+        ...eventBase.market,
+        exchange: "kalshi" as const,
+        externalMarketId: "KXBTC15M-TEST",
+        seriesTicker: "KXBTC15M",
+        id: "KXBTC15M-TEST",
+        conditionId: "KXBTC15M-TEST",
+        clobTokenIds: JSON.stringify([
+          "KXBTC15M-TEST::yes",
+          "KXBTC15M-TEST::no",
+        ]),
+        feeSchedule: { rate: 0.07, makerRate: 0, exponent: 1 },
+      },
+    };
+    const books = kalshiBooks("KXBTC15M-TEST", {
+      orderbook_fp: {
+        yes_dollars: [["0.4000", "100.00"]],
+        no_dollars: [["0.5000", "100.00"]],
+      },
+    });
+    const trader = new KalshiTrader(config);
+    await trader.init();
+    await trader.observeMarket(event, books);
+    const opportunity: TradeOpportunity = {
+      kind: "cheap",
+      event,
+      token: books[0]!,
+      price: 0.15,
+      size: 10,
+      tickSize: "0.01",
+      negRisk: false,
+      tradeKey: "v5-live-test",
+      strategyMode: "ladder_v5",
+      phaseId: "5-2",
+      pairId: "ladder-v5:0.15-0.85",
+      orderPolicy: "gtc",
+      capitalEffect: "increase",
+    };
+    const result = await trader.placeBuy(opportunity);
+    assert.equal(result.accepted, true);
+    const snapshot = trader.getMarketExecutionSnapshot(event.slug);
+    assert.equal(snapshot?.openOrders.length, 1);
+    assert.equal(snapshot?.capitalCommitted, 1.5);
+    await trader.cancelOrders(["v5-live-order"]);
+    assert.equal(cancelled, true);
+    assert.equal(
+      trader.getMarketExecutionSnapshot(event.slug)?.openOrders.length,
+      0,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(directory, { recursive: true, force: true });
+  }
 });

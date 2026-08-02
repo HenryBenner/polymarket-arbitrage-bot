@@ -626,9 +626,11 @@ export class PaperTrader implements OrderExecutor {
               ? "ladder_v5 late 10/90 + 15/85"
               : this.config.strategyMode === "ladder_v5.5"
                 ? "ladder_v5.5 phased dynamic confirmed-fill hedge"
-              : this.config.strategyMode === "ladder_v6"
-                ? "ladder_v6 paired makers / maker-FOK completion"
-                : `${this.config.ladderPreset} public-fill approximation`,
+                : this.config.strategyMode === "ladder_v6"
+                  ? "ladder_v6 paired makers / maker-FOK completion"
+                  : this.config.strategyMode === "ladder_v7"
+                    ? "ladder_v7 fixed cheap maker / capped favorite FAK"
+                    : `${this.config.ladderPreset} public-fill approximation`,
         firstVisibleFillMinutesLeft:
           fills.length > 0
             ? round(

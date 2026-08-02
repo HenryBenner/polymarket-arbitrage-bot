@@ -8,6 +8,7 @@ import {
 import { planLadderV5 } from "./ladder-v5.js";
 import { planLadderV55 } from "./ladder-v5-5.js";
 import { planLadderV6 } from "./ladder-v6.js";
+import { planLadderV7 } from "./ladder-v7.js";
 import { log } from "./logger.js";
 import { MarketScanner } from "./market-scanner.js";
 import {
@@ -62,9 +63,11 @@ export class ReverseBot {
           ? "ladder-v5-state.json"
           : config.strategyMode === "ladder_v5.5"
             ? "ladder-v5-5-state.json"
-          : config.strategyMode === "ladder_v6"
-            ? "ladder-v6-state.json"
-          : "ladder-state.json",
+            : config.strategyMode === "ladder_v6"
+              ? "ladder-v6-state.json"
+              : config.strategyMode === "ladder_v7"
+                ? "ladder-v7-state.json"
+                : "ladder-state.json",
     );
     this.trader.setExecutionWakeHandler?.((marketSlug) =>
       this.config.strategyMode === "ladder_v5.5"
@@ -80,7 +83,8 @@ export class ReverseBot {
       this.config.strategyMode === "odahoa_ladder_2" ||
       this.config.strategyMode === "ladder_v5" ||
       this.config.strategyMode === "ladder_v5.5" ||
-      this.config.strategyMode === "ladder_v6"
+      this.config.strategyMode === "ladder_v6" ||
+      this.config.strategyMode === "ladder_v7"
     ) {
       await this.ladderTracker.init();
     }
@@ -102,6 +106,8 @@ export class ReverseBot {
                   ? "phased dynamic cheap entries with confirmed-fill FOK hedges"
                 : this.config.strategyMode === "ladder_v6"
                   ? "competitive paired makers with maker/FOK completion"
+                : this.config.strategyMode === "ladder_v7"
+                  ? "fixed cheap maker plus capped one-shot favorite taker"
                   : "early two-sided static maker ladder",
       strategyMode: this.config.strategyMode,
       executionMode: this.config.executionMode,
@@ -154,6 +160,18 @@ export class ReverseBot {
       ladderV6MaxRescueLoss:
         this.config.strategyMode === "ladder_v6"
           ? this.config.ladderV6MaxRescueLoss
+          : undefined,
+      ladderV7CheapPrice:
+        this.config.strategyMode === "ladder_v7"
+          ? this.config.ladderV7CheapPrice
+          : undefined,
+      ladderV7FavoritePrice:
+        this.config.strategyMode === "ladder_v7"
+          ? this.config.ladderV7FavoritePrice
+          : undefined,
+      ladderV7MaxShares:
+        this.config.strategyMode === "ladder_v7"
+          ? this.config.ladderV7MaxShares
           : undefined,
       staticMakerShares:
         this.config.strategyMode === "odahoa_static_maker"
@@ -272,6 +290,10 @@ export class ReverseBot {
       await this.enqueueLadderV6Market(event.slug);
       return;
     }
+    if (this.config.strategyMode === "ladder_v7") {
+      await this.processLadderV7Event(event, books);
+      return;
+    }
 
     const opportunities =
       this.config.strategyMode === "reverse"
@@ -352,7 +374,8 @@ export class ReverseBot {
       this.config.strategyMode === "odahoa_ladder" ||
       this.config.strategyMode === "ladder_v5" ||
       this.config.strategyMode === "ladder_v5.5" ||
-      this.config.strategyMode === "ladder_v6"
+      this.config.strategyMode === "ladder_v6" ||
+      this.config.strategyMode === "ladder_v7"
     ) {
       await this.ladderTracker.mark(opportunity.tradeKey);
     } else {
@@ -506,6 +529,61 @@ export class ReverseBot {
         filledShares: lastPlan?.filledSharesByOutcome ?? {},
         filledImbalance: lastPlan?.filledImbalance ?? 0,
         imbalanceCap: this.config.ladderV5MaxImbalance,
+      });
+    }
+    this.trader.reportMarket?.(event.slug);
+  }
+
+  private async processLadderV7Event(
+    event: UpDownEvent,
+    books: TokenBook[],
+  ): Promise<void> {
+    let submitted = 0;
+    let cancelled = 0;
+    let lastPlan:
+      | Awaited<ReturnType<typeof planLadderV7>>
+      | undefined;
+    // V7 has two stable attempts: the cheap post-only bid and the favorite
+    // FAK. Re-read after each so an immediate favorite fill is reflected in
+    // the report without creating a second exposure attempt.
+    for (let iteration = 0; iteration < 4; iteration += 1) {
+      const snapshot = this.trader.getMarketExecutionSnapshot?.(event.slug);
+      if (!snapshot) {
+        throw new Error(
+          "ladder_v7 requires a fill-aware executor snapshot",
+        );
+      }
+      const plan = await planLadderV7(
+        this.config,
+        this.ladderTracker,
+        event,
+        books,
+        snapshot,
+      );
+      lastPlan = plan;
+      if (plan.cancelOrderIds.length > 0) {
+        if (!this.trader.cancelOrders) {
+          throw new Error("ladder_v7 requires executor order cancellation");
+        }
+        await this.trader.cancelOrders(plan.cancelOrderIds);
+        cancelled += plan.cancelOrderIds.length;
+        continue;
+      }
+      const opportunity = plan.opportunities[0];
+      if (!opportunity) break;
+      if (!(await this.executeOpportunity(opportunity))) break;
+      submitted += 1;
+    }
+    if (submitted === 0 && cancelled === 0) {
+      log("Watching ladder_v7 market", {
+        market: event.title,
+        slug: event.slug,
+        filledShares: lastPlan?.filledSharesByOutcome ?? {},
+        pairedShares: lastPlan?.pairedShares ?? 0,
+        unmatchedShares: lastPlan?.unmatchedShares ?? 0,
+        cheapMakerPrice: this.config.ladderV7CheapPrice,
+        favoriteFakLimit: this.config.ladderV7FavoritePrice,
+        maxShares: this.config.ladderV7MaxShares,
       });
     }
     this.trader.reportMarket?.(event.slug);

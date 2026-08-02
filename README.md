@@ -547,6 +547,57 @@ DOTENV_CONFIG_PATH=.env.ladder-v6-paper.example npm start
 
 The isolated ledger is `./data/paper-ladder-v6`.
 
+### Ladder V7 evidence-filtered paper candidate
+
+`STRATEGY_MODE=ladder_v7` is the narrower candidate derived from the combined
+V5/V5.5 log review. The V5 sample starts at `2026-08-01T18:00:00Z`, when BTC,
+ETH, and DOGE were all running concurrently; the earlier BTC-only setup is not
+included.
+
+The result was not "more rungs." V5's matched inventory was profitable, but
+large one-sided positions erased it. V5.5 then made entry and hedging dynamic,
+yet reconstructed PnL was -$55.34 over 60 settlements: just 10 markets paired
+for +$11.97 while 22 one-sided markets lost -$67.31. It also suffered 42
+service restarts with repeated heap out-of-memory failures.
+
+V7 keeps only the execution combination that survived the retrospective
+filters:
+
+1. Trade only from five to two minutes before close.
+2. Attempt one fixed 10-cent cheap-side post-only maker for at most 40 shares.
+3. Independently attempt one favorite-side FAK for at most 40 shares, capped
+   at 80 cents. Unavailable quantity is cancelled, never left resting.
+4. Do not reprice or retry either role; cancel an unfilled cheap maker at two
+   minutes.
+5. Persist two stable role keys per market in an isolated V7 state file.
+
+Across 111 post-cutoff markets per series, the same filter at V5's original
+40-share size retrospectively attributed +$107.06 to BTC, +$53.23 to ETH, and
++$34.40 to DOGE. V7's paper profile uses that same 40-share size; a smaller
+cap is available only for a risk-limited experiment. This is an in-sample
+attribution, not a forward result, and BTC is the only default market because
+its result was the strongest and most stable.
+
+V7 is Kalshi paper-only. Fill in the Kalshi credentials required by its market
+WebSocket, then run the supplied BTC profile.
+
+For Command Prompt:
+
+```bat
+set "DOTENV_CONFIG_PATH=.env.ladder-v7-paper.example"
+npm.cmd start
+```
+
+For Linux or a VPS:
+
+```bash
+DOTENV_CONFIG_PATH=.env.ladder-v7-paper.example npm start
+```
+
+The profile writes paper state to `./data/paper-ladder-v7-btc`. See
+[`LADDER_V7_ANALYSIS.md`](LADDER_V7_ANALYSIS.md) for the reconstructed PnL,
+failure analysis, caveats, and the forward-test acceptance criteria.
+
 ### Odahoa pair-lock V2
 
 `STRATEGY_MODE=odahoa_ladder_2` keeps V1's BTC market selection, phases,

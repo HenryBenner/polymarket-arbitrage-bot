@@ -380,3 +380,39 @@ test("ladder_v6 is paper-only with a 40-share cap and positive edge", () => {
     /LADDER_V6_MIN_NET_EDGE/,
   );
 });
+
+test("ladder_v7 is Kalshi paper-only with an asymmetric price and share cap", () => {
+  const config = testConfig({
+    exchange: "kalshi",
+    strategyMode: "ladder_v7",
+    executionMode: "paper",
+    ladderV7CheapPrice: 0.1,
+    ladderV7FavoritePrice: 0.8,
+    ladderV7MaxShares: 40,
+    kalshiApiKeyId: "key-id",
+    kalshiPrivateKeyPem:
+      "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----",
+  });
+  assert.doesNotThrow(() => validateTradingConfig(config));
+  assert.throws(
+    () => validateTradingConfig({ ...config, executionMode: "live" }),
+    /paper-only/,
+  );
+  assert.throws(
+    () => validateTradingConfig({ ...config, exchange: "polymarket" }),
+    /paper-only/,
+  );
+  assert.throws(
+    () => validateTradingConfig({ ...config, ladderV7MaxShares: 0 }),
+    /LADDER_V7_MAX_SHARES/,
+  );
+  assert.throws(
+    () =>
+      validateTradingConfig({
+        ...config,
+        ladderV7CheapPrice: 0.2,
+        ladderV7FavoritePrice: 0.8,
+      }),
+    /must be less than 1/,
+  );
+});

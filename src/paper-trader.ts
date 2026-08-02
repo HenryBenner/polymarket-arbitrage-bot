@@ -624,6 +624,8 @@ export class PaperTrader implements OrderExecutor {
             ? "odahoa_static_maker"
             : this.config.strategyMode === "ladder_v5"
               ? "ladder_v5 late 10/90 + 15/85"
+              : this.config.strategyMode === "ladder_v5.5"
+                ? "ladder_v5.5 phased dynamic confirmed-fill hedge"
               : this.config.strategyMode === "ladder_v6"
                 ? "ladder_v6 paired makers / maker-FOK completion"
                 : `${this.config.ladderPreset} public-fill approximation`,

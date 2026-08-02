@@ -8,6 +8,7 @@ import {
   LadderTracker,
 } from "../src/ladder.js";
 import { planLadderV5 } from "../src/ladder-v5.js";
+import { planLadderV55 } from "../src/ladder-v5-5.js";
 import { planLadderV6 } from "../src/ladder-v6.js";
 import { findPairLockOpeningOpportunities } from "../src/pair-lock.js";
 import type { MarketExecutionSnapshot } from "../src/types.js";
@@ -87,11 +88,18 @@ test("all ladder planners operate on a non-BTC Kalshi market slug", async () => 
       event,
       snapshot,
     );
+    const v55 = await planLadderV55(
+      { ...config, strategyMode: "ladder_v5.5" },
+      tracker,
+      event,
+      snapshot,
+    );
 
     for (const opportunities of [
       v1,
       v2,
       v5.opportunities,
+      v55.opportunities,
       v6.opportunities,
     ]) {
       assert.ok(opportunities.length > 0);

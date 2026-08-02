@@ -433,6 +433,60 @@ available Kalshi balance before every order, and applies
 `LADDER_MAX_USDC_PER_MARKET` independently to each configured series. Add
 markets to `CRYPTO_MARKETS` only after validating them in paper mode.
 
+### Ladder V5.5 cheap-first paper/live mode
+
+`STRATEGY_MODE=ladder_v5.5` makes the VPS-observed downside protection an
+explicit Kalshi state machine shared by paper and live execution:
+
+1. Reuse the V1 entry phases and low-side ceilings: `45/40` cents at 15-10
+   minutes, `35/30/25` cents at 10-5 minutes, and `20/15/10` cents at 5-2
+   minutes. The risky 5-cent final rung is excluded.
+2. Before each entry, walk enough opposite-side ask depth to cover the entire
+   rung and include the configured taker fee.
+3. Calculate the highest post-only cheap bid that keeps the projected all-in
+   pair cost at or below `LADDER_V5_MAX_PAIR_COST`. A rung price is a ceiling,
+   so the submitted bid may be lower.
+4. Keep at most one cheap order open per market. Cancel it at a phase boundary
+   or whenever current opposite depth no longer makes its remaining quantity
+   safe.
+5. On every confirmed cheap fill update, FOK-buy exactly the newly unmatched
+   opposite shares when their actual fee-adjusted pair cost passes the cap.
+6. If a confirmed fill cannot be hedged profitably, cancel the unfilled cheap
+   remainder immediately so the directional position cannot keep growing.
+7. Open the next rung only after prior filled inventory is paired and its entry
+   order is finished or cancelled.
+8. At two minutes, cancel all entry remainders. Profitable hedges remain allowed
+   until close; V5.5 never submits a loss-making rescue hedge.
+
+The V1 sizing curve makes early exposure smaller and late exposure larger. At
+scale 4 the nominal rung sizes are approximately 8.9, 10, 11.4, 13.3, 16, 20,
+26.7, and 40 shares. `LADDER_V5_MAX_IMBALANCE` remains the hard per-market
+unmatched-share ceiling. Each market has isolated state and cap while all
+markets share the account balance. Set `MINUTES_BEFORE_CLOSE_MAX=15` or the
+scanner will not expose the early phases to the planner.
+
+V5.5 uses `ladder-v5-5-state.json` under its dedicated `PAPER_STATE_PATH`.
+Never reuse a V5, V6, paper, or live state directory.
+
+Paper mode for Command Prompt:
+
+```bat
+set "DOTENV_CONFIG_PATH=.env.ladder-v5-5-paper.example"
+npm.cmd start
+```
+
+Kalshi live mode for Command Prompt:
+
+```bat
+set "DOTENV_CONFIG_PATH=.env.ladder-v5-5-kalshi-live.example"
+npm.cmd start
+```
+
+The live profile intentionally starts at scale 1. Both explicit live-risk
+acknowledgements are required. Live fills are accepted only after authenticated
+Kalshi reconciliation; the same planner then makes the hedge decision used in
+paper mode.
+
 ### Ladder V6 paper candidate
 
 `STRATEGY_MODE=ladder_v6` is an inventory-controlled, two-sided maker strategy:

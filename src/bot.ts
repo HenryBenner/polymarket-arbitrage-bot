@@ -6,6 +6,7 @@ import {
   projectedLadderCapital,
 } from "./ladder.js";
 import { planLadderV5 } from "./ladder-v5.js";
+import { planLadderV55 } from "./ladder-v5-5.js";
 import { planLadderV6 } from "./ladder-v6.js";
 import { log } from "./logger.js";
 import { MarketScanner } from "./market-scanner.js";
@@ -41,6 +42,8 @@ export class ReverseBot {
     string,
     { event: UpDownEvent; books: TokenBook[] }
   >();
+  private readonly ladderV55Events = new Map<string, UpDownEvent>();
+  private readonly ladderV55Queues = new Map<string, Promise<void>>();
   private readonly ladderV6Queues = new Map<string, Promise<void>>();
   private readonly marketQueues = new Map<string, Promise<void>>();
   private ladderTickRunning = false;
@@ -57,12 +60,16 @@ export class ReverseBot {
         ? `pair-lock-${config.executionMode}-ladder-state.json`
         : config.strategyMode === "ladder_v5"
           ? "ladder-v5-state.json"
+          : config.strategyMode === "ladder_v5.5"
+            ? "ladder-v5-5-state.json"
           : config.strategyMode === "ladder_v6"
             ? "ladder-v6-state.json"
           : "ladder-state.json",
     );
     this.trader.setExecutionWakeHandler?.((marketSlug) =>
-      this.enqueueLadderV6Market(marketSlug),
+      this.config.strategyMode === "ladder_v5.5"
+        ? this.enqueueLadderV55Market(marketSlug)
+        : this.enqueueLadderV6Market(marketSlug),
     );
   }
 
@@ -72,6 +79,7 @@ export class ReverseBot {
       this.config.strategyMode === "odahoa_ladder" ||
       this.config.strategyMode === "odahoa_ladder_2" ||
       this.config.strategyMode === "ladder_v5" ||
+      this.config.strategyMode === "ladder_v5.5" ||
       this.config.strategyMode === "ladder_v6"
     ) {
       await this.ladderTracker.init();
@@ -90,6 +98,8 @@ export class ReverseBot {
               ? `${this.config.ladderPreset} post-only inventory pair lock`
               : this.config.strategyMode === "ladder_v5"
                 ? "late 10/90 + 15/85 imbalance-capped ladder"
+                : this.config.strategyMode === "ladder_v5.5"
+                  ? "phased dynamic cheap entries with confirmed-fill FOK hedges"
                 : this.config.strategyMode === "ladder_v6"
                   ? "competitive paired makers with maker/FOK completion"
                   : "early two-sided static maker ladder",
@@ -120,11 +130,13 @@ export class ReverseBot {
           ? this.config.ladderPreset
           : undefined,
       ladderV5MaxImbalance:
-        this.config.strategyMode === "ladder_v5"
+        this.config.strategyMode === "ladder_v5" ||
+        this.config.strategyMode === "ladder_v5.5"
           ? this.config.ladderV5MaxImbalance
           : undefined,
       ladderV5MaxPairCost:
-        this.config.strategyMode === "ladder_v5"
+        this.config.strategyMode === "ladder_v5" ||
+        this.config.strategyMode === "ladder_v5.5"
           ? this.config.ladderV5MaxPairCost
           : undefined,
       ladderV6MaxUnmatchedShares:
@@ -250,6 +262,11 @@ export class ReverseBot {
       await this.processLadderV5Event(event, books);
       return;
     }
+    if (this.config.strategyMode === "ladder_v5.5") {
+      this.ladderV55Events.set(event.slug, event);
+      await this.enqueueLadderV55Market(event.slug);
+      return;
+    }
     if (this.config.strategyMode === "ladder_v6") {
       this.ladderV6Events.set(event.slug, { event, books });
       await this.enqueueLadderV6Market(event.slug);
@@ -334,6 +351,7 @@ export class ReverseBot {
     } else if (
       this.config.strategyMode === "odahoa_ladder" ||
       this.config.strategyMode === "ladder_v5" ||
+      this.config.strategyMode === "ladder_v5.5" ||
       this.config.strategyMode === "ladder_v6"
     ) {
       await this.ladderTracker.mark(opportunity.tradeKey);
@@ -488,6 +506,74 @@ export class ReverseBot {
         filledShares: lastPlan?.filledSharesByOutcome ?? {},
         filledImbalance: lastPlan?.filledImbalance ?? 0,
         imbalanceCap: this.config.ladderV5MaxImbalance,
+      });
+    }
+    this.trader.reportMarket?.(event.slug);
+  }
+
+  private enqueueLadderV55Market(marketSlug: string): Promise<void> {
+    if (this.config.strategyMode !== "ladder_v5.5") {
+      return Promise.resolve();
+    }
+    const previous = this.ladderV55Queues.get(marketSlug) ?? Promise.resolve();
+    const queued = previous
+      .catch(() => undefined)
+      .then(async () => {
+        const event = this.ladderV55Events.get(marketSlug);
+        if (!event) return;
+        await this.processLadderV55Event(event);
+      });
+    this.ladderV55Queues.set(marketSlug, queued);
+    const cleanup = () => {
+      if (this.ladderV55Queues.get(marketSlug) === queued) {
+        this.ladderV55Queues.delete(marketSlug);
+      }
+    };
+    void queued.then(cleanup, cleanup);
+    return queued;
+  }
+
+  private async processLadderV55Event(event: UpDownEvent): Promise<void> {
+    let submitted = 0;
+    let cancelled = 0;
+    let lastPlan: Awaited<ReturnType<typeof planLadderV55>> | undefined;
+    for (let iteration = 0; iteration < 8; iteration += 1) {
+      const snapshot = this.trader.getMarketExecutionSnapshot?.(event.slug);
+      if (!snapshot) {
+        throw new Error("ladder_v5.5 requires a fill-aware executor snapshot");
+      }
+      const plan = await planLadderV55(
+        this.config,
+        this.ladderTracker,
+        event,
+        snapshot,
+      );
+      lastPlan = plan;
+      if (plan.cancelOrderIds.length > 0) {
+        if (!this.trader.cancelOrders) {
+          throw new Error("ladder_v5.5 requires executor order cancellation");
+        }
+        await this.trader.cancelOrders(plan.cancelOrderIds);
+        cancelled += plan.cancelOrderIds.length;
+        continue;
+      }
+      const opportunity = plan.opportunities[0];
+      if (!opportunity) break;
+      if (!(await this.executeOpportunity(opportunity))) break;
+      submitted += 1;
+    }
+    if (submitted === 0 && cancelled === 0) {
+      log("Watching ladder_v5.5 market", {
+        market: event.title,
+        slug: event.slug,
+        entryFilledShares: lastPlan?.entryFilledShares ?? 0,
+        hedgedShares: lastPlan?.hedgedShares ?? 0,
+        pairedShares: lastPlan?.pairedShares ?? 0,
+        unmatchedCheapShares: lastPlan?.unmatchedCheapShares ?? 0,
+        observedHedgeAllInPerShare:
+          lastPlan?.observedHedgeAllInPerShare ?? null,
+        plannedAllInPairCost: lastPlan?.plannedAllInPairCost ?? null,
+        plannedNetEdgePerPair: lastPlan?.plannedNetEdgePerPair ?? null,
       });
     }
     this.trader.reportMarket?.(event.slug);

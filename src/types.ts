@@ -5,6 +5,7 @@ export type StrategyMode =
   | "odahoa_ladder_2"
   | "odahoa_static_maker"
   | "ladder_v5"
+  | "ladder_v5.5"
   | "ladder_v6";
 export type ExecutionMode = "dry_run" | "paper" | "live";
 export type ExchangeName = "polymarket" | "kalshi";

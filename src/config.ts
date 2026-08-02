@@ -177,10 +177,11 @@ export function loadConfig(): BotConfig {
     strategyRaw !== "odahoa_ladder_2" &&
     strategyRaw !== "odahoa_static_maker" &&
     strategyRaw !== "ladder_v5" &&
+    strategyRaw !== "ladder_v5.5" &&
     strategyRaw !== "ladder_v6"
   ) {
     throw new Error(
-      "STRATEGY_MODE must be reverse, odahoa_ladder, odahoa_ladder_2, odahoa_static_maker, ladder_v5, or ladder_v6",
+      "STRATEGY_MODE must be reverse, odahoa_ladder, odahoa_ladder_2, odahoa_static_maker, ladder_v5, ladder_v5.5, or ladder_v6",
     );
   }
 
@@ -398,11 +399,12 @@ export function validateTradingConfig(config: BotConfig): void {
     );
   }
   if (
-    config.strategyMode === "ladder_v5" &&
+    (config.strategyMode === "ladder_v5" ||
+      config.strategyMode === "ladder_v5.5") &&
     config.ladderSizeScale > 6
   ) {
     throw new Error(
-      "ladder_v5 is limited to LADDER_SIZE_SCALE=1 through 6",
+      `${config.strategyMode} is limited to LADDER_SIZE_SCALE=1 through 6`,
     );
   }
   if (
@@ -443,6 +445,15 @@ export function validateTradingConfig(config: BotConfig): void {
   ) {
     throw new Error(
       "ladder_v5 supports paper mode on either venue and live mode on Kalshi",
+    );
+  }
+  if (
+    config.strategyMode === "ladder_v5.5" &&
+    (config.exchange !== "kalshi" ||
+      (config.executionMode !== "paper" && config.executionMode !== "live"))
+  ) {
+    throw new Error(
+      "ladder_v5.5 supports Kalshi paper and live modes only",
     );
   }
   if (
@@ -577,7 +588,8 @@ export function validateTradingConfig(config: BotConfig): void {
   if (
     config.strategyMode === "odahoa_ladder" ||
     config.strategyMode === "odahoa_ladder_2" ||
-    config.strategyMode === "ladder_v5"
+    config.strategyMode === "ladder_v5" ||
+    config.strategyMode === "ladder_v5.5"
   ) {
     if (
       config.ladderLiveAck !==

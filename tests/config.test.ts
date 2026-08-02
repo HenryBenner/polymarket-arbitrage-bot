@@ -304,6 +304,42 @@ test("ladder_v5 supports Kalshi live mode and enforces its statistical guardrail
   );
 });
 
+test("ladder_v5.5 is Kalshi-only with matching paper and live safeguards", () => {
+  const paper = testConfig({
+    exchange: "kalshi",
+    strategyMode: "ladder_v5.5",
+    executionMode: "paper",
+    kalshiApiKeyId: "key-id",
+    kalshiPrivateKeyPem:
+      "-----BEGIN PRIVATE KEY-----\\ntest\\n-----END PRIVATE KEY-----",
+  });
+  assert.doesNotThrow(() => validateTradingConfig(paper));
+  assert.throws(
+    () =>
+      validateTradingConfig({
+        ...paper,
+        exchange: "polymarket",
+      }),
+    /Kalshi paper and live modes only/,
+  );
+  const live = {
+    ...paper,
+    executionMode: "live" as const,
+    dryRun: false,
+    liveTradingAck: "I_UNDERSTAND_REAL_MONEY_IS_AT_RISK",
+    ladderLiveAck: "I_UNDERSTAND_LADDER_MODE_CAN_LOSE_REAL_MONEY",
+  };
+  assert.doesNotThrow(() => validateTradingConfig(live));
+  assert.throws(
+    () => validateTradingConfig({ ...live, ladderLiveAck: undefined }),
+    /Live ladder mode is locked/,
+  );
+  assert.throws(
+    () => validateTradingConfig({ ...paper, ladderSizeScale: 7 }),
+    /limited to LADDER_SIZE_SCALE=1 through 6/,
+  );
+});
+
 test("ladder_v6 is paper-only with a 40-share cap and positive edge", () => {
   const config = testConfig({
     strategyMode: "ladder_v6",

@@ -48,6 +48,9 @@ export class KalshiTrader implements OrderExecutor {
   private executionQueue: Promise<void> = Promise.resolve();
   private persistenceQueue: Promise<void> = Promise.resolve();
   private lastAvailableCash = 0;
+  private executionWakeHandler:
+    | ((marketSlug: string) => void | Promise<void>)
+    | undefined;
 
   constructor(private readonly config: BotConfig) {
     this.client = new KalshiClient(config);
@@ -74,6 +77,12 @@ export class KalshiTrader implements OrderExecutor {
       await this.persist();
     }
     this.lastAvailableCash = await this.client.getBalance();
+  }
+
+  setExecutionWakeHandler(
+    handler: (marketSlug: string) => void | Promise<void>,
+  ): void {
+    this.executionWakeHandler = handler;
   }
 
   async observeMarket(event: UpDownEvent, books: TokenBook[]): Promise<void> {
@@ -436,6 +445,7 @@ export class KalshiTrader implements OrderExecutor {
       (order) => order.conditionId === ticker,
     );
     const localById = new Map(localOrders.map((order) => [order.id, order]));
+    const previousFillCount = this.state.fills.length;
     for (const fill of remoteFills) {
       const order = localById.get(fill.order_id);
       if (order) addFill(this.state.fills, order, fill);
@@ -463,6 +473,18 @@ export class KalshiTrader implements OrderExecutor {
       }
     }
     await this.persist();
+    if (
+      this.state.fills.length > previousFillCount &&
+      this.executionWakeHandler
+    ) {
+      const wake = this.executionWakeHandler;
+      void Promise.resolve(wake(event.slug)).catch((error) => {
+        log("Kalshi fill-driven execution wake failed", {
+          market: event.slug,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
   }
 
   private async persist(): Promise<void> {

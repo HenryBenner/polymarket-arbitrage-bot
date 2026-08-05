@@ -312,7 +312,7 @@ test("Kalshi stream subscriptions carry all initial and newly added market ticke
     },
   };
   internals.sendSubscriptions(["KXADA15M-ONE", "KXBTC15M-ONE"]);
-  assert.equal(messages.length, 2);
+  assert.equal(messages.length, 4);
   for (const message of messages) {
     const params = message.params as {
       market_tickers: string[];
@@ -322,12 +322,24 @@ test("Kalshi stream subscriptions carry all initial and newly added market ticke
       "KXBTC15M-ONE",
     ]);
   }
+  const orderbookSubscription = messages.find(
+    (message) =>
+      ((message.params as { channels?: string[] }).channels ?? [])[0] ===
+      "orderbook_delta",
+  );
+  assert.equal(
+    (orderbookSubscription?.params as { use_yes_price?: boolean })
+      .use_yes_price,
+    true,
+  );
 
   messages.length = 0;
   internals.subscriptionIds.set("orderbook_delta", 10);
   internals.subscriptionIds.set("trade", 11);
+  internals.subscriptionIds.set("fill", 12);
+  internals.subscriptionIds.set("user_orders", 13);
   internals.updateSubscriptions(["KXETH15M-ONE", "KXSOL15M-ONE"]);
-  assert.equal(messages.length, 2);
+  assert.equal(messages.length, 4);
   for (const message of messages) {
     const params = message.params as {
       action: string;
@@ -339,6 +351,177 @@ test("Kalshi stream subscriptions carry all initial and newly added market ticke
       "KXSOL15M-ONE",
     ]);
   }
+});
+
+test("Kalshi stream publishes unified two-outcome books atomically", async () => {
+  const events: Array<Record<string, unknown>> = [];
+  const stream = new KalshiMarketStream(
+    testConfig({ exchange: "kalshi" }),
+    (event) => events.push(event),
+  );
+  const internals = stream as unknown as {
+    handleMessage(data: unknown): Promise<void>;
+  };
+  await internals.handleMessage(
+    Buffer.from(
+      JSON.stringify({
+        type: "orderbook_snapshot",
+        sid: 7,
+        seq: 10,
+        msg: {
+          market_ticker: "KXBTC15M-ONE",
+          yes_dollars_fp: [["0.3000", "12.00"]],
+          no_dollars_fp: [["0.6000", "9.00"]],
+        },
+      }),
+    ),
+  );
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.event_type, "market_books");
+  const books = events[0]?.books as Array<Record<string, unknown>>;
+  assert.equal(books.length, 2);
+  assert.deepEqual(books[0]?.bids, [{ price: "0.3", size: "12" }]);
+  assert.deepEqual(books[0]?.asks, [{ price: "0.6", size: "9" }]);
+  assert.deepEqual(books[1]?.bids, [{ price: "0.4", size: "9" }]);
+  assert.deepEqual(books[1]?.asks, [{ price: "0.7", size: "12" }]);
+
+  await internals.handleMessage(
+    Buffer.from(
+      JSON.stringify({
+        type: "orderbook_delta",
+        sid: 7,
+        seq: 11,
+        msg: {
+          market_ticker: "KXBTC15M-ONE",
+          side: "no",
+          price_dollars: "0.5500",
+          delta_fp: "4.00",
+        },
+      }),
+    ),
+  );
+  const changed = events[1]?.books as Array<Record<string, unknown>>;
+  assert.deepEqual(changed[0]?.asks, [
+    { price: "0.55", size: "4" },
+    { price: "0.6", size: "9" },
+  ]);
+  assert.deepEqual(changed[1]?.bids, [
+    { price: "0.45", size: "4" },
+    { price: "0.4", size: "9" },
+  ]);
+});
+
+test("Kalshi stream invalidates books and requests snapshots on a sequence gap", async () => {
+  const events: Array<Record<string, unknown>> = [];
+  const commands: Array<Record<string, unknown>> = [];
+  const stream = new KalshiMarketStream(
+    testConfig({ exchange: "kalshi" }),
+    (event) => events.push(event),
+  );
+  const internals = stream as unknown as {
+    tickers: Set<string>;
+    socket: { readyState: number; send(value: string): void };
+    subscriptionIds: Map<string, number>;
+    handleMessage(data: unknown): Promise<void>;
+  };
+  internals.tickers.add("KXBTC15M-ONE");
+  internals.subscriptionIds.set("orderbook_delta", 7);
+  internals.socket = {
+    readyState: 1,
+    send(value) {
+      commands.push(JSON.parse(value) as Record<string, unknown>);
+    },
+  };
+  await internals.handleMessage(
+    Buffer.from(
+      JSON.stringify({
+        type: "orderbook_snapshot",
+        sid: 7,
+        seq: 20,
+        msg: {
+          market_ticker: "KXBTC15M-ONE",
+          yes_dollars_fp: [["0.3", "10"]],
+          no_dollars_fp: [["0.6", "10"]],
+        },
+      }),
+    ),
+  );
+  events.length = 0;
+  await internals.handleMessage(
+    Buffer.from(
+      JSON.stringify({
+        type: "orderbook_delta",
+        sid: 7,
+        seq: 22,
+        msg: {
+          market_ticker: "KXBTC15M-ONE",
+          side: "yes",
+          price_dollars: "0.31",
+          delta_fp: "2",
+        },
+      }),
+    ),
+  );
+  assert.deepEqual(events.map((event) => event.event_type), [
+    "market_books_invalid",
+  ]);
+  assert.equal(
+    (commands[0]?.params as { action?: string }).action,
+    "get_snapshot",
+  );
+  assert.deepEqual(
+    (commands[0]?.params as { market_tickers?: string[] }).market_tickers,
+    ["KXBTC15M-ONE"],
+  );
+});
+
+test("Kalshi stream serializes asynchronous message callbacks", async () => {
+  let active = 0;
+  let maxActive = 0;
+  const stream = new KalshiMarketStream(
+    testConfig({ exchange: "kalshi" }),
+    async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      active -= 1;
+    },
+  );
+  const internals = stream as unknown as {
+    enqueueMessage(data: unknown): void;
+    processingQueue: Promise<void>;
+  };
+  internals.enqueueMessage(
+    Buffer.from(
+      JSON.stringify({
+        type: "orderbook_snapshot",
+        sid: 2,
+        seq: 1,
+        msg: {
+          market_ticker: "KXBTC15M-ONE",
+          yes_dollars_fp: [["0.3", "10"]],
+          no_dollars_fp: [["0.6", "10"]],
+        },
+      }),
+    ),
+  );
+  internals.enqueueMessage(
+    Buffer.from(
+      JSON.stringify({
+        type: "orderbook_delta",
+        sid: 2,
+        seq: 2,
+        msg: {
+          market_ticker: "KXBTC15M-ONE",
+          side: "yes",
+          price_dollars: "0.31",
+          delta_fp: "2",
+        },
+      }),
+    ),
+  );
+  await internals.processingQueue;
+  assert.equal(maxActive, 1);
 });
 
 test("Kalshi live executor persists and cancels Ladder V5 GTC orders", async () => {
@@ -441,9 +624,21 @@ test("Kalshi live executor persists and cancels Ladder V5 GTC orders", async () 
         no_dollars: [["0.5000", "100.00"]],
       },
     });
-    const trader = new KalshiTrader(config);
+    const subscriptions: string[][] = [];
+    const trader = new KalshiTrader(config, {
+      stream: {
+        subscribe(tokenIds) {
+          subscriptions.push(tokenIds);
+        },
+        close() {},
+      },
+    });
     await trader.init();
     await trader.observeMarket(event, books);
+    assert.deepEqual(subscriptions, [[
+      "KXBTC15M-TEST::yes",
+      "KXBTC15M-TEST::no",
+    ]]);
     const opportunity: TradeOpportunity = {
       kind: "cheap",
       event,
@@ -464,6 +659,60 @@ test("Kalshi live executor persists and cancels Ladder V5 GTC orders", async () 
     const snapshot = trader.getMarketExecutionSnapshot(event.slug);
     assert.equal(snapshot?.openOrders.length, 1);
     assert.equal(snapshot?.capitalCommitted, 1.5);
+    const wakes: string[] = [];
+    trader.setExecutionWakeHandler((marketSlug) => wakes.push(marketSlug));
+    await trader.ingestMarketEvent({
+      event_type: "market_books",
+      market_ticker: "KXBTC15M-TEST",
+      books: [
+        {
+          event_type: "book",
+          asset_id: "KXBTC15M-TEST::yes",
+          bids: [{ price: "0.42", size: "12" }],
+          asks: [{ price: "0.58", size: "12" }],
+        },
+        {
+          event_type: "book",
+          asset_id: "KXBTC15M-TEST::no",
+          bids: [{ price: "0.41", size: "9" }],
+          asks: [{ price: "0.59", size: "9" }],
+        },
+      ],
+    });
+    assert.deepEqual(
+      trader
+        .getMarketExecutionSnapshot(event.slug)
+        ?.books.map((book) => book.bestAsk),
+      [0.58, 0.59],
+    );
+    await trader.ingestMarketEvent({
+      event_type: "fill",
+      order_id: "v5-live-order",
+      trade_id: "trade-1",
+      market_ticker: "KXBTC15M-TEST",
+      is_taker: false,
+      yes_price_dollars: "0.1500",
+      count_fp: "4.00",
+      fee_cost: "0.0100",
+      ts_ms: Date.now(),
+    });
+    assert.equal(
+      trader.getMarketExecutionSnapshot(event.slug)?.fills[0]?.size,
+      4,
+    );
+    await trader.ingestMarketEvent({
+      event_type: "user_order",
+      order_id: "v5-live-order",
+      ticker: "KXBTC15M-TEST",
+      status: "canceled",
+      fill_count_fp: "4.00",
+      remaining_count_fp: "6.00",
+    });
+    assert.equal(
+      trader.getMarketExecutionSnapshot(event.slug)?.openOrders.length,
+      0,
+    );
+    assert.equal(wakes.length, 3);
     await trader.cancelOrders(["v5-live-order"]);
     assert.equal(cancelled, true);
     assert.equal(

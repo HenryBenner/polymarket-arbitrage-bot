@@ -47,6 +47,8 @@ interface MarketContext {
   event: UpDownEvent;
   books: Map<string, TokenBook>;
   liquidity: Map<string, OrderBookLevel[]>;
+  marketDataValid: boolean;
+  streamBacked: boolean;
 }
 
 interface PriceChange {
@@ -198,7 +200,7 @@ export class PaperTrader implements OrderExecutor {
   }
 
   async observeMarket(event: UpDownEvent, books: TokenBook[]): Promise<void> {
-    const context: MarketContext = {
+    const nextContext: MarketContext = {
       event,
       books: new Map(books.map((book) => [book.tokenId, book])),
       liquidity: new Map(
@@ -207,8 +209,18 @@ export class PaperTrader implements OrderExecutor {
           book.asks.map((level) => ({ ...level })),
         ]),
       ),
+      marketDataValid: true,
+      streamBacked: false,
     };
-    this.contexts.set(event.slug, context);
+    const existingContext = this.contexts.get(event.slug);
+    if (
+      existingContext &&
+      (existingContext.streamBacked || !existingContext.marketDataValid)
+    ) {
+      existingContext.event = event;
+    } else {
+      this.contexts.set(event.slug, nextContext);
+    }
     for (const book of books) this.tokenToMarket.set(book.tokenId, event.slug);
     this.stream.subscribe(books.map((book) => book.tokenId));
     await this.loadFeeConfig(event);
@@ -692,6 +704,7 @@ export class PaperTrader implements OrderExecutor {
     }));
     return structuredClone({
       marketSlug,
+      marketDataValid: context.marketDataValid,
       orders,
       openOrders,
       fills,
@@ -857,6 +870,34 @@ export class PaperTrader implements OrderExecutor {
 
   private async handleStreamEvent(event: MarketStreamEvent): Promise<void> {
     const eventType = String(event.event_type ?? "");
+    if (eventType === "market_books") {
+      const books = Array.isArray(event.books)
+        ? (event.books as MarketStreamEvent[])
+        : [];
+      for (const book of books) this.handleBookEvent(book);
+      for (const book of books) {
+        const tokenId = String(book.asset_id ?? "");
+        const marketSlug = this.tokenToMarket.get(tokenId);
+        const context = marketSlug ? this.contexts.get(marketSlug) : undefined;
+        if (context) {
+          context.marketDataValid = true;
+          context.streamBacked = true;
+        }
+      }
+      await this.notifyExecutionWake(event);
+      return;
+    }
+    if (eventType === "market_books_invalid") {
+      const tickers = Array.isArray(event.market_tickers)
+        ? event.market_tickers.map(String)
+        : [];
+      for (const ticker of tickers) {
+        const marketSlug = this.tokenToMarket.get(kalshiTokenId(ticker, "yes"));
+        const context = marketSlug ? this.contexts.get(marketSlug) : undefined;
+        if (context) context.marketDataValid = false;
+      }
+      return;
+    }
     if (eventType === "book") {
       this.handleBookEvent(event);
       await this.notifyExecutionWake(event);
@@ -893,12 +934,19 @@ export class PaperTrader implements OrderExecutor {
         if (tokenId) tokenIds.add(tokenId);
       }
     }
+    if (Array.isArray(event.books)) {
+      for (const book of event.books as MarketStreamEvent[]) {
+        const tokenId = String(book.asset_id ?? "");
+        if (tokenId) tokenIds.add(tokenId);
+      }
+    }
     const marketSlugs = new Set<string>();
     for (const tokenId of tokenIds) {
       const marketSlug = this.tokenToMarket.get(tokenId);
       if (marketSlug) marketSlugs.add(marketSlug);
     }
     for (const marketSlug of marketSlugs) {
+      if (this.contexts.get(marketSlug)?.marketDataValid === false) continue;
       await this.executionWakeHandler(marketSlug);
     }
   }
@@ -916,6 +964,7 @@ export class PaperTrader implements OrderExecutor {
       previous.bids = bids;
       previous.bestAsk = asks[0]?.price ?? null;
       previous.bestBid = bids[0]?.price ?? null;
+      previous.timestamp = String(event.timestamp ?? Date.now());
     }
     context.liquidity.set(tokenId, asks.map((level) => ({ ...level })));
   }

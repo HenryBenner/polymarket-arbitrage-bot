@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { ReverseBot, type MarketSource } from "../src/bot.js";
 import type {
+  MarketExecutionSnapshot,
   OrderExecutor,
   OrderResult,
   TokenBook,
@@ -144,6 +145,88 @@ test("ladder markets process concurrently and isolate a market failure", async (
       ),
       false,
     );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Ladder V7 WebSocket wakes use the V7 per-market queue", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "v7-wake-route-"));
+  try {
+    const event = marketEvent("btc", "KXBTC15M");
+    event.windowEnd = Date.now() / 1_000 + 4 * 60;
+    event.windowStart = event.windowEnd - 900;
+    const books = booksFor(event);
+    let wake:
+      | ((marketSlug: string) => void | Promise<void>)
+      | undefined;
+    let reports = 0;
+    const executor: OrderExecutor = {
+      async init() {},
+      setExecutionWakeHandler(handler) {
+        wake = handler;
+      },
+      async observeMarket() {},
+      getMarketExecutionSnapshot(marketSlug): MarketExecutionSnapshot {
+        return {
+          marketSlug,
+          marketDataValid: true,
+          orders: [],
+          openOrders: [],
+          fills: [],
+          positions: [],
+          books,
+          capitalUsed: 0,
+          openCommitted: 0,
+          capitalCommitted: 0,
+          availableCash: 1_000,
+          totalFees: 0,
+          estimatedMakerRebate: 0,
+          takerFeeRate: 0.07,
+          makerFeeRate: 0,
+          takerFeeExponent: 1,
+          settledPnl: null,
+        };
+      },
+      async placeBuy(opportunity) {
+        return {
+          dryRun: true,
+          accepted: true,
+          tokenId: opportunity.token.tokenId,
+          side: "BUY",
+          price: opportunity.price,
+          size: opportunity.size,
+        };
+      },
+      reportMarket() {
+        reports += 1;
+      },
+      async cancelOrders() {},
+    };
+    const scanner: MarketSource = {
+      async scan() {
+        return [event];
+      },
+      async getTokenBooks() {
+        return books;
+      },
+    };
+    const bot = new ReverseBot(
+      testConfig({
+        exchange: "kalshi",
+        strategyMode: "ladder_v7",
+        executionMode: "paper",
+        paperStatePath: directory,
+      }),
+      executor,
+      scanner,
+    );
+    await bot.init();
+    await bot.runOnce();
+    assert.equal(reports, 1);
+    assert.ok(wake);
+    await wake(event.slug);
+    assert.equal(reports, 2);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

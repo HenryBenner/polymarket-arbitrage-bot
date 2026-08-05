@@ -202,6 +202,13 @@ paper mode, so paper mode needs a Kalshi API key ID and RSA private key. Public
 REST discovery does not. Put the PEM in `KALSHI_PRIVATE_KEY`, surrounded by
 double quotes, with literal `\n` between lines:
 
+Kalshi book subscriptions explicitly use unified YES-price semantics. Incoming
+messages are processed in order and each update publishes YES and NO books as
+one atomic market snapshot. A sequence gap invalidates affected books and
+pauses strategy wakes until the stream obtains fresh snapshots. Live Kalshi
+execution also consumes `fill` and `user_orders` updates, with REST
+reconciliation retained for startup and reconnect recovery.
+
 ```env
 KALSHI_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
 ```
@@ -529,8 +536,9 @@ profit but reduces quote competitiveness. Always use a separate
 
 V6 is paper-only. Its paper executor uses the market WebSocket to wake the
 planner immediately after simulated maker fills and relevant book changes;
-it does not wait for the scanner poll. Real-money V6 remains disabled until an
-authenticated user-stream implementation and forward paper evidence exist.
+it does not wait for the scanner poll. Real-money V6 remains disabled pending
+forward paper evidence even though the Kalshi executor now has authenticated
+fill and order-state streams.
 
 For Command Prompt:
 
@@ -578,7 +586,9 @@ cap is available only for a risk-limited experiment. This is an in-sample
 attribution, not a forward result, and BTC is the only default market because
 its result was the strongest and most stable.
 
-V7 is Kalshi paper-only. Fill in the Kalshi credentials required by its market
+V7 is Kalshi paper-only. Its per-market execution queue wakes once after each
+atomic two-outcome book update or simulated fill instead of waiting for the
+polling interval. Fill in the Kalshi credentials required by its market
 WebSocket, then run the supplied BTC profile.
 
 For Command Prompt:

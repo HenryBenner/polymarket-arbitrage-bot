@@ -209,6 +209,7 @@ export interface PaperSettlement {
 
 export interface MarketExecutionSnapshot {
   marketSlug: string;
+  marketDataValid?: boolean;
   orders: readonly PaperOrder[];
   openOrders: readonly PaperOrder[];
   fills: readonly PaperFill[];

@@ -45,10 +45,12 @@ export class ReverseBot {
     { event: UpDownEvent; books: TokenBook[] }
   >();
   private readonly ladderV8Events = new Map<string, UpDownEvent>();
+  private readonly ladderV7Events = new Map<string, UpDownEvent>();
   private readonly ladderV55Events = new Map<string, UpDownEvent>();
   private readonly ladderV55Queues = new Map<string, Promise<void>>();
   private readonly ladderV6Queues = new Map<string, Promise<void>>();
   private readonly ladderV8Queues = new Map<string, Promise<void>>();
+  private readonly ladderV7Queues = new Map<string, Promise<void>>();
   private readonly marketQueues = new Map<string, Promise<void>>();
   private ladderTickRunning = false;
 
@@ -79,7 +81,9 @@ export class ReverseBot {
         ? this.enqueueLadderV55Market(marketSlug)
         : this.config.strategyMode === "ladder_v6"
           ? this.enqueueLadderV6Market(marketSlug)
-          : this.enqueueLadderV8Market(marketSlug),
+          : this.config.strategyMode === "ladder_v7"
+            ? this.enqueueLadderV7Market(marketSlug)
+            : this.enqueueLadderV8Market(marketSlug),
     );
   }
 
@@ -283,6 +287,12 @@ export class ReverseBot {
   private async processEvent(event: UpDownEvent): Promise<void> {
     const books = await this.scanner.getTokenBooks(event);
     await this.trader.observeMarket?.(event, books);
+    if (
+      this.trader.getMarketExecutionSnapshot?.(event.slug)
+        ?.marketDataValid === false
+    ) {
+      return;
+    }
 
     if (
       (this.config.strategyMode === "odahoa_ladder" ||
@@ -313,7 +323,8 @@ export class ReverseBot {
       return;
     }
     if (this.config.strategyMode === "ladder_v7") {
-      await this.processLadderV7Event(event, books);
+      this.ladderV7Events.set(event.slug, event);
+      await this.enqueueLadderV7Market(event.slug);
       return;
     }
     if (this.config.strategyMode === "ladder_v8") {
@@ -529,6 +540,7 @@ export class ReverseBot {
           "ladder_v5 requires a fill-aware executor snapshot",
         );
       }
+      if (snapshot.marketDataValid === false) return;
       const plan = await planLadderV5(
         this.config,
         this.ladderTracker,
@@ -564,7 +576,6 @@ export class ReverseBot {
 
   private async processLadderV7Event(
     event: UpDownEvent,
-    books: TokenBook[],
   ): Promise<void> {
     let submitted = 0;
     let cancelled = 0;
@@ -581,11 +592,12 @@ export class ReverseBot {
           "ladder_v7 requires a fill-aware executor snapshot",
         );
       }
+      if (snapshot.marketDataValid === false) return;
       const plan = await planLadderV7(
         this.config,
         this.ladderTracker,
         event,
-        books,
+        [...snapshot.books],
         snapshot,
       );
       lastPlan = plan;
@@ -615,6 +627,28 @@ export class ReverseBot {
       });
     }
     this.trader.reportMarket?.(event.slug);
+  }
+
+  private enqueueLadderV7Market(marketSlug: string): Promise<void> {
+    if (this.config.strategyMode !== "ladder_v7") {
+      return Promise.resolve();
+    }
+    const previous = this.ladderV7Queues.get(marketSlug) ?? Promise.resolve();
+    const queued = previous
+      .catch(() => undefined)
+      .then(async () => {
+        const event = this.ladderV7Events.get(marketSlug);
+        if (!event) return;
+        await this.processLadderV7Event(event);
+      });
+    this.ladderV7Queues.set(marketSlug, queued);
+    const cleanup = () => {
+      if (this.ladderV7Queues.get(marketSlug) === queued) {
+        this.ladderV7Queues.delete(marketSlug);
+      }
+    };
+    void queued.then(cleanup, cleanup);
+    return queued;
   }
 
   private enqueueLadderV8Market(marketSlug: string): Promise<void> {
@@ -658,6 +692,7 @@ export class ReverseBot {
           "ladder_v8 requires a fill-aware executor snapshot",
         );
       }
+      if (snapshot.marketDataValid === false) return;
       const plan = await planLadderV8(
         this.config,
         this.ladderTracker,
@@ -725,6 +760,7 @@ export class ReverseBot {
       if (!snapshot) {
         throw new Error("ladder_v5.5 requires a fill-aware executor snapshot");
       }
+      if (snapshot.marketDataValid === false) return;
       const plan = await planLadderV55(
         this.config,
         this.ladderTracker,
@@ -800,6 +836,7 @@ export class ReverseBot {
           "ladder_v6 requires a fill-aware executor snapshot",
         );
       }
+      if (snapshot.marketDataValid === false) return;
       const plan = await planLadderV6(
         this.config,
         this.ladderTracker,

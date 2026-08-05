@@ -411,6 +411,66 @@ test("paper market events wake V6 immediately after a maker fill", async () => {
   }
 });
 
+test("paper Kalshi book batches update both outcomes before one execution wake", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paper-atomic-book-"));
+  try {
+    const trader = new PaperTrader(
+      testConfig({
+        exchange: "kalshi",
+        strategyMode: "ladder_v7",
+        paperStatePath: directory,
+      }),
+      {
+        stream: fakeStream,
+        feeLoader: async () => ({ rate: 0.07, exponent: 1 }),
+        settlementLoader: async () => null,
+      },
+    );
+    await trader.init();
+    const event = testEvent();
+    event.market.externalMarketId = "KXBTC15M-TEST";
+    event.market.id = "KXBTC15M-TEST";
+    event.market.clobTokenIds = JSON.stringify([
+      "KXBTC15M-TEST::yes",
+      "KXBTC15M-TEST::no",
+    ]);
+    const books = testBooks();
+    books[0]!.tokenId = "KXBTC15M-TEST::yes";
+    books[1]!.tokenId = "KXBTC15M-TEST::no";
+    await trader.observeMarket(event, books);
+    const observed: Array<Array<number | null>> = [];
+    trader.setExecutionWakeHandler((marketSlug) => {
+      observed.push(
+        trader
+          .getMarketExecutionSnapshot(marketSlug)!
+          .books.map((book) => book.bestAsk),
+      );
+    });
+    await trader.ingestMarketEvent({
+      event_type: "market_books",
+      market_ticker: "KXBTC15M-TEST",
+      books: [
+        {
+          event_type: "book",
+          asset_id: "KXBTC15M-TEST::yes",
+          bids: [{ price: "0.31", size: "10" }],
+          asks: [{ price: "0.68", size: "10" }],
+        },
+        {
+          event_type: "book",
+          asset_id: "KXBTC15M-TEST::no",
+          bids: [{ price: "0.32", size: "10" }],
+          asks: [{ price: "0.69", size: "10" }],
+        },
+      ],
+    });
+    assert.deepEqual(observed, [[0.68, 0.69]]);
+    await trader.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("paper settlement pays the winning shares and persists across restart", async () => {
   const directory = await mkdtemp(join(tmpdir(), "paper-settle-"));
   try {

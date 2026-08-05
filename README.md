@@ -598,6 +598,65 @@ The profile writes paper state to `./data/paper-ladder-v7-btc`. See
 [`LADDER_V7_ANALYSIS.md`](LADDER_V7_ANALYSIS.md) for the reconstructed PnL,
 failure analysis, caveats, and the forward-test acceptance criteria.
 
+### Ladder V8 Odahoa BTC 15-minute paper candidate
+
+`STRATEGY_MODE=ladder_v8` models the recurring structure observed in Odahoa's
+public BTC 15-minute maker fills on August 3-4, 2026. It is intentionally
+Polymarket paper-only: the public record reveals fills, not every submitted or
+cancelled order, so this is an evidence-based reconstruction rather than an
+exact copy of private intent.
+
+V8 applies these rules throughout the 15-to-2-minute entry window:
+
+1. Lock the cheap and favorite outcomes on the first V8 planning decision for
+   the market. A later favorite reversal permanently flip-locks that market.
+2. Offer all nine complementary 5-cent pairs: 45/55 through 5/95.
+3. Submit every leg post-only, below the current ask, with one stable key per
+   market, outcome, and price. A submitted leg is never replenished.
+4. On a favorite reversal, cancel the entire resting opening grid and never
+   build another stack. The flip lock is persisted across restarts. V8 may
+   submit only one deficient-side completion maker, sized no larger than the
+   actual unmatched inventory and priced for a maximum 99-cent pair cost.
+5. At two minutes, cancel open orders that would add to the heavier filled
+   outcome while retaining completion orders on the deficient outcome.
+6. Once V8's filled imbalance reaches 240 shares, cancel and block additional
+   orders on the heavy outcome. This guard reacts after confirmed fills and
+   cannot prevent several simultaneously resting orders from filling together.
+
+The default order size is selected from the BTC market's start time in New
+York, matching the strongest recurring share tiers in the audit:
+
+| Market start (ET) | Shares per leg |
+| --- | ---: |
+| 00:00-05:59 | 5 |
+| 06:00-08:59 | 16 |
+| 09:00-14:59 | 120 |
+| 15:00-17:59 | 32 |
+| 18:00-23:59 | 8 |
+
+`LADDER_V8_SIZE_SCALE` scales those tiers, while
+`LADDER_V8_MAX_SHARES_PER_ORDER` is a hard per-leg ceiling. At the default
+daytime tier, one complete nine-pair grid can commit up to $1,080, so the
+sample profile sets `LADDER_MAX_USDC_PER_MARKET=1100` and uses an isolated
+$25,000 paper ledger. These values emulate the observed sizing; they are not
+a recommendation for live risk.
+
+For Command Prompt:
+
+```bat
+set "DOTENV_CONFIG_PATH=.env.ladder-v8-paper.example"
+npm.cmd start
+```
+
+For PowerShell:
+
+```powershell
+$env:DOTENV_CONFIG_PATH = ".env.ladder-v8-paper.example"
+npm start
+```
+
+The profile writes paper state to `./data/paper-ladder-v8-btc`.
+
 ### Odahoa pair-lock V2
 
 `STRATEGY_MODE=odahoa_ladder_2` keeps V1's BTC market selection, phases,

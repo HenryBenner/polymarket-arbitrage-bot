@@ -630,6 +630,8 @@ export class PaperTrader implements OrderExecutor {
                   ? "ladder_v6 paired makers / maker-FOK completion"
                   : this.config.strategyMode === "ladder_v7"
                     ? "ladder_v7 fixed cheap maker / capped favorite FAK"
+                    : this.config.strategyMode === "ladder_v8"
+                      ? "ladder_v8 Odahoa-sized complementary maker grid"
                     : `${this.config.ladderPreset} public-fill approximation`,
         firstVisibleFillMinutesLeft:
           fills.length > 0

@@ -152,6 +152,9 @@ export interface BotConfig {
   ladderV7CheapPrice: number;
   ladderV7FavoritePrice: number;
   ladderV7MaxShares: number;
+  ladderV8SizeScale: number;
+  ladderV8MaxSharesPerOrder: number;
+  ladderV8MaxUnmatchedShares: number;
   paperStartingUsdc: number;
   paperStatePath: string;
 }
@@ -182,10 +185,11 @@ export function loadConfig(): BotConfig {
     strategyRaw !== "ladder_v5" &&
     strategyRaw !== "ladder_v5.5" &&
     strategyRaw !== "ladder_v6" &&
-    strategyRaw !== "ladder_v7"
+    strategyRaw !== "ladder_v7" &&
+    strategyRaw !== "ladder_v8"
   ) {
     throw new Error(
-      "STRATEGY_MODE must be reverse, odahoa_ladder, odahoa_ladder_2, odahoa_static_maker, ladder_v5, ladder_v5.5, ladder_v6, or ladder_v7",
+      "STRATEGY_MODE must be reverse, odahoa_ladder, odahoa_ladder_2, odahoa_static_maker, ladder_v5, ladder_v5.5, ladder_v6, ladder_v7, or ladder_v8",
     );
   }
 
@@ -286,6 +290,15 @@ export function loadConfig(): BotConfig {
     ladderV7CheapPrice: envNumber("LADDER_V7_CHEAP_PRICE", 0.1),
     ladderV7FavoritePrice: envNumber("LADDER_V7_FAVORITE_PRICE", 0.8),
     ladderV7MaxShares: envNumber("LADDER_V7_MAX_SHARES", 40),
+    ladderV8SizeScale: envNumber("LADDER_V8_SIZE_SCALE", 1),
+    ladderV8MaxSharesPerOrder: envNumber(
+      "LADDER_V8_MAX_SHARES_PER_ORDER",
+      120,
+    ),
+    ladderV8MaxUnmatchedShares: envNumber(
+      "LADDER_V8_MAX_UNMATCHED_SHARES",
+      240,
+    ),
     paperStartingUsdc: envNumber("PAPER_STARTING_USDC", 100),
     paperStatePath: envString("PAPER_STATE_PATH", "./data/paper"),
   };
@@ -437,6 +450,28 @@ export function validateTradingConfig(config: BotConfig): void {
     throw new Error("LADDER_V7_MAX_SHARES must be greater than 0");
   }
   if (
+    !Number.isFinite(config.ladderV8SizeScale) ||
+    config.ladderV8SizeScale <= 0
+  ) {
+    throw new Error("LADDER_V8_SIZE_SCALE must be greater than 0");
+  }
+  if (
+    !Number.isFinite(config.ladderV8MaxSharesPerOrder) ||
+    config.ladderV8MaxSharesPerOrder <= 0
+  ) {
+    throw new Error(
+      "LADDER_V8_MAX_SHARES_PER_ORDER must be greater than 0",
+    );
+  }
+  if (
+    !Number.isFinite(config.ladderV8MaxUnmatchedShares) ||
+    config.ladderV8MaxUnmatchedShares <= 0
+  ) {
+    throw new Error(
+      "LADDER_V8_MAX_UNMATCHED_SHARES must be greater than 0",
+    );
+  }
+  if (
     (config.strategyMode === "ladder_v5" ||
       config.strategyMode === "ladder_v5.5" ||
       config.strategyMode === "ladder_v7") &&
@@ -509,6 +544,14 @@ export function validateTradingConfig(config: BotConfig): void {
   ) {
     throw new Error(
       "ladder_v7 is Kalshi paper-only until its asymmetric execution is forward-tested",
+    );
+  }
+  if (
+    config.strategyMode === "ladder_v8" &&
+    (config.exchange !== "polymarket" || config.executionMode !== "paper")
+  ) {
+    throw new Error(
+      "ladder_v8 is Polymarket paper-only until its Odahoa-sized maker grid is forward-tested",
     );
   }
   if (!Number.isInteger(config.signatureType) || config.signatureType < 0 || config.signatureType > 3) {

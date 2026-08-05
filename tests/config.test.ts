@@ -416,3 +416,43 @@ test("ladder_v7 is Kalshi paper-only with an asymmetric price and share cap", ()
     /must be less than 1/,
   );
 });
+
+test("ladder_v8 is Polymarket paper-only with Odahoa sizing guards", () => {
+  const config = testConfig({
+    exchange: "polymarket",
+    strategyMode: "ladder_v8",
+    executionMode: "paper",
+    ladderV8SizeScale: 1,
+    ladderV8MaxSharesPerOrder: 120,
+    ladderV8MaxUnmatchedShares: 240,
+  });
+  assert.doesNotThrow(() => validateTradingConfig(config));
+  assert.throws(
+    () => validateTradingConfig({ ...config, executionMode: "live" }),
+    /paper-only/,
+  );
+  assert.throws(
+    () => validateTradingConfig({ ...config, exchange: "kalshi" }),
+    /paper-only/,
+  );
+  assert.throws(
+    () => validateTradingConfig({ ...config, ladderV8SizeScale: 0 }),
+    /LADDER_V8_SIZE_SCALE/,
+  );
+  assert.throws(
+    () =>
+      validateTradingConfig({
+        ...config,
+        ladderV8MaxSharesPerOrder: 0,
+      }),
+    /LADDER_V8_MAX_SHARES_PER_ORDER/,
+  );
+  assert.throws(
+    () =>
+      validateTradingConfig({
+        ...config,
+        ladderV8MaxUnmatchedShares: 0,
+      }),
+    /LADDER_V8_MAX_UNMATCHED_SHARES/,
+  );
+});

@@ -103,8 +103,10 @@ test("Kalshi REST authentication signs timestamp, method, and path without query
 test("Kalshi order entry maps Up to a YES bid and Down to a complementary YES ask", async () => {
   const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const requests: Array<Record<string, unknown>> = [];
+  const requestUrls: string[] = [];
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (_input, init) => {
+  globalThis.fetch = async (input, init) => {
+    requestUrls.push(String(input));
     requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
     return new Response(
       JSON.stringify({
@@ -145,6 +147,13 @@ test("Kalshi order entry maps Up to a YES bid and Down to a complementary YES as
       timeInForce: "fill_or_kill",
       postOnly: false,
     });
+    await client.amendOrder({
+      orderId: "order-1",
+      ticker: "KXBTC15M-TEST",
+      outcome: "no",
+      price: 0.15,
+      totalCount: 20,
+    });
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -154,6 +163,10 @@ test("Kalshi order entry maps Up to a YES bid and Down to a complementary YES as
   assert.equal(requests[1]?.side, "ask");
   assert.equal(requests[1]?.price, "0.6500");
   assert.equal(requests[1]?.time_in_force, "fill_or_kill");
+  assert.match(requestUrls[2]!, /portfolio\/events\/orders\/order-1\/amend$/);
+  assert.equal(requests[2]?.side, "ask");
+  assert.equal(requests[2]?.price, "0.8500");
+  assert.equal(requests[2]?.count, "20.00");
 });
 
 test("Kalshi balance is loaded from the configured subaccount in dollars", async () => {

@@ -299,6 +299,7 @@ export class KalshiTrader implements OrderExecutor {
             : filled > 0
               ? "partial"
               : "open",
+        side: "BUY",
         phaseId: opportunity.phaseId,
         pairId: opportunity.pairId,
         orderPolicy: opportunity.orderPolicy ?? "gtc",
@@ -376,6 +377,86 @@ export class KalshiTrader implements OrderExecutor {
       }
     }
     await this.persist();
+  }
+
+  async amendOrder(
+    orderId: string,
+    opportunity: TradeOpportunity,
+  ): Promise<OrderResult> {
+    return this.serializeExecution(opportunity.event.slug, () =>
+      this.amendOrderLocked(orderId, opportunity),
+    );
+  }
+
+  private async amendOrderLocked(
+    orderId: string,
+    opportunity: TradeOpportunity,
+  ): Promise<OrderResult> {
+    const order = this.state.orders.find((candidate) => candidate.id === orderId);
+    if (!order || (order.status !== "open" && order.status !== "partial")) {
+      return {
+        dryRun: this.config.dryRun,
+        accepted: false,
+        tokenId: opportunity.token.tokenId,
+        side: "BUY",
+        price: opportunity.price,
+        size: opportunity.size,
+        response: { status: "rejected", reason: "order_not_open" },
+      };
+    }
+    const parsed = parseKalshiTokenId(order.tokenId);
+    if (!parsed) throw new Error(`Invalid Kalshi token ID: ${order.tokenId}`);
+    const alreadyFilled = round(order.originalSize - order.remainingSize);
+    const totalCount = round(alreadyFilled + opportunity.size);
+    if (this.config.dryRun) {
+      order.limitPrice = opportunity.price;
+      order.originalSize = totalCount;
+      order.remainingSize = opportunity.size;
+      return {
+        dryRun: true,
+        accepted: true,
+        tokenId: order.tokenId,
+        side: "BUY",
+        price: opportunity.price,
+        size: opportunity.size,
+      };
+    }
+    const response = await this.client.amendOrder({
+      orderId,
+      ticker: parsed.ticker,
+      outcome: parsed.outcome,
+      price: opportunity.price,
+      totalCount,
+    });
+    order.limitPrice = opportunity.price;
+    order.originalSize = totalCount;
+    order.remainingSize = Number.isFinite(Number(response.remaining_count))
+      ? Number(response.remaining_count)
+      : opportunity.size;
+    const amendedFillCount = Number(response.fill_count) || 0;
+    order.status =
+      order.remainingSize <= 1e-8
+        ? amendedFillCount > 0
+          ? "filled"
+          : "cancelled"
+        : amendedFillCount > 0 || alreadyFilled > 0
+          ? "partial"
+          : "open";
+    this.unconfirmedOrderReservations.set(
+      order.id,
+      opportunity.price * opportunity.size,
+    );
+    this.expectedFillCounts.set(order.id, alreadyFilled + amendedFillCount);
+    await this.persist();
+    return {
+      dryRun: false,
+      accepted: true,
+      tokenId: order.tokenId,
+      side: "BUY",
+      price: opportunity.price,
+      size: opportunity.size,
+      response,
+    };
   }
 
   getMarketExecutionSnapshot(
@@ -638,6 +719,7 @@ export class KalshiTrader implements OrderExecutor {
       size,
       fee,
       liquidity: event.is_taker ? "taker" : "maker",
+      side: "BUY",
       timestamp: new Date(
         Number(event.ts_ms) || Number(event.ts) * 1_000 || Date.now(),
       ).toISOString(),
@@ -813,6 +895,7 @@ function addFill(
     size,
     fee: Math.max(0, Number(remote.fee_cost) || 0),
     liquidity: remote.is_taker ? "taker" : "maker",
+    side: "BUY",
     timestamp:
       remote.created_time ??
       new Date((remote.ts ?? Date.now() / 1_000) * 1_000).toISOString(),

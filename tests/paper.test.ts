@@ -679,3 +679,68 @@ test("per-market caps are independent and never block a reducing hedge", async (
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("paper execution amends rescue orders and can flatten owned inventory", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paper-v9-lifecycle-"));
+  try {
+    const trader = new PaperTrader(
+      testConfig({
+        exchange: "kalshi",
+        strategyMode: "ladder_v9",
+        paperStatePath: directory,
+        paperStartingUsdc: 100,
+      }),
+      {
+        stream: fakeStream,
+        feeLoader: async () => ({ rate: 0.07, exponent: 1 }),
+        settlementLoader: async () => null,
+      },
+    );
+    await trader.init();
+    const books = testBooks(0.4, 0.6);
+    await trader.observeMarket(testEvent(), books);
+
+    await trader.placeBuy({
+      ...opportunity(books[0]!, "v9-cheap", 0.1, 40),
+      strategyMode: "ladder_v9",
+      pairId: "ladder-v9:cheap-entry",
+      orderPolicy: "post_only",
+    });
+    const cheapOrder = trader.snapshot().orders[0]!;
+    const amended = await trader.amendOrder(cheapOrder.id, {
+      ...opportunity(books[0]!, "v9-amend-12", 0.12, 20),
+      strategyMode: "ladder_v9",
+      pairId: "ladder-v9:amend-rescue-12",
+      orderPolicy: "gtc",
+    });
+    assert.equal(amended.accepted, true);
+    assert.equal(trader.snapshot().orders[0]?.limitPrice, 0.12);
+    assert.equal(trader.snapshot().orders[0]?.remainingSize, 20);
+    await trader.cancelOrders([cheapOrder.id]);
+
+    const bought = await trader.placeBuy({
+      ...opportunity(books[0]!, "v9-owned", 0.4, 5),
+      strategyMode: "ladder_v9",
+      pairId: "ladder-v9:test-owned",
+      orderPolicy: "fak",
+    });
+    assert.equal((bought.response as { filledSize: number }).filledSize, 5);
+    const sold = await trader.placeSell({
+      ...opportunity(books[0]!, "v9-flatten", 0.39, 5),
+      strategyMode: "ladder_v9",
+      pairId: "ladder-v9:flatten-cheap-1",
+      orderPolicy: "fak",
+    });
+    assert.equal((sold.response as { filledSize: number }).filledSize, 5);
+    const state = trader.snapshot();
+    assert.equal(state.positions.find((item) => item.tokenId === "up-token")?.shares, 0);
+    assert.equal(state.fills.at(-1)?.side, "SELL");
+    assert.equal(
+      trader.getMarketExecutionSnapshot(testEvent().slug)?.openCommitted,
+      0,
+    );
+    await trader.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

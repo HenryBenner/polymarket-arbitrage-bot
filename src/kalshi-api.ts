@@ -209,6 +209,29 @@ export class KalshiClient {
     });
   }
 
+  async amendOrder(input: {
+    orderId: string;
+    ticker: string;
+    outcome: "yes" | "no";
+    price: number;
+    totalCount: number;
+  }): Promise<KalshiOrderResponse> {
+    const yesPrice = input.outcome === "yes" ? input.price : 1 - input.price;
+    return this.request<KalshiOrderResponse>(
+      `/portfolio/events/orders/${encodeURIComponent(input.orderId)}/amend`,
+      {
+        method: "POST",
+        body: {
+          ticker: input.ticker,
+          side: input.outcome === "yes" ? "bid" : "ask",
+          price: yesPrice.toFixed(4),
+          count: input.totalCount.toFixed(2),
+          exchange_index: 0,
+        },
+      },
+    );
+  }
+
   async getOrders(ticker: string): Promise<KalshiOrder[]> {
     const query = new URLSearchParams({
       ticker,

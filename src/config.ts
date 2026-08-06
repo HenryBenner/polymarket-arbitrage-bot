@@ -155,6 +155,16 @@ export interface BotConfig {
   ladderV8SizeScale: number;
   ladderV8MaxSharesPerOrder: number;
   ladderV8MaxUnmatchedShares: number;
+  ladderV9CheapPrice: number;
+  ladderV9InitialFavoritePrice: number;
+  ladderV9InitialFavoriteShares: number;
+  ladderV9TargetShares: number;
+  ladderV9MinLockedEdge: number;
+  ladderV9CompletionRetryLimit: number;
+  ladderV9CompletionCooldownMs: number;
+  ladderV9RescueMaxPairCost: number;
+  ladderV9EmergencyMaxPairCost: number;
+  ladderV9ManagementCutoffSeconds: number;
   paperStartingUsdc: number;
   paperStatePath: string;
 }
@@ -186,10 +196,11 @@ export function loadConfig(): BotConfig {
     strategyRaw !== "ladder_v5.5" &&
     strategyRaw !== "ladder_v6" &&
     strategyRaw !== "ladder_v7" &&
-    strategyRaw !== "ladder_v8"
+    strategyRaw !== "ladder_v8" &&
+    strategyRaw !== "ladder_v9"
   ) {
     throw new Error(
-      "STRATEGY_MODE must be reverse, odahoa_ladder, odahoa_ladder_2, odahoa_static_maker, ladder_v5, ladder_v5.5, ladder_v6, ladder_v7, or ladder_v8",
+      "STRATEGY_MODE must be reverse, odahoa_ladder, odahoa_ladder_2, odahoa_static_maker, ladder_v5, ladder_v5.5, ladder_v6, ladder_v7, ladder_v8, or ladder_v9",
     );
   }
 
@@ -298,6 +309,37 @@ export function loadConfig(): BotConfig {
     ladderV8MaxUnmatchedShares: envNumber(
       "LADDER_V8_MAX_UNMATCHED_SHARES",
       240,
+    ),
+    ladderV9CheapPrice: envNumber("LADDER_V9_CHEAP_PRICE", 0.1),
+    ladderV9InitialFavoritePrice: envNumber(
+      "LADDER_V9_INITIAL_FAVORITE_PRICE",
+      0.8,
+    ),
+    ladderV9InitialFavoriteShares: envNumber(
+      "LADDER_V9_INITIAL_FAVORITE_SHARES",
+      20,
+    ),
+    ladderV9TargetShares: envNumber("LADDER_V9_TARGET_SHARES", 40),
+    ladderV9MinLockedEdge: envNumber("LADDER_V9_MIN_LOCKED_EDGE", 0.03),
+    ladderV9CompletionRetryLimit: envNumber(
+      "LADDER_V9_COMPLETION_RETRY_LIMIT",
+      4,
+    ),
+    ladderV9CompletionCooldownMs: envNumber(
+      "LADDER_V9_COMPLETION_COOLDOWN_MS",
+      350,
+    ),
+    ladderV9RescueMaxPairCost: envNumber(
+      "LADDER_V9_RESCUE_MAX_PAIR_COST",
+      1,
+    ),
+    ladderV9EmergencyMaxPairCost: envNumber(
+      "LADDER_V9_EMERGENCY_MAX_PAIR_COST",
+      1.02,
+    ),
+    ladderV9ManagementCutoffSeconds: envNumber(
+      "LADDER_V9_MANAGEMENT_CUTOFF_SECONDS",
+      15,
     ),
     paperStartingUsdc: envNumber("PAPER_STARTING_USDC", 100),
     paperStatePath: envString("PAPER_STATE_PATH", "./data/paper"),
@@ -472,6 +514,83 @@ export function validateTradingConfig(config: BotConfig): void {
     );
   }
   if (
+    !Number.isFinite(config.ladderV9CheapPrice) ||
+    config.ladderV9CheapPrice <= 0 ||
+    config.ladderV9CheapPrice >= 0.5
+  ) {
+    throw new Error(
+      "LADDER_V9_CHEAP_PRICE must be greater than 0 and less than 0.5",
+    );
+  }
+  if (
+    !Number.isFinite(config.ladderV9InitialFavoritePrice) ||
+    config.ladderV9InitialFavoritePrice <= 0.5 ||
+    config.ladderV9InitialFavoritePrice >= 1 ||
+    config.ladderV9CheapPrice + config.ladderV9InitialFavoritePrice >= 1
+  ) {
+    throw new Error(
+      "LADDER_V9 initial cheap and favorite prices must be valid and total less than 1",
+    );
+  }
+  if (
+    !Number.isFinite(config.ladderV9InitialFavoriteShares) ||
+    config.ladderV9InitialFavoriteShares <= 0 ||
+    !Number.isFinite(config.ladderV9TargetShares) ||
+    config.ladderV9TargetShares < config.ladderV9InitialFavoriteShares
+  ) {
+    throw new Error(
+      "LADDER_V9_TARGET_SHARES must be at least LADDER_V9_INITIAL_FAVORITE_SHARES and both must be positive",
+    );
+  }
+  if (
+    !Number.isFinite(config.ladderV9MinLockedEdge) ||
+    config.ladderV9MinLockedEdge <= 0 ||
+    config.ladderV9MinLockedEdge >= 0.2
+  ) {
+    throw new Error(
+      "LADDER_V9_MIN_LOCKED_EDGE must be greater than 0 and less than 0.2",
+    );
+  }
+  if (
+    !Number.isInteger(config.ladderV9CompletionRetryLimit) ||
+    config.ladderV9CompletionRetryLimit < 1 ||
+    config.ladderV9CompletionRetryLimit > 10
+  ) {
+    throw new Error(
+      "LADDER_V9_COMPLETION_RETRY_LIMIT must be an integer from 1 through 10",
+    );
+  }
+  if (
+    !Number.isFinite(config.ladderV9CompletionCooldownMs) ||
+    config.ladderV9CompletionCooldownMs < 250 ||
+    config.ladderV9CompletionCooldownMs > 500
+  ) {
+    throw new Error(
+      "LADDER_V9_COMPLETION_COOLDOWN_MS must be from 250 through 500",
+    );
+  }
+  if (
+    !Number.isFinite(config.ladderV9RescueMaxPairCost) ||
+    config.ladderV9RescueMaxPairCost < 0.9 ||
+    config.ladderV9RescueMaxPairCost > 1 ||
+    !Number.isFinite(config.ladderV9EmergencyMaxPairCost) ||
+    config.ladderV9EmergencyMaxPairCost < config.ladderV9RescueMaxPairCost ||
+    config.ladderV9EmergencyMaxPairCost > 1.05
+  ) {
+    throw new Error(
+      "LADDER_V9 rescue pair costs must be ordered between 0.90 and 1.05",
+    );
+  }
+  if (
+    !Number.isFinite(config.ladderV9ManagementCutoffSeconds) ||
+    config.ladderV9ManagementCutoffSeconds < 5 ||
+    config.ladderV9ManagementCutoffSeconds > 30
+  ) {
+    throw new Error(
+      "LADDER_V9_MANAGEMENT_CUTOFF_SECONDS must be from 5 through 30",
+    );
+  }
+  if (
     (config.strategyMode === "ladder_v5" ||
       config.strategyMode === "ladder_v5.5" ||
       config.strategyMode === "ladder_v7") &&
@@ -552,6 +671,14 @@ export function validateTradingConfig(config: BotConfig): void {
   ) {
     throw new Error(
       "ladder_v8 is Polymarket paper-only until its Odahoa-sized maker grid is forward-tested",
+    );
+  }
+  if (
+    config.strategyMode === "ladder_v9" &&
+    (config.exchange !== "kalshi" || config.executionMode !== "paper")
+  ) {
+    throw new Error(
+      "ladder_v9 is Kalshi paper-only until its staged completion and rescue lifecycle is forward-tested",
     );
   }
   if (!Number.isInteger(config.signatureType) || config.signatureType < 0 || config.signatureType > 3) {

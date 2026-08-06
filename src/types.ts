@@ -8,7 +8,8 @@ export type StrategyMode =
   | "ladder_v5.5"
   | "ladder_v6"
   | "ladder_v7"
-  | "ladder_v8";
+  | "ladder_v8"
+  | "ladder_v9";
 export type ExecutionMode = "dry_run" | "paper" | "live";
 export type ExchangeName = "polymarket" | "kalshi";
 export type LadderPreset = "odahoa_v1";
@@ -157,6 +158,7 @@ export interface PaperOrder {
   remainingSize: number;
   queueAhead: number;
   status: PaperOrderStatus;
+  side?: TradeSide;
   phaseId?: string;
   pairId?: string;
   orderPolicy?: "gtc" | "post_only" | "fak" | "fok";
@@ -183,6 +185,7 @@ export interface PaperFill {
   makerFeeEquivalent?: number;
   estimatedMakerRebate?: number;
   liquidity: "taker" | "maker";
+  side?: TradeSide;
   timestamp: string;
 }
 
@@ -230,6 +233,11 @@ export interface MarketExecutionSnapshot {
 export interface OrderExecutor {
   init(): Promise<void>;
   placeBuy(opportunity: TradeOpportunity): Promise<OrderResult>;
+  placeSell?(opportunity: TradeOpportunity): Promise<OrderResult>;
+  amendOrder?(
+    orderId: string,
+    opportunity: TradeOpportunity,
+  ): Promise<OrderResult>;
   setExecutionWakeHandler?(
     handler: (marketSlug: string) => void | Promise<void>,
   ): void;

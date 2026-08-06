@@ -667,6 +667,54 @@ npm start
 
 The profile writes paper state to `./data/paper-ladder-v8-btc`.
 
+### Ladder V9 fill-driven staged execution
+
+`STRATEGY_MODE=ladder_v9` replaces V7's independent one-shot legs with a
+confirmed-fill lifecycle. It is Kalshi paper-only while its completion,
+amendment, and flattening behavior is forward-tested; V7 remains available
+unchanged.
+
+V9 applies the following sequence:
+
+1. From five to two minutes before close, submit the 40-share 10-cent cheap
+   order first. It is post-only unless the visible ask is already 10 cents or
+   lower, in which case it is FAK. The initial favorite order cannot be sent
+   until this cheap order is confirmed open, partial, or filled.
+2. Submit a 20-share favorite FAK capped at 80 cents. After confirmed cheap
+   fills, complete only the actual unmatched cheap quantity, using up to four
+   fee-aware FAK attempts separated by a 350ms cooldown. The normal completion
+   cap preserves at least three cents of locked edge per pair.
+3. If favorite shares fill first, retain or amend the cheap order at 10 cents,
+   move it to 12 cents after 45 seconds, and move it to 15 cents with 90 seconds
+   remaining. With 45 seconds remaining, V9 may cross only if fees keep pair
+   cost at or below $1.00; with 20 seconds remaining, the emergency ceiling is
+   $1.02.
+4. At two minutes, cancel the market only when neither leg filled. Confirmed
+   exposure keeps being managed. At 15 seconds, complete within the configured
+   loss ceiling or sell the residual outcome at the best visible bid, with
+   bounded retry keys and cooldowns for partial flattening.
+
+Paper execution models Kalshi order amendments in place, including already
+filled quantity plus the desired new remainder. V9 planning is awakened by
+atomic two-outcome books, order updates, and fills, so staged actions do not
+wait for the polling interval.
+
+For Command Prompt:
+
+```bat
+set "DOTENV_CONFIG_PATH=.env.ladder-v9-paper.example"
+npm.cmd start
+```
+
+For PowerShell:
+
+```powershell
+$env:DOTENV_CONFIG_PATH = ".env.ladder-v9-paper.example"
+npm start
+```
+
+The profile writes paper state to `./data/paper-ladder-v9-btc`.
+
 ### Odahoa pair-lock V2
 
 `STRATEGY_MODE=odahoa_ladder_2` keeps V1's BTC market selection, phases,

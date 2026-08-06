@@ -417,6 +417,60 @@ test("ladder_v7 is Kalshi paper-only with an asymmetric price and share cap", ()
   );
 });
 
+test("ladder_v9 validates staged completion and rescue safety limits", () => {
+  const config = testConfig({
+    exchange: "kalshi",
+    strategyMode: "ladder_v9",
+    executionMode: "paper",
+    ladderV9CheapPrice: 0.1,
+    ladderV9InitialFavoritePrice: 0.8,
+    ladderV9InitialFavoriteShares: 20,
+    ladderV9TargetShares: 40,
+    ladderV9MinLockedEdge: 0.03,
+    ladderV9CompletionRetryLimit: 4,
+    ladderV9CompletionCooldownMs: 350,
+    ladderV9RescueMaxPairCost: 1,
+    ladderV9EmergencyMaxPairCost: 1.02,
+    ladderV9ManagementCutoffSeconds: 15,
+    kalshiApiKeyId: "key-id",
+    kalshiPrivateKeyPem:
+      "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----",
+  });
+  assert.doesNotThrow(() => validateTradingConfig(config));
+  assert.throws(
+    () => validateTradingConfig({ ...config, executionMode: "live" }),
+    /paper-only/,
+  );
+  assert.throws(
+    () => validateTradingConfig({ ...config, exchange: "polymarket" }),
+    /paper-only/,
+  );
+  assert.throws(
+    () =>
+      validateTradingConfig({
+        ...config,
+        ladderV9CompletionCooldownMs: 200,
+      }),
+    /LADDER_V9_COMPLETION_COOLDOWN_MS/,
+  );
+  assert.throws(
+    () =>
+      validateTradingConfig({
+        ...config,
+        ladderV9RescueMaxPairCost: 1.01,
+      }),
+    /rescue pair costs/,
+  );
+  assert.throws(
+    () =>
+      validateTradingConfig({
+        ...config,
+        ladderV9TargetShares: 10,
+      }),
+    /LADDER_V9_TARGET_SHARES/,
+  );
+});
+
 test("ladder_v8 is Polymarket paper-only with Odahoa sizing guards", () => {
   const config = testConfig({
     exchange: "polymarket",

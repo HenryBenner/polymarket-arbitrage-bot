@@ -690,9 +690,13 @@ V9 applies the following sequence:
    cost at or below $1.00; with 20 seconds remaining, the emergency ceiling is
    $1.02.
 4. At two minutes, cancel the market only when neither leg filled. Confirmed
-   exposure keeps being managed. At 15 seconds, complete within the configured
-   loss ceiling or sell the residual outcome at the best visible bid, with
-   bounded retry keys and cooldowns for partial flattening.
+   exposure keeps being managed. At 15 seconds, V9 may complete cheap-side
+   exposure within the configured loss ceiling or sell it when that pays more.
+   Unmatched favorite exposure is never sold at a loss: without a
+   settlement-aware probability model it is held through settlement, and a
+   `favorite-profit-exit-*` is allowed only when the after-fee bid recovers the
+   favorite's all-in acquisition cost. The final contract bid is not treated as
+   the settlement probability.
 
 Paper execution models Kalshi order amendments in place, including already
 filled quantity plus the desired new remainder. V9 planning is awakened by

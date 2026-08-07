@@ -557,6 +557,52 @@ export async function planLadderV9(
   }
 
   if (unmatchedFavorite > EPSILON && favoriteAllIn !== null) {
+    const planFavoriteProfitExit = (): void => {
+      const bid = favorite.bestBid;
+      if (bid === null) {
+        plan.managementStage = "hold-favorite";
+        return;
+      }
+      const afterFeeSalePrice =
+        bid - takerFeePerShare(snapshot, bid);
+      if (afterFeeSalePrice + EPSILON < favoriteAllIn) {
+        // A late contract bid is not a settlement-probability model. Until V9
+        // has one, an underwater unmatched favorite is held through settlement.
+        plan.managementStage = "hold-favorite";
+        return;
+      }
+      const attempt = nextFlattenAttempt(
+        v9Orders,
+        "favorite-profit-exit-",
+        config.ladderV9CompletionRetryLimit,
+        config.ladderV9CompletionCooldownMs,
+        nowSeconds,
+      );
+      if (
+        attempt === null ||
+        !validOrder(favorite, bid, unmatchedFavorite)
+      ) {
+        plan.managementStage = "hold-favorite";
+        return;
+      }
+      const exitRole = `favorite-profit-exit-${attempt}`;
+      const tradeKey = `${V9_PREFIX}${event.slug}:5-2:${exitRole}`;
+      if (!existingKeys.has(tradeKey) && !tracker.has(tradeKey)) {
+        plan.flattenOpportunities.push(
+          opportunity(
+            event,
+            favorite,
+            "expensive",
+            bid,
+            unmatchedFavorite,
+            tradeKey,
+            exitRole,
+            "fak",
+          ),
+        );
+        plan.managementStage = "favorite-profit-exit";
+      }
+    };
     const firstFavoriteFillAt = Math.min(
       ...favoriteBuyFills.map((fill) => Date.parse(fill.timestamp)),
     );
@@ -591,7 +637,10 @@ export async function planLadderV9(
     );
     plan.maximumCompletionPrice = cap;
     plan.managementStage = stage;
-    if (cap === null) return plan;
+    if (cap === null) {
+      if (finalDecision) planFavoriteProfitExit();
+      return plan;
+    }
     const targetPrice = policy === "fak" ? cap : Math.min(scheduledPrice, cap);
     const openCheapOrder = snapshot.openOrders.find(
       (order) => isV9Order(order) && order.tokenId === cheap.tokenId,
@@ -624,47 +673,10 @@ export async function planLadderV9(
     }
 
     const canCross = cheap.bestAsk !== null && cheap.bestAsk <= cap + EPSILON;
-    const preferFlatten =
-      finalDecision && flattenPaysMore(snapshot, favorite, cheap);
     const rescueRole = `cheap-${stage}`;
     const existingRescue = v9Orders.find((order) => role(order) === rescueRole);
-    if (
-      policy === "fak" &&
-      (!canCross || existingRescue || preferFlatten)
-    ) {
-      if (finalDecision) {
-        const bid = favorite.bestBid;
-        const attempt = nextFlattenAttempt(
-          v9Orders,
-          "flatten-favorite-",
-          config.ladderV9CompletionRetryLimit,
-          config.ladderV9CompletionCooldownMs,
-          nowSeconds,
-        );
-        if (
-          bid !== null &&
-          attempt !== null &&
-          validOrder(favorite, bid, unmatchedFavorite)
-        ) {
-          const flattenRole = `flatten-favorite-${attempt}`;
-          const tradeKey = `${V9_PREFIX}${event.slug}:5-2:${flattenRole}`;
-          if (!existingKeys.has(tradeKey) && !tracker.has(tradeKey)) {
-            plan.flattenOpportunities.push(
-              opportunity(
-                event,
-                favorite,
-                "expensive",
-                bid,
-                unmatchedFavorite,
-                tradeKey,
-                flattenRole,
-                "fak",
-              ),
-            );
-            plan.managementStage = "flatten-favorite";
-          }
-        }
-      }
+    if (policy === "fak" && (!canCross || existingRescue)) {
+      if (finalDecision) planFavoriteProfitExit();
       return plan;
     }
     const tradeKey = `${V9_PREFIX}${event.slug}:5-2:${rescueRole}`;

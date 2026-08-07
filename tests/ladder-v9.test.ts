@@ -372,6 +372,104 @@ test("ladder_v9 uses emergency pair limits then flattens an uncompletable residu
   });
 });
 
+test("ladder_v9 holds an underwater unmatched favorite through settlement", async () => {
+  await withTracker(async (tracker, directory) => {
+    const event = testEvent();
+    const books = testBooks(0.4, 0.6);
+    books[1]!.bestBid = 0.22;
+    books[1]!.bids = [{ price: 0.22, size: 40 }];
+    const config = testConfig({
+      exchange: "kalshi",
+      strategyMode: "ladder_v9",
+      paperStatePath: directory,
+    });
+    const createdAt = new Date((event.windowEnd - 240) * 1_000).toISOString();
+    const cheap = order(
+      "cheap-entry",
+      "up-token",
+      "Up",
+      0.1,
+      40,
+      "cancelled",
+      createdAt,
+      "post_only",
+    );
+    const favorite = order(
+      "favorite-initial",
+      "down-token",
+      "Down",
+      0.8,
+      20,
+      "filled",
+      createdAt,
+    );
+    const plan = await planLadderV9(
+      config,
+      tracker,
+      event,
+      books,
+      snapshot(books, [cheap, favorite], [fill(favorite, 20, 0.8, 0.224)]),
+      event.windowEnd - 15,
+    );
+    assert.equal(plan.managementStage, "hold-favorite");
+    assert.deepEqual(plan.flattenOpportunities, []);
+    assert.ok(
+      plan.opportunities.every(
+        (item) => !item.pairId?.startsWith("ladder-v9:flatten-favorite-"),
+      ),
+    );
+  });
+});
+
+test("ladder_v9 sells an unmatched favorite only at an after-fee profit", async () => {
+  await withTracker(async (tracker, directory) => {
+    const event = testEvent();
+    const books = testBooks(0.4, 0.6);
+    books[1]!.bestBid = 0.85;
+    books[1]!.bids = [{ price: 0.85, size: 40 }];
+    const config = testConfig({
+      exchange: "kalshi",
+      strategyMode: "ladder_v9",
+      paperStatePath: directory,
+    });
+    const createdAt = new Date((event.windowEnd - 240) * 1_000).toISOString();
+    const cheap = order(
+      "cheap-entry",
+      "up-token",
+      "Up",
+      0.1,
+      40,
+      "cancelled",
+      createdAt,
+      "post_only",
+    );
+    const favorite = order(
+      "favorite-initial",
+      "down-token",
+      "Down",
+      0.8,
+      20,
+      "filled",
+      createdAt,
+    );
+    const plan = await planLadderV9(
+      config,
+      tracker,
+      event,
+      books,
+      snapshot(books, [cheap, favorite], [fill(favorite, 20, 0.8, 0.224)]),
+      event.windowEnd - 15,
+    );
+    assert.equal(plan.managementStage, "favorite-profit-exit");
+    assert.equal(
+      plan.flattenOpportunities[0]?.pairId,
+      "ladder-v9:favorite-profit-exit-1",
+    );
+    assert.equal(plan.flattenOpportunities[0]?.price, 0.85);
+    assert.equal(plan.flattenOpportunities[0]?.size, 20);
+  });
+});
+
 test("ladder_v9 cancels an empty initial market at two minutes but keeps managing exposure", async () => {
   await withTracker(async (tracker, directory) => {
     const event = testEvent();

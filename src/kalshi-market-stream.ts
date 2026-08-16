@@ -69,6 +69,27 @@ export class KalshiMarketStream {
     }
   }
 
+  /** Stop retaining and receiving updates for contracts that have settled. */
+  unsubscribe(tokenIds: string[]): void {
+    const removals = new Set<string>();
+    for (const tokenId of tokenIds) {
+      const parsed = parseKalshiTokenId(tokenId);
+      if (!parsed || !this.tickers.delete(parsed.ticker)) continue;
+      removals.add(parsed.ticker);
+      this.books.delete(parsed.ticker);
+      this.invalidTickers.delete(parsed.ticker);
+      this.pendingAdditions.delete(parsed.ticker);
+    }
+    if (removals.size === 0 || !this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+    for (const sid of this.subscriptionIds.values()) {
+      this.socket.send(JSON.stringify({
+        id: this.commandId++,
+        cmd: "update_subscription",
+        params: { sids: [sid], market_tickers: [...removals], action: "delete_markets" },
+      }));
+    }
+  }
+
   close(): void {
     this.stopped = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
@@ -295,7 +316,10 @@ export class KalshiMarketStream {
     this.books.set(ticker, state);
     this.invalidTickers.delete(ticker);
     if (this.invalidTickers.size === 0) this.recoveringOrderbook = false;
-    await this.emitBooks(ticker, state);
+    await this.emitBooks(ticker, state, {
+      telemetry_type: "snapshot",
+      sequence: event.seq,
+    });
   }
 
   private async handleDelta(event: KalshiMessage): Promise<void> {
@@ -307,7 +331,9 @@ export class KalshiMarketStream {
     }
     this.recordSequence(event);
     if (this.invalidTickers.has(ticker)) return;
-    const side = String(message.side ?? "") as "yes" | "no";
+    const side = String(
+      message.outcome_side ?? message.side ?? "",
+    ) as "yes" | "no";
     const price = Number(message.price_dollars);
     const delta = Number(message.delta_fp);
     const state = this.books.get(ticker);
@@ -317,7 +343,14 @@ export class KalshiMarketStream {
     const next = (levels.get(price) ?? 0) + delta;
     if (next <= 1e-8) levels.delete(price);
     else levels.set(price, next);
-    await this.emitBooks(ticker, state);
+    await this.emitBooks(ticker, state, {
+      telemetry_type: "delta",
+      telemetry_side: side,
+      telemetry_price: price,
+      telemetry_delta: delta,
+      sequence: event.seq,
+      source_timestamp: message.ts_ms ?? message.ts,
+    });
   }
 
   private hasConsecutiveSequence(event: KalshiMessage): boolean {
@@ -378,6 +411,8 @@ export class KalshiMarketStream {
     if (!Number.isFinite(price) || !Number.isFinite(size)) return;
     await this.onEvent({
       event_type: "last_trade_price",
+      market_ticker: ticker,
+      taker_outcome_side: takerOutcome,
       asset_id: kalshiTokenId(ticker, makerOutcome),
       side: "SELL",
       price: String(price),
@@ -390,6 +425,7 @@ export class KalshiMarketStream {
   private async emitBooks(
     ticker: string,
     state: KalshiBookState,
+    telemetry: Record<string, unknown> = {},
   ): Promise<void> {
     if (this.invalidTickers.has(ticker)) return;
     const yesBids = mapToLevels(state.yes, false);
@@ -407,6 +443,7 @@ export class KalshiMarketStream {
       asset_ids: books.map((book) => book.asset_id),
       books,
       timestamp,
+      ...telemetry,
     });
   }
 

@@ -9,6 +9,7 @@
     "build": "tsc",
     "test": "tsx --test tests/*.test.ts",
     "compare:strategies": "tsx src/strategy-comparison.ts",
+    "report:ladder-v10": "tsx src/ladder-v10-report.ts",
     "audit": "npm audit --audit-level=high",
     "check": "npm run build && npm test && npm run audit"
   },

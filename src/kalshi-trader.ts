@@ -7,7 +7,7 @@ import {
   type KalshiFill,
 } from "./kalshi-api.js";
 import { KalshiMarketStream } from "./kalshi-market-stream.js";
-import { log } from "./logger.js";
+import { log, logThrottled } from "./logger.js";
 import type { MarketStreamEvent } from "./market-stream.js";
 import {
   minimumOrderRejection,
@@ -515,7 +515,7 @@ export class KalshiTrader implements OrderExecutor {
     const pairedShares = shares.length >= 2 ? Math.min(...shares) : 0;
     const maximumShares = shares.length > 0 ? Math.max(...shares) : 0;
     const context = this.contexts.get(marketSlug);
-    log("Kalshi ladder market status", {
+    logThrottled("Kalshi ladder market status", marketSlug, {
       market: marketSlug,
       series: context?.event.market.seriesTicker,
       capitalCommitted: snapshot.capitalCommitted,
@@ -847,7 +847,7 @@ export class KalshiTrader implements OrderExecutor {
     const operation = async (): Promise<void> => {
       await mkdir(dirname(this.statePath), { recursive: true });
       const temporaryPath = `${this.statePath}.${process.pid}.tmp`;
-      const serialized = JSON.stringify(this.state, null, 2);
+      const serialized = JSON.stringify(this.state);
       await writeFile(temporaryPath, serialized, "utf8");
       try {
         await rename(temporaryPath, this.statePath);

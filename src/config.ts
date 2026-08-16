@@ -165,6 +165,18 @@ export interface BotConfig {
   ladderV9RescueMaxPairCost: number;
   ladderV9EmergencyMaxPairCost: number;
   ladderV9ManagementCutoffSeconds: number;
+  ladderV10CheapPrice: number;
+  ladderV10FavoritePrice: number;
+  ladderV10MidShares: number;
+  ladderV10TargetShares: number;
+  ladderV10MaxPairCost: number;
+  ladderV10ScoreLow: number;
+  ladderV10ScoreHigh: number;
+  ladderV10BurnInMarkets: number;
+  ladderV10SnapshotIntervalMs: number;
+  ladderV10SourceStaleMs: number;
+  ladderV10CoinbaseWsHost: string;
+  ladderV10CoinbaseProduct: string;
   paperStartingUsdc: number;
   paperStatePath: string;
 }
@@ -197,10 +209,11 @@ export function loadConfig(): BotConfig {
     strategyRaw !== "ladder_v6" &&
     strategyRaw !== "ladder_v7" &&
     strategyRaw !== "ladder_v8" &&
-    strategyRaw !== "ladder_v9"
+    strategyRaw !== "ladder_v9" &&
+    strategyRaw !== "ladder_v10"
   ) {
     throw new Error(
-      "STRATEGY_MODE must be reverse, odahoa_ladder, odahoa_ladder_2, odahoa_static_maker, ladder_v5, ladder_v5.5, ladder_v6, ladder_v7, ladder_v8, or ladder_v9",
+      "STRATEGY_MODE must be reverse, odahoa_ladder, odahoa_ladder_2, odahoa_static_maker, ladder_v5, ladder_v5.5, ladder_v6, ladder_v7, ladder_v8, ladder_v9, or ladder_v10",
     );
   }
 
@@ -340,6 +353,27 @@ export function loadConfig(): BotConfig {
     ladderV9ManagementCutoffSeconds: envNumber(
       "LADDER_V9_MANAGEMENT_CUTOFF_SECONDS",
       15,
+    ),
+    ladderV10CheapPrice: envNumber("LADDER_V10_CHEAP_PRICE", 0.1),
+    ladderV10FavoritePrice: envNumber("LADDER_V10_FAVORITE_PRICE", 0.8),
+    ladderV10MidShares: envNumber("LADDER_V10_MID_SHARES", 20),
+    ladderV10TargetShares: envNumber("LADDER_V10_TARGET_SHARES", 40),
+    ladderV10MaxPairCost: envNumber("LADDER_V10_MAX_PAIR_COST", 0.97),
+    ladderV10ScoreLow: envNumber("LADDER_V10_SCORE_LOW", 40),
+    ladderV10ScoreHigh: envNumber("LADDER_V10_SCORE_HIGH", 70),
+    ladderV10BurnInMarkets: envNumber("LADDER_V10_BURN_IN_MARKETS", 32),
+    ladderV10SnapshotIntervalMs: envNumber(
+      "LADDER_V10_SNAPSHOT_INTERVAL_MS",
+      1_000,
+    ),
+    ladderV10SourceStaleMs: envNumber("LADDER_V10_SOURCE_STALE_MS", 2_000),
+    ladderV10CoinbaseWsHost: envString(
+      "LADDER_V10_COINBASE_WS_HOST",
+      "wss://advanced-trade-ws.coinbase.com",
+    ),
+    ladderV10CoinbaseProduct: envString(
+      "LADDER_V10_COINBASE_PRODUCT",
+      "BTC-USD",
     ),
     paperStartingUsdc: envNumber("PAPER_STARTING_USDC", 100),
     paperStatePath: envString("PAPER_STATE_PATH", "./data/paper"),
@@ -591,6 +625,54 @@ export function validateTradingConfig(config: BotConfig): void {
     );
   }
   if (
+    !Number.isFinite(config.ladderV10CheapPrice) ||
+    config.ladderV10CheapPrice <= 0 ||
+    config.ladderV10CheapPrice >= 0.5 ||
+    !Number.isFinite(config.ladderV10FavoritePrice) ||
+    config.ladderV10FavoritePrice <= 0.5 ||
+    config.ladderV10FavoritePrice >= 1 ||
+    config.ladderV10CheapPrice + config.ladderV10FavoritePrice >= 1
+  ) {
+    throw new Error(
+      "LADDER_V10 cheap and favorite prices must be valid and total less than 1",
+    );
+  }
+  if (
+    !Number.isInteger(config.ladderV10MidShares) ||
+    config.ladderV10MidShares !== 20 ||
+    !Number.isInteger(config.ladderV10TargetShares) ||
+    config.ladderV10TargetShares !== 40
+  ) {
+    throw new Error(
+      "LADDER_V10 target shares must preserve the 20/40-share V7 tiers",
+    );
+  }
+  if (
+    !Number.isFinite(config.ladderV10MaxPairCost) ||
+    config.ladderV10MaxPairCost <= 0.8 ||
+    config.ladderV10MaxPairCost >= 1
+  ) {
+    throw new Error("LADDER_V10_MAX_PAIR_COST must be greater than 0.8 and less than 1");
+  }
+  if (
+    !Number.isFinite(config.ladderV10ScoreLow) ||
+    !Number.isFinite(config.ladderV10ScoreHigh) ||
+    config.ladderV10ScoreLow < 0 ||
+    config.ladderV10ScoreHigh > 100 ||
+    config.ladderV10ScoreLow >= config.ladderV10ScoreHigh
+  ) {
+    throw new Error("LADDER_V10 score bands must be ordered between 0 and 100");
+  }
+  if (
+    !Number.isInteger(config.ladderV10BurnInMarkets) ||
+    config.ladderV10BurnInMarkets < 32 ||
+    config.ladderV10SnapshotIntervalMs !== 1_000 ||
+    !Number.isFinite(config.ladderV10SourceStaleMs) ||
+    config.ladderV10SourceStaleMs < config.ladderV10SnapshotIntervalMs
+  ) {
+    throw new Error("LADDER_V10 burn-in and sampling settings are invalid");
+  }
+  if (
     (config.strategyMode === "ladder_v5" ||
       config.strategyMode === "ladder_v5.5" ||
       config.strategyMode === "ladder_v7") &&
@@ -679,6 +761,18 @@ export function validateTradingConfig(config: BotConfig): void {
   ) {
     throw new Error(
       "ladder_v9 is Kalshi paper-only until its staged completion and rescue lifecycle is forward-tested",
+    );
+  }
+  if (
+    config.strategyMode === "ladder_v10" &&
+    (config.exchange !== "kalshi" ||
+      config.executionMode !== "paper" ||
+      config.minutesBeforeCloseMax < 15 ||
+      config.kalshiSeriesTickers.length !== 1 ||
+      config.kalshiSeriesTickers[0] !== "KXBTC15M")
+  ) {
+    throw new Error(
+      "ladder_v10 is BTC-only Kalshi paper mode until its regime gate is forward-tested",
     );
   }
   if (!Number.isInteger(config.signatureType) || config.signatureType < 0 || config.signatureType > 3) {

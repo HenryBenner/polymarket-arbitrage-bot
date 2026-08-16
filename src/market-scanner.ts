@@ -16,7 +16,7 @@ import type {
   TokenBook,
   UpDownEvent,
 } from "./types.js";
-import { log } from "./logger.js";
+import { logThrottled } from "./logger.js";
 import {
   bestPrice,
   matchesSlugPrefixes,
@@ -160,10 +160,14 @@ export class MarketScanner {
           page.reason instanceof Error
             ? page.reason.message
             : String(page.reason);
-        log("Kalshi series scan failed", {
-          series: this.config.kalshiSeriesTickers[index],
-          error: message,
-        });
+        logThrottled(
+          "Kalshi series scan failed",
+          String(this.config.kalshiSeriesTickers[index]),
+          {
+            series: this.config.kalshiSeriesTickers[index],
+            error: message,
+          },
+        );
         continue;
       }
       const { series, markets } = page.value;

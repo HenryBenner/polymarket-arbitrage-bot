@@ -9,7 +9,8 @@ export type StrategyMode =
   | "ladder_v6"
   | "ladder_v7"
   | "ladder_v8"
-  | "ladder_v9";
+  | "ladder_v9"
+  | "ladder_v10";
 export type ExecutionMode = "dry_run" | "paper" | "live";
 export type ExchangeName = "polymarket" | "kalshi";
 export type LadderPreset = "odahoa_v1";
@@ -240,6 +241,12 @@ export interface OrderExecutor {
   ): Promise<OrderResult>;
   setExecutionWakeHandler?(
     handler: (marketSlug: string) => void | Promise<void>,
+  ): void;
+  setMarketTelemetryHandler?(
+    handler: (event: Record<string, unknown>) => void | Promise<void>,
+  ): void;
+  setSettlementHandler?(
+    handler: (settlement: PaperSettlement) => void | Promise<void>,
   ): void;
   observeMarket?(event: UpDownEvent, books: TokenBook[]): Promise<void>;
   getMarketExecutionSnapshot?(

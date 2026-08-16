@@ -289,7 +289,7 @@ export class LadderTracker {
   private async persist(): Promise<void> {
     await mkdir(dirname(this.statePath), { recursive: true });
     const temporaryPath = `${this.statePath}.${process.pid}.tmp`;
-    const serialized = JSON.stringify(this.state, null, 2);
+    const serialized = JSON.stringify(this.state);
     await writeFile(temporaryPath, serialized, "utf8");
     try {
       await rename(temporaryPath, this.statePath);

@@ -471,6 +471,47 @@ test("ladder_v9 validates staged completion and rescue safety limits", () => {
   );
 });
 
+test("ladder_v10 is BTC-only Kalshi paper mode with bounded detector controls", () => {
+  const config = testConfig({
+    exchange: "kalshi",
+    strategyMode: "ladder_v10",
+    executionMode: "paper",
+    kalshiSeriesTickers: ["KXBTC15M"],
+    kalshiApiKeyId: "key-id",
+    kalshiPrivateKeyPem:
+      "-----BEGIN PRIVATE KEY-----\\ntest\\n-----END PRIVATE KEY-----",
+  });
+  assert.doesNotThrow(() => validateTradingConfig(config));
+  assert.throws(
+    () => validateTradingConfig({ ...config, executionMode: "live" }),
+    /BTC-only Kalshi paper mode/,
+  );
+  assert.throws(
+    () => validateTradingConfig({ ...config, kalshiSeriesTickers: ["KXETH15M"] }),
+    /BTC-only Kalshi paper mode/,
+  );
+  assert.throws(
+    () => validateTradingConfig({ ...config, ladderV10ScoreLow: 80 }),
+    /score bands/,
+  );
+  assert.throws(
+    () => validateTradingConfig({ ...config, ladderV10TargetShares: 41 }),
+    /target shares/,
+  );
+  assert.throws(
+    () => validateTradingConfig({ ...config, ladderV10BurnInMarkets: 31 }),
+    /burn-in and sampling/,
+  );
+  assert.throws(
+    () => validateTradingConfig({ ...config, ladderV10SnapshotIntervalMs: 2_000 }),
+    /burn-in and sampling/,
+  );
+  assert.throws(
+    () => validateTradingConfig({ ...config, minutesBeforeCloseMax: 10 }),
+    /BTC-only Kalshi paper mode/,
+  );
+});
+
 test("ladder_v8 is Polymarket paper-only with Odahoa sizing guards", () => {
   const config = testConfig({
     exchange: "polymarket",

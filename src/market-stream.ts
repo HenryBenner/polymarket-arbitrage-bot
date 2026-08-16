@@ -46,6 +46,12 @@ export class MarketStream {
     }
   }
 
+  unsubscribe(tokenIds: string[]): void {
+    const removals = tokenIds.filter((tokenId) => this.tokenIds.delete(tokenId));
+    if (removals.length === 0 || this.socket?.readyState !== WebSocket.OPEN) return;
+    this.socket.send(JSON.stringify({ assets_ids: removals, operation: "unsubscribe" }));
+  }
+
   close(): void {
     this.stopped = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);

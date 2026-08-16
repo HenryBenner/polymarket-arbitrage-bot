@@ -719,6 +719,52 @@ npm start
 
 The profile writes paper state to `./data/paper-ladder-v9-btc`.
 
+### Ladder V10 regime-gated V7 paper experiment
+
+`STRATEGY_MODE=ladder_v10` is a BTC-only Kalshi paper experiment. It observes
+the market from 15 minutes remaining, subscribes to Kalshi's authenticated
+`cfbenchmarks_value` BRTI feed, and keeps one-second feature buffers in memory.
+It writes only compact decision and settlement events to
+`btc-regime-events.jsonl`, making the VPS footprint bounded. Coinbase BTC-USD
+and the Kalshi Up midpoint are kept as validated fallbacks; BRTI remains the
+preferred path source.
+
+The first 32 complete markets are burn-in markets and deliberately use V7's
+40-share favorite fallback. Once the volatility normalizer is frozen, the
+five-minute score selects 0, 20, or 40 one-shot favorite FAK shares while the
+10-cent cheap maker remains fixed at 40 shares. The score is never revised for
+that market. Missing or stale detector data also falls back to 40 favorite
+shares and is reported separately.
+
+The frozen `v10-heuristic-1` score weights 30/60/120-second path
+oscillation (20), five-second reversals (15), range versus displacement (10),
+burn-in-normalized realized volatility (10), market geometry (15), 10-cent
+queue depletion (10), near-best flow alternation (10), and V7-counterfactual
+rolling pair rate (10). Volatility P10/P90 is frozen after burn-in; an invalid
+normalizer keeps the strategy on the V7 fallback.
+
+Only confirmed cheap inventory may create a later order: V10 submits an exact
+favorite FOK only when available depth and taker fees keep the completed pair
+at or below 0.97. It does not use V9 repricing, rescue, flattening, or favorite
+profit exits. Each five-minute decision also stores the unchanged V7 favorite
+counterfactual so settlement reports actual V10 PnL beside modeled V7 PnL.
+The atomic regime state is `ladder-v10-regime-state.json`; decision and
+settlement audit records are append-only in `btc-regime-events.jsonl`.
+
+Start from `.env.ladder-v10-paper.example`. Keep
+`MINUTES_BEFORE_CLOSE_MAX=15`, `CRYPTO_MARKETS=KXBTC15M`, and a fresh
+`PAPER_STATE_PATH`; V10 is rejected in live mode or on any other series.
+
+After settlements, produce the overall, trailing-100, score-band, source,
+fallback, pair-formation, and exposure-cohort evaluation with:
+
+```powershell
+npm run report:ladder-v10 -- ./data/paper-ladder-v10-btc
+```
+
+The report compares actual V10 P&L with the frozen-book V7 counterfactual and
+marks the experiment evaluation-ready only after 300 settled adaptive markets.
+
 ### Odahoa pair-lock V2
 
 `STRATEGY_MODE=odahoa_ladder_2` keeps V1's BTC market selection, phases,

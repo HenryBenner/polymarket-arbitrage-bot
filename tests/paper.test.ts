@@ -744,3 +744,35 @@ test("paper execution amends rescue orders and can flatten owned inventory", asy
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("unrelated market trades do not rewrite paper execution history", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paper-noop-trade-"));
+  try {
+    const trader = new PaperTrader(
+      testConfig({ paperStatePath: directory }),
+      {
+        stream: fakeStream,
+        feeLoader: async () => ({ rate: 0.07, exponent: 1 }),
+        settlementLoader: async () => null,
+      },
+    );
+    await trader.init();
+    await trader.observeMarket(testEvent(), testBooks());
+
+    await trader.ingestMarketEvent({
+      event_type: "last_trade_price",
+      asset_id: "up-token",
+      side: "SELL",
+      price: "0.4",
+      size: "5",
+      timestamp: "1000",
+      transaction_hash: "unrelated-trade",
+    });
+
+    assert.deepEqual(trader.snapshot().seenEventKeys, []);
+    assert.deepEqual(trader.snapshot().fills, []);
+    await trader.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

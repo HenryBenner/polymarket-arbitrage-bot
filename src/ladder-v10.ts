@@ -14,6 +14,7 @@ import { tickSizeFromMarket } from "./utils/market.js";
 
 const EPSILON = 1e-8;
 const V10_PREFIX = "ladder-v10:";
+const FULL_FAVORITE_SHARES = 40;
 
 export const LADDER_V10_PHASE: LadderPhase = {
   id: "5-0",
@@ -165,6 +166,10 @@ export async function planLadderV10(
     : undefined;
   const cheapShares = cheap ? sharesFor(fills, cheap.tokenId) : 0;
   const favoriteShares = favorite ? sharesFor(fills, favorite.tokenId) : 0;
+  const binaryFavoriteTargetShares =
+    decision && decision.favoriteTargetShares > EPSILON
+      ? FULL_FAVORITE_SHARES
+      : 0;
   const plan: LadderV10Plan = {
     cancelOrderIds: [],
     opportunities: [],
@@ -228,7 +233,7 @@ export async function planLadderV10(
   if (
     entryActive &&
     !favoriteInitial &&
-    decision.favoriteTargetShares > EPSILON
+    binaryFavoriteTargetShares > EPSILON
   ) {
     const tradeKey = `${V10_PREFIX}${event.slug}:favorite-initial`;
     if (
@@ -237,7 +242,7 @@ export async function planLadderV10(
       validOrder(
         favorite,
         config.ladderV10FavoritePrice,
-        decision.favoriteTargetShares,
+        binaryFavoriteTargetShares,
       )
     ) {
       plan.opportunities.push(
@@ -246,7 +251,7 @@ export async function planLadderV10(
           favorite,
           "expensive",
           config.ladderV10FavoritePrice,
-          decision.favoriteTargetShares,
+          binaryFavoriteTargetShares,
           tradeKey,
           "favorite-initial",
           "fak",

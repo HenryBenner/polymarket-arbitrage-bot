@@ -2,7 +2,10 @@ import "dotenv/config";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import type { LadderV10Decision } from "./ladder-v10-regime.js";
+import type {
+  LadderV10Decision,
+  LadderV10ShadowResult,
+} from "./ladder-v10-regime.js";
 
 type ExposureCohort = "neither" | "favorite_only" | "cheap_only" | "paired";
 
@@ -24,6 +27,15 @@ export interface LadderV10Report {
   settledAdaptiveMarkets: number;
   evaluationMinimum: 300;
   evaluationReady: boolean;
+  binaryShadowExperiment: {
+    settledAdaptiveMarkets: number;
+    windows: {
+      last32: ShadowComparisonSummary;
+      last96: ShadowComparisonSummary;
+      all: ShadowComparisonSummary;
+    };
+    rallyCapture: Record<"8" | "16" | "32", RallyCaptureSummary>;
+  };
   overall: ReportRow;
   trailing100: ReportRow;
   cohorts: {
@@ -33,6 +45,38 @@ export interface LadderV10Report {
     pairFormation: Record<string, ReportRow>;
     exposure: Record<string, ReportRow>;
   };
+}
+
+interface ShadowStrategyPnl {
+  pnl: number;
+  averagePnl: number;
+}
+
+interface ShadowComparisonSummary {
+  markets: number;
+  v10Actual: ShadowStrategyPnl & { maxDrawdown: number };
+  legacyV10: ShadowStrategyPnl & { differenceVsV10: number };
+  shadowOriginalV7: ShadowStrategyPnl & { differenceVsV10: number };
+  shadowDangerFilter: ShadowStrategyPnl & {
+    differenceVsV7: number;
+    filterActivations: number;
+  };
+  shadowDynamicCheap: ShadowStrategyPnl & {
+    differenceVsV7: number;
+    definiteFills: number;
+    queueFills: number;
+    confirmedFills: number;
+    uncertainFills: number;
+    noFills: number;
+  };
+}
+
+interface RallyCaptureSummary {
+  markets: number;
+  v7WindowPnl: number;
+  v10WindowPnl: number;
+  captureRatio: number | null;
+  avoidedLoss: number | null;
 }
 
 function round(value: number, places = 4): number {
@@ -108,6 +152,103 @@ function grouped(
   );
 }
 
+function sumShadow(
+  rows: readonly LadderV10ShadowResult[],
+  value: (row: LadderV10ShadowResult) => number,
+): number {
+  return rows.reduce((sum, row) => sum + value(row), 0);
+}
+
+function averagePnl(pnl: number, markets: number): number {
+  return markets === 0 ? 0 : round(pnl / markets);
+}
+
+function maxDrawdown(values: readonly number[]): number {
+  let cumulative = 0;
+  let peak = 0;
+  let maximum = 0;
+  for (const value of values) {
+    cumulative += value;
+    peak = Math.max(peak, cumulative);
+    maximum = Math.max(maximum, peak - cumulative);
+  }
+  return round(maximum);
+}
+
+function summarizeShadows(
+  rows: readonly LadderV10ShadowResult[],
+): ShadowComparisonSummary {
+  const v10 = sumShadow(rows, (row) => row.v10Actual.pnl);
+  const legacy = sumShadow(rows, (row) => row.legacyV10.pnl);
+  const v7 = sumShadow(rows, (row) => row.shadowV7.pnl);
+  const danger = sumShadow(rows, (row) => row.shadowDangerFilter.pnl);
+  const dynamic = sumShadow(rows, (row) => row.shadowDynamicCheap.pnl);
+  const definiteFills = rows.filter(
+    (row) => row.shadowDynamicCheap.fillState === "DEFINITE_FILL",
+  ).length;
+  const queueFills = rows.filter(
+    (row) => row.shadowDynamicCheap.fillState === "QUEUE_FILL",
+  ).length;
+  return {
+    markets: rows.length,
+    v10Actual: {
+      pnl: round(v10),
+      averagePnl: averagePnl(v10, rows.length),
+      maxDrawdown: maxDrawdown(rows.map((row) => row.v10Actual.pnl)),
+    },
+    legacyV10: {
+      pnl: round(legacy),
+      averagePnl: averagePnl(legacy, rows.length),
+      differenceVsV10: round(legacy - v10),
+    },
+    shadowOriginalV7: {
+      pnl: round(v7),
+      averagePnl: averagePnl(v7, rows.length),
+      differenceVsV10: round(v7 - v10),
+    },
+    shadowDangerFilter: {
+      pnl: round(danger),
+      averagePnl: averagePnl(danger, rows.length),
+      differenceVsV7: round(danger - v7),
+      filterActivations: rows.filter(
+        (row) => row.shadowDangerFilter.triggered,
+      ).length,
+    },
+    shadowDynamicCheap: {
+      pnl: round(dynamic),
+      averagePnl: averagePnl(dynamic, rows.length),
+      differenceVsV7: round(dynamic - v7),
+      definiteFills,
+      queueFills,
+      confirmedFills: definiteFills + queueFills,
+      uncertainFills: rows.filter(
+        (row) => row.shadowDynamicCheap.fillState === "UNCERTAIN",
+      ).length,
+      noFills: rows.filter(
+        (row) => row.shadowDynamicCheap.fillState === "NO_FILL",
+      ).length,
+    },
+  };
+}
+
+function rallyCapture(
+  rows: readonly LadderV10ShadowResult[],
+  window: number,
+): RallyCaptureSummary {
+  const selected = rows.slice(-window);
+  const v7WindowPnl = sumShadow(selected, (row) => row.shadowV7.pnl);
+  const v10WindowPnl = sumShadow(selected, (row) => row.v10Actual.pnl);
+  return {
+    markets: selected.length,
+    v7WindowPnl: round(v7WindowPnl),
+    v10WindowPnl: round(v10WindowPnl),
+    captureRatio:
+      v7WindowPnl > 0 ? round(v10WindowPnl / v7WindowPnl) : null,
+    avoidedLoss:
+      v7WindowPnl < 0 ? round(v10WindowPnl - v7WindowPnl) : null,
+  };
+}
+
 export function buildLadderV10Report(
   decisions: readonly LadderV10Decision[],
   scoreLow = 40,
@@ -133,12 +274,32 @@ export function buildLadderV10Report(
   const settledAdaptiveMarkets = settled.filter(
     (decision) => decision.decisionReason === "adaptive",
   ).length;
+  const experimentRows = settled
+    .filter(
+      (decision) =>
+        decision.decisionReason === "adaptive" &&
+        decision.shadowResult !== undefined,
+    )
+    .map((decision) => decision.shadowResult!);
   return {
     scoreVersion: settled.at(-1)?.scoreVersion ?? "v10-heuristic-1",
     settledMarkets: settled.length,
     settledAdaptiveMarkets,
     evaluationMinimum: 300,
     evaluationReady: settledAdaptiveMarkets >= 300,
+    binaryShadowExperiment: {
+      settledAdaptiveMarkets: experimentRows.length,
+      windows: {
+        last32: summarizeShadows(experimentRows.slice(-32)),
+        last96: summarizeShadows(experimentRows.slice(-96)),
+        all: summarizeShadows(experimentRows),
+      },
+      rallyCapture: {
+        "8": rallyCapture(experimentRows, 8),
+        "16": rallyCapture(experimentRows, 16),
+        "32": rallyCapture(experimentRows, 32),
+      },
+    },
     overall: summarize(settled),
     trailing100: summarize(settled.slice(-100)),
     cohorts: {

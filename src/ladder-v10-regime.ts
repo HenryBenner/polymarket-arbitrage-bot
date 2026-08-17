@@ -27,6 +27,12 @@ import type {
 const SCORE_VERSION = "v10-heuristic-1";
 const V10_PREFIX = "ladder-v10:";
 const EPSILON = 1e-9;
+const FULL_FAVORITE_SHARES = 40;
+const SHADOW_MAX_PAIR_COST = 0.9;
+const SHADOW_RUNG_LOW_CENTS = 8;
+const SHADOW_RUNG_HIGH_CENTS = 25;
+const SHADOW_RUNG_COUNT = SHADOW_RUNG_HIGH_CENTS - SHADOW_RUNG_LOW_CENTS + 1;
+const BINARY_EXPERIMENT_VERSION = "v10-binary-shadow-1";
 
 interface BookSample {
   timestampMs: number;
@@ -81,6 +87,50 @@ interface CounterfactualFill {
   fee: number;
 }
 
+export type ShadowCheapFillState =
+  | "DEFINITE_FILL"
+  | "QUEUE_FILL"
+  | "UNCERTAIN"
+  | "NO_FILL";
+
+export interface ShadowRungMasks {
+  eligible: number;
+  crossed: number;
+  queueCleared: number;
+}
+
+interface ShadowRungTracking extends ShadowRungMasks {
+  touched: number;
+  queueAhead: number[];
+  volumeAtRung: number[];
+}
+
+export interface LadderV10ShadowResult {
+  marketSlug: string;
+  v10Score: number | null;
+  legacyV10TargetShares: number;
+  binaryV10TargetShares: number;
+  v10Actual: { favoriteShares: number; pnl: number };
+  legacyV10: { favoriteShares: number; pnl: number };
+  shadowV7: { pnl: number };
+  shadowDangerFilter: {
+    triggered: boolean;
+    favoritePrice: number | null;
+    pnl: number;
+  };
+  shadowDynamicCheap: {
+    favoritePrice: number | null;
+    cheapTarget: number | null;
+    fillState: ShadowCheapFillState;
+    pnl: number;
+  };
+  rungMasks: ShadowRungMasks;
+  favoriteDepthAt80: number;
+  vwap40: number | null;
+  vwap80: number | null;
+  vwap120: number | null;
+}
+
 export interface LadderV10Decision {
   marketSlug: string;
   createdAt: string;
@@ -90,11 +140,25 @@ export interface LadderV10Decision {
   source: RegimePriceSource | "none";
   decisionReason: "adaptive" | "burn_in" | "v7_fallback";
   favoriteTargetShares: number;
+  experimentVersion?: typeof BINARY_EXPERIMENT_VERSION;
+  legacyV10TargetShares?: number;
+  binaryV10TargetShares?: number;
   cheapTokenId: string;
   favoriteTokenId: string;
   features: OscillationFeatures | null;
   rawFeatures?: OscillationRawFeatures | null;
   counterfactualFavorite: CounterfactualFill;
+  legacyCounterfactualFavorite?: CounterfactualFill;
+  expectedFavoriteFillPrice?: number | null;
+  dynamicCheapTarget?: number | null;
+  favoriteDepthAt80?: number;
+  vwap40?: number | null;
+  vwap80?: number | null;
+  vwap120?: number | null;
+  shadowMakerFeeRate?: number;
+  shadowFeeExponent?: number;
+  shadowRungTracking?: ShadowRungTracking;
+  shadowResult?: LadderV10ShadowResult;
   observedFills: PaperFill[];
   actualPnl?: number;
   counterfactualV7Pnl?: number;
@@ -131,6 +195,8 @@ interface MarketContext {
   lastBidDepth: number | null;
   lastAskDepth: number | null;
   pendingTradeFlow: number;
+  shadowRungTracking: ShadowRungTracking | null;
+  shadowTradeKeys: Set<string>;
   latestSnapshot: MarketExecutionSnapshot | null;
   finalized: boolean;
 }
@@ -474,6 +540,10 @@ export function favoriteTierForScore(
   return score < low ? 0 : score < high ? midShares : fullShares;
 }
 
+export function binaryFavoriteTarget(legacyTargetShares: number): number {
+  return legacyTargetShares <= EPSILON ? 0 : FULL_FAVORITE_SHARES;
+}
+
 function rankBooks(books: readonly TokenBook[]): {
   cheap: TokenBook;
   favorite: TokenBook;
@@ -512,6 +582,116 @@ function simulateFavorite(
     remaining -= selected;
   }
   return { size: round(size), cost: round(cost), fee: round(fee) };
+}
+
+function simulateVwap(book: TokenBook, shares: number, limit = 0.8): number | null {
+  let remaining = shares;
+  let cost = 0;
+  for (const level of book.asks) {
+    if (level.price > limit + EPSILON || remaining <= EPSILON) break;
+    const selected = Math.min(remaining, level.size);
+    cost += selected * level.price;
+    remaining -= selected;
+  }
+  return remaining > EPSILON ? null : round(cost / shares);
+}
+
+function floorToCent(value: number): number {
+  return Math.floor((value + EPSILON) * 100) / 100;
+}
+
+export function shadowDynamicCheapTarget(
+  favoritePrice: number | null,
+): number | null {
+  return favoritePrice === null
+    ? null
+    : round(clamp(floorToCent(SHADOW_MAX_PAIR_COST - favoritePrice), 0.08, 0.25), 2);
+}
+
+export function classifyShadowCheapFill(
+  target: number | null,
+  tracking: {
+    eligible: number;
+    crossed: number;
+    queueCleared: number;
+    touched: number;
+  } | null,
+): ShadowCheapFillState {
+  const index = target === null ? null : rungIndex(target);
+  const bit = index === null ? 0 : rungBit(index);
+  if (index === null || !tracking || (tracking.eligible & bit) === 0) {
+    return "NO_FILL";
+  }
+  if ((tracking.crossed & bit) !== 0) return "DEFINITE_FILL";
+  if ((tracking.queueCleared & bit) !== 0) return "QUEUE_FILL";
+  return (tracking.touched & bit) !== 0 ? "UNCERTAIN" : "NO_FILL";
+}
+
+function rungIndex(price: number): number | null {
+  const cents = Math.round(price * 100);
+  return cents < SHADOW_RUNG_LOW_CENTS || cents > SHADOW_RUNG_HIGH_CENTS
+    ? null
+    : cents - SHADOW_RUNG_LOW_CENTS;
+}
+
+function rungPrice(index: number): number {
+  return (SHADOW_RUNG_LOW_CENTS + index) / 100;
+}
+
+function rungBit(index: number): number {
+  return 1 << index;
+}
+
+function initializeRungTracking(cheap: TokenBook): ShadowRungTracking {
+  let eligible = 0;
+  const queueAhead = Array.from({ length: SHADOW_RUNG_COUNT }, () => 0);
+  for (let index = 0; index < SHADOW_RUNG_COUNT; index += 1) {
+    const price = rungPrice(index);
+    if (cheap.bestAsk !== null && price + EPSILON < cheap.bestAsk) {
+      eligible |= rungBit(index);
+      queueAhead[index] = queueAt(cheap, price);
+    }
+  }
+  return {
+    eligible,
+    crossed: 0,
+    queueCleared: 0,
+    touched: 0,
+    queueAhead,
+    volumeAtRung: Array.from({ length: SHADOW_RUNG_COUNT }, () => 0),
+  };
+}
+
+function copyRungTracking(tracking: ShadowRungTracking): ShadowRungTracking {
+  return {
+    eligible: tracking.eligible,
+    crossed: tracking.crossed,
+    queueCleared: tracking.queueCleared,
+    touched: tracking.touched,
+    queueAhead: [...tracking.queueAhead],
+    volumeAtRung: [...tracking.volumeAtRung],
+  };
+}
+
+function shadowPnl(input: {
+  winningTokenId: string;
+  cheapTokenId: string;
+  favoriteTokenId: string;
+  cheapSize: number;
+  cheapCost: number;
+  favorite: CounterfactualFill;
+}): number {
+  const payout =
+    input.winningTokenId === input.cheapTokenId
+      ? input.cheapSize
+      : input.winningTokenId === input.favoriteTokenId
+        ? input.favorite.size
+        : 0;
+  return round(payout - input.cheapCost - input.favorite.cost - input.favorite.fee);
+}
+
+function emptyFill(): CounterfactualFill {
+  return { size: 0, cost: 0, fee: 0 };
 }
 
 export class LadderV10RegimeEngine {
@@ -591,6 +771,8 @@ export class LadderV10RegimeEngine {
         lastBidDepth: null,
         lastAskDepth: null,
         pendingTradeFlow: 0,
+        shadowRungTracking: null,
+        shadowTradeKeys: new Set<string>(),
         latestSnapshot: null,
         finalized: false,
       });
@@ -622,10 +804,57 @@ export class LadderV10RegimeEngine {
     if (!context) return;
     if (event.event_type === "last_trade_price") {
       const size = Number(event.size);
+      const price = Number(event.price);
       const tokenId = String(event.asset_id ?? "");
       const up = context.books.find((book) => book.outcome.toLowerCase() === "up");
       if (Number.isFinite(size)) {
         context.pendingTradeFlow += tokenId === up?.tokenId ? size : -size;
+      }
+      const decision = this.state.decisions[context.event.slug];
+      const tracking = context.shadowRungTracking;
+      if (
+        decision?.experimentVersion === BINARY_EXPERIMENT_VERSION &&
+        tracking &&
+        tokenId === decision.cheapTokenId &&
+        Number.isFinite(price) &&
+        Number.isFinite(size) &&
+        size > 0
+      ) {
+        const tradeKey = [
+          event.transaction_hash ?? "",
+          event.timestamp ?? "",
+          tokenId,
+          price,
+          size,
+        ].join(":");
+        if (context.shadowTradeKeys.has(tradeKey)) return;
+        context.shadowTradeKeys.add(tradeKey);
+        if (context.shadowTradeKeys.size > 256) {
+          const oldest = context.shadowTradeKeys.values().next().value as
+            | string
+            | undefined;
+          if (oldest) context.shadowTradeKeys.delete(oldest);
+        }
+        for (let index = 0; index < SHADOW_RUNG_COUNT; index += 1) {
+          const bit = rungBit(index);
+          if ((tracking.eligible & bit) === 0) continue;
+          const rung = rungPrice(index);
+          if (price < rung - EPSILON) {
+            tracking.touched |= bit;
+            tracking.crossed |= bit;
+          } else if (Math.abs(price - rung) <= EPSILON) {
+            tracking.touched |= bit;
+            tracking.volumeAtRung[index] = round(
+              (tracking.volumeAtRung[index] ?? 0) + size,
+            );
+            if (
+              tracking.volumeAtRung[index]! + EPSILON >=
+              (tracking.queueAhead[index] ?? 0) + FULL_FAVORITE_SHARES
+            ) {
+              tracking.queueCleared |= bit;
+            }
+          }
+        }
       }
     }
   }
@@ -640,6 +869,25 @@ export class LadderV10RegimeEngine {
     context.latestSnapshot = snapshot;
     const decision = this.state.decisions[event.slug];
     if (!decision) return;
+    if (
+      decision.experimentVersion === BINARY_EXPERIMENT_VERSION &&
+      context.shadowRungTracking
+    ) {
+      const cheap = snapshot.books.find(
+        (book) => book.tokenId === decision.cheapTokenId,
+      );
+      if (cheap?.bestAsk !== null && cheap?.bestAsk !== undefined) {
+        for (let index = 0; index < SHADOW_RUNG_COUNT; index += 1) {
+          const bit = rungBit(index);
+          if (
+            (context.shadowRungTracking.eligible & bit) !== 0 &&
+            cheap.bestAsk <= rungPrice(index) + EPSILON
+          ) {
+            context.shadowRungTracking.touched |= bit;
+          }
+        }
+      }
+    }
     const ids = new Set(
       snapshot.orders
         .filter((order) => order.pairId?.startsWith(V10_PREFIX))
@@ -715,7 +963,7 @@ export class LadderV10RegimeEngine {
       this.state.volatilityP90 !== null &&
       this.state.volatilityP90 - this.state.volatilityP10 > EPSILON;
     const adaptive = !burnIn && normalizationValid && selected?.valid === true;
-    const favoriteTargetShares = adaptive
+    const legacyV10TargetShares = adaptive
       ? favoriteTierForScore(
           selected.score,
           this.config.ladderV10ScoreLow,
@@ -724,6 +972,28 @@ export class LadderV10RegimeEngine {
           this.config.ladderV10TargetShares,
         )
       : this.config.ladderV10TargetShares;
+    const favoriteTargetShares = binaryFavoriteTarget(legacyV10TargetShares);
+    const counterfactualFavorite = simulateFavorite(
+      ranked.favorite,
+      this.config.ladderV10FavoritePrice,
+      FULL_FAVORITE_SHARES,
+      snapshot,
+    );
+    const legacyCounterfactualFavorite =
+      legacyV10TargetShares > 0
+        ? simulateFavorite(
+            ranked.favorite,
+            this.config.ladderV10FavoritePrice,
+            legacyV10TargetShares,
+            snapshot,
+          )
+        : emptyFill();
+    const expectedFavoriteFillPrice =
+      counterfactualFavorite.size > EPSILON
+        ? round(counterfactualFavorite.cost / counterfactualFavorite.size)
+        : null;
+    const tracking = initializeRungTracking(ranked.cheap);
+    context.shadowRungTracking = tracking;
     const decision: LadderV10Decision = {
       marketSlug: event.slug,
       createdAt: new Date(nowSeconds * 1_000).toISOString(),
@@ -737,16 +1007,25 @@ export class LadderV10RegimeEngine {
           ? "adaptive"
           : "v7_fallback",
       favoriteTargetShares,
+      experimentVersion: BINARY_EXPERIMENT_VERSION,
+      legacyV10TargetShares,
+      binaryV10TargetShares: favoriteTargetShares,
       cheapTokenId: ranked.cheap.tokenId,
       favoriteTokenId: ranked.favorite.tokenId,
       features: selected?.features ?? null,
       rawFeatures: selected?.rawFeatures ?? null,
-      counterfactualFavorite: simulateFavorite(
-        ranked.favorite,
-        this.config.ladderV10FavoritePrice,
-        this.config.ladderV10TargetShares,
-        snapshot,
-      ),
+      counterfactualFavorite,
+      legacyCounterfactualFavorite,
+      expectedFavoriteFillPrice,
+      dynamicCheapTarget: shadowDynamicCheapTarget(expectedFavoriteFillPrice),
+      favoriteDepthAt80: ranked.favorite.asks
+        .filter((level) => level.price <= this.config.ladderV10FavoritePrice + EPSILON)
+        .reduce((sum, level) => sum + level.size, 0),
+      vwap40: simulateVwap(ranked.favorite, 40),
+      vwap80: simulateVwap(ranked.favorite, 80),
+      vwap120: simulateVwap(ranked.favorite, 120),
+      shadowMakerFeeRate: snapshot.makerFeeRate ?? 0,
+      shadowFeeExponent: snapshot.takerFeeExponent,
       observedFills: [],
     };
     this.state.decisions[event.slug] = decision;
@@ -762,6 +1041,8 @@ export class LadderV10RegimeEngine {
       score: decision.score,
       source: decision.source,
       decisionReason: decision.decisionReason,
+      legacyV10TargetShares,
+      binaryV10TargetShares: favoriteTargetShares,
       favoriteTargetShares,
     });
     return decision;
@@ -770,6 +1051,13 @@ export class LadderV10RegimeEngine {
   async handleSettlement(settlement: PaperSettlement): Promise<void> {
     const decision = this.state.decisions[settlement.marketSlug];
     if (!decision || decision.settledAt) return;
+    const contextTracking = this.contexts.get(settlement.marketSlug)
+      ?.shadowRungTracking;
+    const tracking = contextTracking
+      ? copyRungTracking(contextTracking)
+      : decision.shadowRungTracking
+        ? copyRungTracking(decision.shadowRungTracking)
+        : null;
     const cheapFills = decision.observedFills.filter(
       (fill) => fill.tokenId === decision.cheapTokenId,
     );
@@ -789,6 +1077,101 @@ export class LadderV10RegimeEngine {
     decision.counterfactualV7Pnl = round(
       payout - cheapCost - favorite.cost - favorite.fee,
     );
+    if (
+      decision.experimentVersion === BINARY_EXPERIMENT_VERSION &&
+      decision.legacyV10TargetShares !== undefined &&
+      decision.binaryV10TargetShares !== undefined
+    ) {
+      const masks: ShadowRungMasks = {
+        eligible: tracking?.eligible ?? 0,
+        crossed: tracking?.crossed ?? 0,
+        queueCleared: tracking?.queueCleared ?? 0,
+      };
+      const favoritePrice = decision.expectedFavoriteFillPrice ?? null;
+      const dangerTriggered =
+        favoritePrice !== null &&
+        favoritePrice >= 0.6 &&
+        favoritePrice < 0.7;
+      const dangerFavorite = dangerTriggered ? emptyFill() : favorite;
+      const dangerPnl = shadowPnl({
+        winningTokenId: settlement.winningTokenId,
+        cheapTokenId: decision.cheapTokenId,
+        favoriteTokenId: decision.favoriteTokenId,
+        cheapSize,
+        cheapCost,
+        favorite: dangerFavorite,
+      });
+      const target = decision.dynamicCheapTarget ?? null;
+      const fillState = classifyShadowCheapFill(target, tracking);
+      const dynamicCheapFilled =
+        fillState === "DEFINITE_FILL" || fillState === "QUEUE_FILL";
+      const dynamicCheapSize = dynamicCheapFilled ? FULL_FAVORITE_SHARES : 0;
+      const dynamicCheapFee =
+        dynamicCheapFilled && target !== null
+          ? dynamicCheapSize *
+            (decision.shadowMakerFeeRate ?? 0) *
+            Math.pow(
+              target * (1 - target),
+              decision.shadowFeeExponent ?? 1,
+            )
+          : 0;
+      const dynamicCheapCost =
+        target === null
+          ? 0
+          : dynamicCheapSize * target + dynamicCheapFee;
+      const dynamicPnl = shadowPnl({
+        winningTokenId: settlement.winningTokenId,
+        cheapTokenId: decision.cheapTokenId,
+        favoriteTokenId: decision.favoriteTokenId,
+        cheapSize: dynamicCheapSize,
+        cheapCost: dynamicCheapCost,
+        favorite,
+      });
+      const legacyFavorite = decision.legacyCounterfactualFavorite ?? emptyFill();
+      const legacyPnl = shadowPnl({
+        winningTokenId: settlement.winningTokenId,
+        cheapTokenId: decision.cheapTokenId,
+        favoriteTokenId: decision.favoriteTokenId,
+        cheapSize,
+        cheapCost,
+        favorite: legacyFavorite,
+      });
+      const actualFavoriteShares = decision.observedFills
+        .filter((fill) => fill.tokenId === decision.favoriteTokenId)
+        .reduce((sum, fill) => sum + fill.size, 0);
+      decision.shadowResult = {
+        marketSlug: decision.marketSlug,
+        v10Score: decision.score,
+        legacyV10TargetShares: decision.legacyV10TargetShares,
+        binaryV10TargetShares: decision.binaryV10TargetShares,
+        v10Actual: {
+          favoriteShares: round(actualFavoriteShares),
+          pnl: settlement.realizedPnl,
+        },
+        legacyV10: {
+          favoriteShares: legacyFavorite.size,
+          pnl: legacyPnl,
+        },
+        shadowV7: { pnl: decision.counterfactualV7Pnl },
+        shadowDangerFilter: {
+          triggered: dangerTriggered,
+          favoritePrice,
+          pnl: dangerPnl,
+        },
+        shadowDynamicCheap: {
+          favoritePrice,
+          cheapTarget: target,
+          fillState,
+          pnl: dynamicPnl,
+        },
+        rungMasks: masks,
+        favoriteDepthAt80: round(decision.favoriteDepthAt80 ?? 0),
+        vwap40: decision.vwap40 ?? null,
+        vwap80: decision.vwap80 ?? null,
+        vwap120: decision.vwap120 ?? null,
+      };
+      delete decision.shadowRungTracking;
+    }
     decision.settledAt = settlement.settledAt;
     await this.persist();
     await this.appendEventLog({
@@ -802,6 +1185,7 @@ export class LadderV10RegimeEngine {
         favoriteTargetShares: decision.favoriteTargetShares,
         actualPnl: decision.actualPnl,
         counterfactualV7Pnl: decision.counterfactualV7Pnl,
+        shadowResult: decision.shadowResult,
       },
     });
     log("Ladder V10 settled comparison", {
@@ -976,6 +1360,14 @@ export class LadderV10RegimeEngine {
       this.state.completeMarkets.push(context.event.slug);
     }
     if (decision) {
+      if (
+        decision.experimentVersion === BINARY_EXPERIMENT_VERSION &&
+        context.shadowRungTracking
+      ) {
+        decision.shadowRungTracking = copyRungTracking(
+          context.shadowRungTracking,
+        );
+      }
       const cheapSize = decision.observedFills
         .filter((fill) => fill.tokenId === decision.cheapTokenId)
         .reduce((sum, fill) => sum + fill.size, 0);

@@ -731,10 +731,11 @@ preferred path source.
 
 The first 32 complete markets are burn-in markets and deliberately use V7's
 40-share favorite fallback. Once the volatility normalizer is frozen, the
-five-minute score selects 0, 20, or 40 one-shot favorite FAK shares while the
-10-cent cheap maker remains fixed at 40 shares. The score is never revised for
-that market. Missing or stale detector data also falls back to 40 favorite
-shares and is reported separately.
+five-minute score retains the legacy 0/20/40 decision for comparison but maps
+it to binary actual sizing: legacy zero remains zero and legacy 20 or 40 becomes
+one 40-share favorite FAK. The 10-cent cheap maker remains fixed at 40 shares.
+The score is never revised for that market. Missing or stale detector data also
+falls back to 40 favorite shares and is reported separately.
 
 The frozen `v10-heuristic-1` score weights 30/60/120-second path
 oscillation (20), five-second reversals (15), range versus displacement (10),
@@ -750,6 +751,11 @@ profit exits. Each five-minute decision also stores the unchanged V7 favorite
 counterfactual so settlement reports actual V10 PnL beside modeled V7 PnL.
 The atomic regime state is `ladder-v10-regime-state.json`; decision and
 settlement audit records are append-only in `btc-regime-events.jsonl`.
+For new binary-experiment markets, the same settled record also contains the
+legacy V10 result, original V7 control, shadow 60-70-cent danger filter, fixed
+90-cent dynamic-cheap shadow, compact 8-25-cent rung masks, and favorite depth
+plus VWAP40/80/120 telemetry. Shadows reuse the existing book/trade stream and
+never submit an order or make another API request.
 
 Start from `.env.ladder-v10-paper.example`. Keep
 `MINUTES_BEFORE_CLOSE_MAX=15`, `CRYPTO_MARKETS=KXBTC15M`, and a fresh
@@ -764,6 +770,8 @@ npm run report:ladder-v10 -- ./data/paper-ladder-v10-btc
 
 The report compares actual V10 P&L with the frozen-book V7 counterfactual and
 marks the experiment evaluation-ready only after 300 settled adaptive markets.
+It also reports the binary shadow experiment for the last 32, last 96, and all
+new markets, plus rolling 8/16/32-market rally capture or avoided loss.
 
 ### Odahoa pair-lock V2
 

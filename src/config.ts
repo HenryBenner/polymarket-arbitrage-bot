@@ -644,7 +644,7 @@ export function validateTradingConfig(config: BotConfig): void {
     config.ladderV10TargetShares !== 40
   ) {
     throw new Error(
-      "LADDER_V10 target shares must preserve the 20/40-share V7 tiers",
+      "LADDER_V10 target shares must preserve the legacy 20-share comparison and 40-share cap",
     );
   }
   if (

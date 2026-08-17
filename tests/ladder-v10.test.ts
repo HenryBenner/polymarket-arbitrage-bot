@@ -5,9 +5,12 @@ import { join } from "node:path";
 import test from "node:test";
 import type { LadderV10Decision } from "../src/ladder-v10-regime.js";
 import {
+  binaryFavoriteTarget,
+  classifyShadowCheapFill,
   favoriteTierForScore,
   LadderV10RegimeEngine,
   scoreOscillation,
+  shadowDynamicCheapTarget,
 } from "../src/ladder-v10-regime.js";
 import { buildLadderV10Report } from "../src/ladder-v10-report.js";
 import { planLadderV10 } from "../src/ladder-v10.js";
@@ -156,7 +159,7 @@ test("V10 posts the fixed cheap maker before its frozen favorite tier", async ()
       event.windowEnd - 240,
     );
     assert.equal(second.opportunities[0]?.pairId, "ladder-v10:favorite-initial");
-    assert.equal(second.opportunities[0]?.size, 20);
+    assert.equal(second.opportunities[0]?.size, 40);
     assert.equal(second.opportunities[0]?.orderPolicy, "fak");
   });
 });
@@ -280,6 +283,55 @@ test("favorite sizing uses frozen 0/20/40 boundary semantics", () => {
   assert.equal(favoriteTierForScore(40), 20);
   assert.equal(favoriteTierForScore(69), 20);
   assert.equal(favoriteTierForScore(70), 40);
+  assert.equal(binaryFavoriteTarget(0), 0);
+  assert.equal(binaryFavoriteTarget(20), 40);
+  assert.equal(binaryFavoriteTarget(40), 40);
+});
+
+test("dynamic cheap shadow uses the fixed 90-cent pair target and conservative fills", () => {
+  assert.equal(shadowDynamicCheapTarget(0.8), 0.1);
+  assert.equal(shadowDynamicCheapTarget(0.78), 0.12);
+  assert.equal(shadowDynamicCheapTarget(0.75), 0.15);
+  assert.equal(shadowDynamicCheapTarget(0.7), 0.2);
+  assert.equal(shadowDynamicCheapTarget(0.65), 0.25);
+  assert.equal(shadowDynamicCheapTarget(0.6), 0.25);
+  const bit25 = 1 << 17;
+  assert.equal(
+    classifyShadowCheapFill(0.25, {
+      eligible: bit25,
+      crossed: bit25,
+      queueCleared: 0,
+      touched: bit25,
+    }),
+    "DEFINITE_FILL",
+  );
+  assert.equal(
+    classifyShadowCheapFill(0.25, {
+      eligible: bit25,
+      crossed: 0,
+      queueCleared: bit25,
+      touched: bit25,
+    }),
+    "QUEUE_FILL",
+  );
+  assert.equal(
+    classifyShadowCheapFill(0.25, {
+      eligible: bit25,
+      crossed: 0,
+      queueCleared: 0,
+      touched: bit25,
+    }),
+    "UNCERTAIN",
+  );
+  assert.equal(
+    classifyShadowCheapFill(0.25, {
+      eligible: bit25,
+      crossed: 0,
+      queueCleared: 0,
+      touched: 0,
+    }),
+    "NO_FILL",
+  );
 });
 
 test("regime price parsers accept official BRTI and Coinbase ticker payloads", () => {
@@ -412,6 +464,27 @@ test("V10 report separates fallback and exposure cohorts and enforces 300 adapti
   cheapOnly.actualPnl = 6;
   cheapOnly.counterfactualV7Pnl = -4;
   cheapOnly.settledAt = "2026-08-12T00:01:00.000Z";
+  cheapOnly.shadowResult = {
+    marketSlug: cheapOnly.marketSlug,
+    v10Score: cheapOnly.score,
+    legacyV10TargetShares: 20,
+    binaryV10TargetShares: 40,
+    v10Actual: { favoriteShares: 40, pnl: 6 },
+    legacyV10: { favoriteShares: 20, pnl: 2 },
+    shadowV7: { pnl: -4 },
+    shadowDangerFilter: { triggered: true, favoritePrice: 0.65, pnl: 1 },
+    shadowDynamicCheap: {
+      favoritePrice: 0.65,
+      cheapTarget: 0.25,
+      fillState: "QUEUE_FILL",
+      pnl: 3,
+    },
+    rungMasks: { eligible: 1, crossed: 0, queueCleared: 1 },
+    favoriteDepthAt80: 100,
+    vwap40: 0.65,
+    vwap80: 0.66,
+    vwap120: null,
+  };
 
   const fallback = decision(40);
   fallback.marketSlug = "fallback-market";
@@ -435,6 +508,14 @@ test("V10 report separates fallback and exposure cohorts and enforces 300 adapti
   assert.equal(report.overall.tradedMarkets, 2);
   assert.equal(report.overall.noTradeMarkets, 1);
   assert.equal(report.overall.actualWinRate, 0.5);
+  assert.equal(report.binaryShadowExperiment.settledAdaptiveMarkets, 1);
+  assert.equal(report.binaryShadowExperiment.windows.all.v10Actual.pnl, 6);
+  assert.equal(
+    report.binaryShadowExperiment.windows.all.shadowDynamicCheap.queueFills,
+    1,
+  );
+  assert.equal(report.binaryShadowExperiment.rallyCapture["8"].captureRatio, null);
+  assert.equal(report.binaryShadowExperiment.rallyCapture["8"].avoidedLoss, 10);
   assert.equal(report.cohorts.fallbackStatus.v7_fallback?.markets, 1);
   assert.equal(report.cohorts.exposure.cheap_only?.markets, 1);
   assert.equal(report.cohorts.exposure.favorite_only?.markets, 1);
@@ -489,6 +570,22 @@ test("regime decisions survive restart and JSONL snapshots append continuously",
     const frozen = await engine.decisionFor(event, snapshot(), clock / 1_000);
     assert.equal(frozen?.decisionReason, "adaptive");
     assert.equal(frozen?.source, "brti");
+    assert.equal(frozen?.legacyV10TargetShares, 20);
+    assert.equal(frozen?.binaryV10TargetShares, 40);
+    assert.equal(frozen?.favoriteTargetShares, 40);
+    assert.equal(frozen?.dynamicCheapTarget, 0.25);
+    assert.equal(frozen?.favoriteDepthAt80, 10);
+    assert.equal(frozen?.vwap40, null);
+    engine.ingestTelemetry({
+      event_type: "last_trade_price",
+      market_ticker: event.market.externalMarketId ?? event.market.id,
+      asset_id: "up-token",
+      side: "SELL",
+      price: "0.24",
+      size: "1",
+      timestamp: String(clock + 1_000),
+      transaction_hash: "shadow-cross",
+    });
     await engine.handleSettlement({
       marketSlug: event.slug,
       winningTokenId: "down-token",
@@ -504,6 +601,12 @@ test("regime decisions survive restart and JSONL snapshots append continuously",
       engine.snapshotState().decisions[event.slug]?.counterfactualV7Pnl,
       3.832,
     );
+    const shadow = engine.snapshotState().decisions[event.slug]?.shadowResult;
+    assert.equal(shadow?.shadowDangerFilter.triggered, true);
+    assert.equal(shadow?.shadowDynamicCheap.fillState, "DEFINITE_FILL");
+    assert.equal(shadow?.rungMasks.crossed & (1 << 17), 1 << 17);
+    assert.equal(shadow?.legacyV10TargetShares, 20);
+    assert.equal(shadow?.binaryV10TargetShares, 40);
     await engine.close();
 
     clock += 1_000;

@@ -773,6 +773,41 @@ marks the experiment evaluation-ready only after 300 settled adaptive markets.
 It also reports the binary shadow experiment for the last 32, last 96, and all
 new markets, plus rolling 8/16/32-market rally capture or avoided loss.
 
+### Ladder V11 BRTI low-reversal experiment
+
+`STRATEGY_MODE=ladder_v11` is an isolated BTC-only Kalshi strategy with
+`ladder-v11:*` trade keys and its own tracker/regime state. It reuses the V10
+market, BRTI, book, fee, execution, and settlement infrastructure, but BRTI is
+its only permitted BTC source. Missing, stale, or incomplete BRTI history is a
+hard no-trade decision: V11 has no Coinbase, Kalshi-proxy, stale-snapshot, V7,
+or burn-in trading fallback.
+
+The experiment parameters are intentionally hard-coded: reversals must be at
+most `0.10`; a qualifying market posts 40 shares at 10 cents post-only and then
+submits a 40-share favorite FAK capped at 80 cents. A rejected market submits
+neither order. There are no 20-share orders, completion/rescue orders, dynamic
+cheap prices, danger filter, or score-based authorization. V10's score and the
+neighboring `0.05/0.10/0.15/0.20` reversal thresholds remain telemetry only.
+
+Immediately before the favorite submission, V11 recomputes the BRTI features,
+re-reads the streaming Kalshi book, and re-derives both outcome roles. Stored
+decisions older than one second are explicitly counted as recalculations. A
+favorite below 50 cents, above 80 cents, on a changed outcome, or based on a
+non-BRTI/invalid feature state is aborted. Favorite fills below 50 cents also
+produce a severe invariant diagnostic with the complete decision context.
+
+Start with `.env.ladder-v11-paper.example`. The atomic state is
+`ladder-v11-regime-state.json`, audit events are appended to
+`ladder-v11-events.jsonl`, and the compact evaluation report is generated with:
+
+```powershell
+npm run report:ladder-v11 -- ./data/paper-ladder-v11-btc
+```
+
+The report includes V11 P&L, selection rate, pair/favorite-only/cheap-only
+cohorts, drawdown, execution-synchronized V7/V10 shadows, stale recalculations,
+stale executions, sub-50-cent favorite fills, and non-BRTI trades.
+
 ### Odahoa pair-lock V2
 
 `STRATEGY_MODE=odahoa_ladder_2` keeps V1's BTC market selection, phases,

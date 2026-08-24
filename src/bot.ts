@@ -13,6 +13,15 @@ import { planLadderV8 } from "./ladder-v8.js";
 import { planLadderV9 } from "./ladder-v9.js";
 import { planLadderV10 } from "./ladder-v10.js";
 import { LadderV10RegimeEngine } from "./ladder-v10-regime.js";
+import {
+  LADDER_V11_FAVORITE_MAX_PRICE,
+  planLadderV11,
+} from "./ladder-v11.js";
+import {
+  LADDER_V11_MAX_STORED_DECISION_AGE_MS,
+  LadderV11RegimeEngine,
+  type LadderV11DecisionSnapshot,
+} from "./ladder-v11-regime.js";
 import { log, logThrottled } from "./logger.js";
 import { MarketScanner } from "./market-scanner.js";
 import {
@@ -51,6 +60,7 @@ export class ReverseBot {
   private readonly ladderV7Events = new Map<string, UpDownEvent>();
   private readonly ladderV9Events = new Map<string, UpDownEvent>();
   private readonly ladderV10Events = new Map<string, UpDownEvent>();
+  private readonly ladderV11Events = new Map<string, UpDownEvent>();
   private readonly ladderV55Events = new Map<string, UpDownEvent>();
   private readonly ladderV55Queues = new Map<string, Promise<void>>();
   private readonly ladderV6Queues = new Map<string, Promise<void>>();
@@ -59,9 +69,12 @@ export class ReverseBot {
   private readonly ladderV9Queues = new Map<string, Promise<void>>();
   private readonly ladderV10Queues = new Map<string, Promise<void>>();
   private readonly ladderV10WakePending = new Set<string>();
+  private readonly ladderV11Queues = new Map<string, Promise<void>>();
+  private readonly ladderV11WakePending = new Set<string>();
   private readonly marketQueues = new Map<string, Promise<void>>();
   private ladderTickRunning = false;
   private readonly ladderV10Regime: LadderV10RegimeEngine | null;
+  private readonly ladderV11Regime: LadderV11RegimeEngine | null;
   private ladderV10SampleTimer: NodeJS.Timeout | null = null;
   private ladderV10SampleRunning = false;
 
@@ -74,6 +87,10 @@ export class ReverseBot {
     this.ladderV10Regime =
       config.strategyMode === "ladder_v10"
         ? new LadderV10RegimeEngine(config)
+        : null;
+    this.ladderV11Regime =
+      config.strategyMode === "ladder_v11"
+        ? new LadderV11RegimeEngine(config)
         : null;
     this.ladderTracker = new LadderTracker(
       config.paperStatePath,
@@ -93,6 +110,8 @@ export class ReverseBot {
                     ? "ladder-v9-state.json"
                     : config.strategyMode === "ladder_v10"
                       ? "ladder-v10-state.json"
+                    : config.strategyMode === "ladder_v11"
+                      ? "ladder-v11-state.json"
                     : "ladder-state.json",
     );
     this.trader.setExecutionWakeHandler?.((marketSlug) =>
@@ -106,6 +125,8 @@ export class ReverseBot {
               ? this.enqueueLadderV9Market(marketSlug)
               : this.config.strategyMode === "ladder_v10"
                 ? this.enqueueLadderV10Market(marketSlug)
+              : this.config.strategyMode === "ladder_v11"
+                ? this.enqueueLadderV11Market(marketSlug)
               : this.enqueueLadderV8Market(marketSlug),
     );
     if (this.ladderV10Regime) {
@@ -116,6 +137,16 @@ export class ReverseBot {
         await this.ladderV10Regime?.handleSettlement(settlement);
         this.ladderV10Events.delete(settlement.marketSlug);
         this.ladderV10WakePending.delete(settlement.marketSlug);
+      });
+    }
+    if (this.ladderV11Regime) {
+      this.trader.setMarketTelemetryHandler?.((event) =>
+        this.ladderV11Regime?.ingestTelemetry(event),
+      );
+      this.trader.setSettlementHandler?.(async (settlement) => {
+        await this.ladderV11Regime?.handleSettlement(settlement);
+        this.ladderV11Events.delete(settlement.marketSlug);
+        this.ladderV11WakePending.delete(settlement.marketSlug);
       });
     }
   }
@@ -131,11 +162,13 @@ export class ReverseBot {
       this.config.strategyMode === "ladder_v7" ||
       this.config.strategyMode === "ladder_v8" ||
       this.config.strategyMode === "ladder_v9" ||
-      this.config.strategyMode === "ladder_v10"
+      this.config.strategyMode === "ladder_v10" ||
+      this.config.strategyMode === "ladder_v11"
     ) {
       await this.ladderTracker.init();
     }
     await this.ladderV10Regime?.init();
+    await this.ladderV11Regime?.init();
   }
 
   async run(): Promise<void> {
@@ -162,6 +195,8 @@ export class ReverseBot {
                       ? "staged cheap-first entry with fill-aware completion and rescue"
                       : this.config.strategyMode === "ladder_v10"
                         ? "regime-gated V7 with strict cheap-fill completion"
+                      : this.config.strategyMode === "ladder_v11"
+                        ? "BRTI-only low-reversal binary 40/40 ladder"
                       : "early two-sided static maker ladder",
       strategyMode: this.config.strategyMode,
       executionMode: this.config.executionMode,
@@ -259,6 +294,16 @@ export class ReverseBot {
         this.config.strategyMode === "ladder_v10"
           ? this.config.ladderV10BurnInMarkets
           : undefined,
+      ladderV11Parameters:
+        this.config.strategyMode === "ladder_v11"
+          ? {
+              btcSource: "brti",
+              maxReversals: 0.1,
+              cheapPrice: 0.1,
+              favoriteMaxPrice: 0.8,
+              size: 40,
+            }
+          : undefined,
       staticMakerShares:
         this.config.strategyMode === "odahoa_static_maker"
           ? this.config.staticMakerMaxShares
@@ -270,10 +315,10 @@ export class ReverseBot {
     });
 
     await this.runOnce();
-    if (this.ladderV10Regime && !this.ladderV10SampleTimer) {
+    if ((this.ladderV10Regime || this.ladderV11Regime) && !this.ladderV10SampleTimer) {
       this.ladderV10SampleTimer = setInterval(
         () => void this.sampleLadderV10(),
-        this.config.ladderV10SnapshotIntervalMs,
+        this.ladderV11Regime ? 1_000 : this.config.ladderV10SnapshotIntervalMs,
       );
     }
     setInterval(() => void this.scheduledTick(), this.config.pollIntervalMs);
@@ -284,14 +329,15 @@ export class ReverseBot {
   }
 
   private async sampleLadderV10(): Promise<void> {
-    if (!this.ladderV10Regime || this.ladderV10SampleRunning) return;
+    const regime = this.ladderV10Regime ?? this.ladderV11Regime;
+    if (!regime || this.ladderV10SampleRunning) return;
     this.ladderV10SampleRunning = true;
     try {
-      await this.ladderV10Regime.sampleAll(
+      await regime.sampleAll(
         (slug) => this.trader.getMarketExecutionSnapshot?.(slug) ?? null,
       );
     } catch (error) {
-      log("Ladder V10 sample cycle failed", {
+      log("Ladder regime sample cycle failed", {
         error: error instanceof Error ? error.message : String(error),
       });
     } finally {
@@ -429,6 +475,12 @@ export class ReverseBot {
       await this.enqueueLadderV10Market(event.slug);
       return;
     }
+    if (this.config.strategyMode === "ladder_v11") {
+      this.ladderV11Events.set(event.slug, event);
+      this.ladderV11Regime?.registerMarket(event, books);
+      await this.enqueueLadderV11Market(event.slug);
+      return;
+    }
 
     const opportunities =
       this.config.strategyMode === "reverse"
@@ -513,7 +565,8 @@ export class ReverseBot {
       this.config.strategyMode === "ladder_v7" ||
       this.config.strategyMode === "ladder_v8" ||
       this.config.strategyMode === "ladder_v9" ||
-      this.config.strategyMode === "ladder_v10"
+      this.config.strategyMode === "ladder_v10" ||
+      this.config.strategyMode === "ladder_v11"
     ) {
       await this.ladderTracker.mark(opportunity.tradeKey);
     } else {
@@ -928,6 +981,187 @@ export class ReverseBot {
     this.trader.reportMarket?.(event.slug);
   }
 
+  private enqueueLadderV11Market(marketSlug: string): Promise<void> {
+    if (this.config.strategyMode !== "ladder_v11") {
+      return Promise.resolve();
+    }
+    const active = this.ladderV11Queues.get(marketSlug);
+    if (active) {
+      this.ladderV11WakePending.add(marketSlug);
+      return active;
+    }
+    const queued = this.drainLadderV11Market(marketSlug);
+    this.ladderV11Queues.set(marketSlug, queued);
+    const cleanup = () => {
+      if (this.ladderV11Queues.get(marketSlug) === queued) {
+        this.ladderV11Queues.delete(marketSlug);
+      }
+    };
+    void queued.then(cleanup, cleanup);
+    return queued;
+  }
+
+  private async drainLadderV11Market(marketSlug: string): Promise<void> {
+    do {
+      this.ladderV11WakePending.delete(marketSlug);
+      const event = this.ladderV11Events.get(marketSlug);
+      if (!event) return;
+      await this.processLadderV11Event(event);
+    } while (this.ladderV11WakePending.delete(marketSlug));
+  }
+
+  private async processLadderV11Event(event: UpDownEvent): Promise<void> {
+    if (!this.ladderV11Regime) {
+      throw new Error("ladder_v11 requires its BRTI regime engine");
+    }
+    let submitted = 0;
+    let cancelled = 0;
+    let lastDecision: LadderV11DecisionSnapshot | null = null;
+    let lastPlan: Awaited<ReturnType<typeof planLadderV11>> | undefined;
+    for (let iteration = 0; iteration < 8; iteration += 1) {
+      const snapshot = this.trader.getMarketExecutionSnapshot?.(event.slug);
+      if (!snapshot) {
+        throw new Error("ladder_v11 requires a fill-aware executor snapshot");
+      }
+      if (snapshot.marketDataValid === false) return;
+      await this.ladderV11Regime.observeExecution(event, snapshot);
+      const initialDecision = await this.ladderV11Regime.evaluate(
+        event,
+        snapshot,
+      );
+      lastDecision = initialDecision;
+      let plan = await planLadderV11(
+        this.ladderTracker,
+        event,
+        snapshot,
+        initialDecision,
+        false,
+      );
+      lastPlan = plan;
+      if (plan.cancelOrderIds.length > 0) {
+        if (!this.trader.cancelOrders) {
+          throw new Error("ladder_v11 requires executor order cancellation");
+        }
+        await this.trader.cancelOrders(plan.cancelOrderIds);
+        cancelled += plan.cancelOrderIds.length;
+        continue;
+      }
+
+      let opportunity = plan.opportunities[0];
+      if (opportunity?.pairId === "ladder-v11:cheap-maker") {
+        if (!(await this.executeOpportunity(opportunity))) break;
+        submitted += 1;
+        await this.ladderV11Regime.recordOrderSubmitted(
+          event.slug,
+          "cheap-maker",
+          initialDecision,
+        );
+        continue;
+      }
+
+      if (plan.managementStage !== "favorite-revalidation-required") break;
+
+      // Re-read the latest streaming BRTI state and current Kalshi book even
+      // when the stored decision is younger than one second. If it is older,
+      // the regime engine also records the mandatory stale recalculation.
+      let finalSnapshot = this.trader.getMarketExecutionSnapshot?.(event.slug);
+      if (!finalSnapshot || finalSnapshot.marketDataValid === false) break;
+      let finalDecision = await this.ladderV11Regime.evaluate(
+        event,
+        finalSnapshot,
+        true,
+      );
+      if (
+        Date.now() - finalDecision.decisionTimestampMs >
+        LADDER_V11_MAX_STORED_DECISION_AGE_MS
+      ) {
+        finalSnapshot = this.trader.getMarketExecutionSnapshot?.(event.slug);
+        if (!finalSnapshot || finalSnapshot.marketDataValid === false) break;
+        finalDecision = await this.ladderV11Regime.evaluate(
+          event,
+          finalSnapshot,
+          true,
+        );
+      }
+      lastDecision = finalDecision;
+      plan = await planLadderV11(
+        this.ladderTracker,
+        event,
+        finalSnapshot,
+        finalDecision,
+        true,
+      );
+      lastPlan = plan;
+      if (plan.cancelOrderIds.length > 0) {
+        if (!this.trader.cancelOrders) {
+          throw new Error("ladder_v11 requires executor order cancellation");
+        }
+        await this.trader.cancelOrders(plan.cancelOrderIds);
+        cancelled += plan.cancelOrderIds.length;
+        break;
+      }
+      opportunity = plan.opportunities[0];
+      if (!opportunity) break;
+
+      const ranked = [...finalSnapshot.books]
+        .filter((book) => book.bestAsk !== null)
+        .sort(
+          (left, right) =>
+            (left.bestAsk ?? 1) - (right.bestAsk ?? 1) ||
+            left.outcomeIndex - right.outcomeIndex,
+        );
+      const currentFavorite = ranked.length === 2 ? ranked[1] : undefined;
+      const currentFavoriteAsk = currentFavorite?.bestAsk ?? null;
+      if (
+        finalDecision.source !== "brti" ||
+        !finalDecision.scoreInputsValid ||
+        !finalDecision.eligible ||
+        !currentFavorite ||
+        opportunity.token.tokenId !== currentFavorite.tokenId ||
+        currentFavoriteAsk === null ||
+        currentFavoriteAsk < 0.5 ||
+        currentFavoriteAsk > LADDER_V11_FAVORITE_MAX_PRICE
+      ) {
+        await this.ladderV11Regime.recordInvariantAbort(event.slug, "favorite_pre_submit", {
+          source: finalDecision.source,
+          scoreInputsValid: finalDecision.scoreInputsValid,
+          eligible: finalDecision.eligible,
+          reversals: finalDecision.features?.reversals ?? null,
+          plannedTokenId: opportunity.token.tokenId,
+          currentFavoriteTokenId: currentFavorite?.tokenId ?? null,
+          currentFavoriteAsk,
+          finalDecision,
+        });
+        break;
+      }
+
+      if (!(await this.executeOpportunity(opportunity))) break;
+      submitted += 1;
+      await this.ladderV11Regime.recordOrderSubmitted(
+        event.slug,
+        "favorite-initial",
+        finalDecision,
+      );
+    }
+    if (submitted === 0 && cancelled === 0) {
+      logThrottled("Watching ladder_v11 market", event.slug, {
+        market: event.title,
+        slug: event.slug,
+        stage: lastPlan?.managementStage ?? "observing",
+        source: lastDecision?.source ?? "none",
+        reversals: lastDecision?.features?.reversals ?? null,
+        v10Score: lastDecision?.v10Score ?? null,
+        decision: lastDecision?.decision ?? "NO_TRADE",
+        reason: lastDecision?.reason ?? "NO_BRTI",
+        reversalThresholds: lastDecision?.reversalThresholds,
+        pairedShares: lastPlan?.pairedShares ?? 0,
+        unmatchedCheapShares: lastPlan?.unmatchedCheapShares ?? 0,
+        unmatchedFavoriteShares: lastPlan?.unmatchedFavoriteShares ?? 0,
+      });
+    }
+    this.trader.reportMarket?.(event.slug);
+  }
+
   private async executeSellOpportunity(
     opportunity: TradeOpportunity,
   ): Promise<boolean> {
@@ -1210,11 +1444,15 @@ export class ReverseBot {
     prune(this.ladderV8Events);
     prune(this.ladderV9Events);
     prune(this.ladderV10Events);
+    prune(this.ladderV11Events);
     for (const [slug, context] of this.ladderV6Events) {
       if (context.event.windowEnd <= now) this.ladderV6Events.delete(slug);
     }
     for (const slug of this.ladderV10WakePending) {
       if (!this.ladderV10Events.has(slug)) this.ladderV10WakePending.delete(slug);
+    }
+    for (const slug of this.ladderV11WakePending) {
+      if (!this.ladderV11Events.has(slug)) this.ladderV11WakePending.delete(slug);
     }
   }
 

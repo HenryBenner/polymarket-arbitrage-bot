@@ -34,7 +34,7 @@ const SHADOW_RUNG_HIGH_CENTS = 25;
 const SHADOW_RUNG_COUNT = SHADOW_RUNG_HIGH_CENTS - SHADOW_RUNG_LOW_CENTS + 1;
 const BINARY_EXPERIMENT_VERSION = "v10-binary-shadow-1";
 
-interface BookSample {
+export interface BookSample {
   timestampMs: number;
   upMid: number | null;
   cheapQueue: number;

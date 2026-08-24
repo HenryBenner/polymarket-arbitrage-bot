@@ -881,6 +881,8 @@ export class PaperTrader implements OrderExecutor {
                   ? "ladder_v6 paired makers / maker-FOK completion"
                   : this.config.strategyMode === "ladder_v10"
                     ? "ladder_v10 regime-gated V7 / strict FOK completion"
+                  : this.config.strategyMode === "ladder_v11"
+                    ? "ladder_v11 BRTI-only low-reversal 40/40 ladder"
                   : this.config.strategyMode === "ladder_v7"
                     ? "ladder_v7 fixed cheap maker / capped favorite FAK"
                     : this.config.strategyMode === "ladder_v8"
@@ -1253,7 +1255,10 @@ export class PaperTrader implements OrderExecutor {
     }
     for (const marketSlug of marketSlugs) {
       if (this.contexts.get(marketSlug)?.marketDataValid === false) continue;
-      if (this.config.strategyMode === "ladder_v10") {
+      if (
+        this.config.strategyMode === "ladder_v10" ||
+        this.config.strategyMode === "ladder_v11"
+      ) {
         // Do not block the WebSocket decoder on strategy work: an active book
         // can otherwise retain every incoming delta in its pending queue.
         void Promise.resolve(this.executionWakeHandler(marketSlug)).catch((error) => {

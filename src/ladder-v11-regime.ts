@@ -1,11 +1,4 @@
-import {
-  appendFile,
-  mkdir,
-  readFile,
-  rename,
-  rm,
-  writeFile,
-} from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { BotConfig } from "./config.js";
 import {
@@ -34,6 +27,7 @@ import type {
   TokenBook,
   UpDownEvent,
 } from "./types.js";
+import { appendRotatingJsonLine } from "./utils/rotating-jsonl.js";
 
 const EPSILON = 1e-9;
 const V11_PREFIX = "ladder-v11:";
@@ -117,6 +111,7 @@ export interface LadderV11DecisionRecord {
   initialDecisionAgeMs: number;
   decisionAgeMs: number | null;
   staleDecisionRecalculated: boolean;
+  executionRevalidated: boolean;
   initialFavorite: string;
   finalFavorite: string;
   initialFavoritePrice: number | null;
@@ -364,6 +359,9 @@ export class LadderV11RegimeEngine {
         throw new Error("Unsupported Ladder V11 regime state");
       }
       this.state = parsed;
+      for (const record of Object.values(this.state.decisions)) {
+        record.executionRevalidated ??= false;
+      }
     } catch (error) {
       const code =
         error && typeof error === "object" && "code" in error
@@ -499,8 +497,11 @@ export class LadderV11RegimeEngine {
       context.latestSnapshot = snapshot;
       this.sampleContext(context, nowMs);
     }
-    const result = this.calculateDecision(event, snapshot, nowMs);
     const existing = this.state.decisions[event.slug];
+    // A normal execution wake never needs to recalculate a frozen decision.
+    // The finalForExecution path intentionally bypasses this shortcut.
+    if (existing && !finalForExecution) return existing.initialDecision;
+    const result = this.calculateDecision(event, snapshot, nowMs);
     // Accumulate BRTI/book history before five minutes without freezing a
     // trade decision. The first persisted decision is the actual entry gate.
     if (!existing && result.reason === "MARKET_TOO_EARLY") return result;
@@ -515,6 +516,7 @@ export class LadderV11RegimeEngine {
         initialDecisionAgeMs: 0,
         decisionAgeMs: null,
         staleDecisionRecalculated: false,
+        executionRevalidated: false,
         initialFavorite: result.favoriteOutcome,
         finalFavorite: result.favoriteOutcome,
         initialFavoritePrice: result.favoritePrice,
@@ -550,6 +552,7 @@ export class LadderV11RegimeEngine {
         };
       }
       existing.finalDecision = final;
+      existing.executionRevalidated = true;
       existing.finalDecisionAt = final.decisionTimestamp;
       existing.initialDecisionAgeMs = age;
       existing.staleDecisionRecalculated ||= age > LADDER_V11_MAX_STORED_DECISION_AGE_MS;
@@ -740,6 +743,32 @@ export class LadderV11RegimeEngine {
     return structuredClone(this.state);
   }
 
+  shouldSkipExecutionPass(
+    event: UpDownEvent,
+    snapshot: MarketExecutionSnapshot,
+    nowSeconds = this.now() / 1_000,
+  ): boolean {
+    const record = this.state.decisions[event.slug];
+    if (!record) return false;
+    const strategyOrders = snapshot.orders.filter(isV11Order);
+    const cheapOpen = snapshot.openOrders.some(
+      (order) => isV11Order(order) && orderRole(order) === "cheap-maker",
+    );
+    const favoriteAttempted = strategyOrders.some(
+      (order) => orderRole(order) === "favorite-initial",
+    );
+    const secondsLeft = event.windowEnd - nowSeconds;
+    // Preserve the existing two-minute cheap-maker cancellation pass.
+    if (secondsLeft <= 120) return !cheapOpen;
+    if (!record.initialDecision.eligible) return true;
+    if (favoriteAttempted) return true;
+    return (
+      record.executionRevalidated &&
+      !record.finalDecision.eligible &&
+      !cheapOpen
+    );
+  }
+
   private calculateDecision(
     event: UpDownEvent,
     snapshot: MarketExecutionSnapshot,
@@ -749,7 +778,9 @@ export class LadderV11RegimeEngine {
     const latest = this.brtiPoints.at(-1);
     const context = this.contexts.get(event.slug);
     const secondsLeft = event.windowEnd - nowMs / 1_000;
-    const score = ranked
+    // Before five minutes V11 only accumulates bounded in-memory history. It
+    // does not need to run the full feature calculation on every book wake.
+    const score = secondsLeft <= 300 && ranked
       ? scoreOscillation({
           points: this.brtiPoints,
           bookSamples: context?.bookSamples ?? [],
@@ -912,11 +943,9 @@ export class LadderV11RegimeEngine {
 
   private async appendEventLog(event: Record<string, unknown>): Promise<void> {
     this.eventLogQueue = this.eventLogQueue.then(async () => {
-      await mkdir(dirname(this.eventLogPath), { recursive: true });
-      await appendFile(
+      await appendRotatingJsonLine(
         this.eventLogPath,
-        `${JSON.stringify({ timestamp: new Date(this.now()).toISOString(), ...event })}\n`,
-        "utf8",
+        { timestamp: new Date(this.now()).toISOString(), ...event },
       );
     });
     await this.eventLogQueue;

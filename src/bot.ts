@@ -1025,6 +1025,9 @@ export class ReverseBot {
       }
       if (snapshot.marketDataValid === false) return;
       await this.ladderV11Regime.observeExecution(event, snapshot);
+      if (this.ladderV11Regime.shouldSkipExecutionPass(event, snapshot)) {
+        return;
+      }
       const initialDecision = await this.ladderV11Regime.evaluate(
         event,
         snapshot,
@@ -1144,20 +1147,25 @@ export class ReverseBot {
       );
     }
     if (submitted === 0 && cancelled === 0) {
-      logThrottled("Watching ladder_v11 market", event.slug, {
-        market: event.title,
-        slug: event.slug,
-        stage: lastPlan?.managementStage ?? "observing",
-        source: lastDecision?.source ?? "none",
-        reversals: lastDecision?.features?.reversals ?? null,
-        v10Score: lastDecision?.v10Score ?? null,
-        decision: lastDecision?.decision ?? "NO_TRADE",
-        reason: lastDecision?.reason ?? "NO_BRTI",
-        reversalThresholds: lastDecision?.reversalThresholds,
-        pairedShares: lastPlan?.pairedShares ?? 0,
-        unmatchedCheapShares: lastPlan?.unmatchedCheapShares ?? 0,
-        unmatchedFavoriteShares: lastPlan?.unmatchedFavoriteShares ?? 0,
-      });
+      logThrottled(
+        "Watching ladder_v11 market",
+        event.slug,
+        {
+          market: event.title,
+          slug: event.slug,
+          stage: lastPlan?.managementStage ?? "observing",
+          source: lastDecision?.source ?? "none",
+          reversals: lastDecision?.features?.reversals ?? null,
+          v10Score: lastDecision?.v10Score ?? null,
+          decision: lastDecision?.decision ?? "NO_TRADE",
+          reason: lastDecision?.reason ?? "NO_BRTI",
+          reversalThresholds: lastDecision?.reversalThresholds,
+          pairedShares: lastPlan?.pairedShares ?? 0,
+          unmatchedCheapShares: lastPlan?.unmatchedCheapShares ?? 0,
+          unmatchedFavoriteShares: lastPlan?.unmatchedFavoriteShares ?? 0,
+        },
+        300_000,
+      );
     }
     this.trader.reportMarket?.(event.slug);
   }

@@ -1,11 +1,4 @@
-import {
-  appendFile,
-  mkdir,
-  readFile,
-  rename,
-  rm,
-  writeFile,
-} from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { ClobClient } from "@polymarket/clob-client-v2";
 import type { BotConfig } from "./config.js";
@@ -17,6 +10,7 @@ import {
   minimumOrderRejection,
   validateOrderMinimum,
 } from "./utils/order-validation.js";
+import { appendRotatingJsonLine } from "./utils/rotating-jsonl.js";
 import type {
   GammaMarket,
   MarketExecutionSnapshot,
@@ -728,9 +722,11 @@ export class PaperTrader implements OrderExecutor {
       .join("|")}:${this.settlementsByMarket.has(marketSlug)}`;
     const previousReport = this.reportStateByMarket.get(marketSlug);
     const now = Date.now();
+    const unchangedReportIntervalMs =
+      this.config.strategyMode === "ladder_v11" ? 300_000 : 30_000;
     if (
       previousReport?.signature === signature &&
-      now - previousReport.loggedAt < 30_000
+      now - previousReport.loggedAt < unchangedReportIntervalMs
     ) {
       return;
     }
@@ -1640,11 +1636,9 @@ export class PaperTrader implements OrderExecutor {
     type: string,
     payload: PaperOrder | PaperFill | PaperSettlement,
   ): Promise<void> {
-    await mkdir(dirname(this.eventLogPath), { recursive: true });
-    await appendFile(
+    await appendRotatingJsonLine(
       this.eventLogPath,
-      `${JSON.stringify({ type, timestamp: new Date().toISOString(), payload })}\n`,
-      "utf8",
+      { type, timestamp: new Date().toISOString(), payload },
     );
   }
 

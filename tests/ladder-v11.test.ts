@@ -314,6 +314,59 @@ test("V11 freezes NO_TRADE when BRTI is unavailable at the entry decision", asyn
   }
 });
 
+test("V11 skips full feature work before five minutes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ladder-v11-observe-"));
+  const clock = 1_800_000_000_000;
+  const provider = new FakeBrtiProvider();
+  try {
+    const event = testEvent();
+    event.windowEnd = clock / 1_000 + 600;
+    const engine = new LadderV11RegimeEngine(
+      testConfig({
+        strategyMode: "ladder_v11",
+        exchange: "kalshi",
+        paperStatePath: directory,
+      }),
+      { providers: [provider], now: () => clock },
+    );
+    await engine.init();
+    emitTrend(provider, clock - 120_000, 120);
+    const observing = await engine.evaluate(event, snapshot(), false, clock);
+    assert.equal(observing.reason, "MARKET_TOO_EARLY");
+    assert.equal(observing.v10Score, null);
+    assert.equal(observing.features, null);
+    assert.equal(engine.snapshotState().decisions[event.slug], undefined);
+    await engine.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("V11 terminal markets skip stream-driven strategy passes until cleanup", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ladder-v11-terminal-"));
+  const clock = 1_800_000_000_000;
+  const provider = new FakeBrtiProvider();
+  try {
+    const event = testEvent();
+    event.windowEnd = clock / 1_000 + 300;
+    const engine = new LadderV11RegimeEngine(
+      testConfig({
+        strategyMode: "ladder_v11",
+        exchange: "kalshi",
+        paperStatePath: directory,
+      }),
+      { providers: [provider], now: () => clock },
+    );
+    await engine.init();
+    const rejected = await engine.evaluate(event, snapshot(), false, clock);
+    assert.equal(rejected.eligible, false);
+    assert.equal(engine.shouldSkipExecutionPass(event, snapshot(), clock / 1_000), true);
+    await engine.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("V11 recomputes aged decisions and rejects execution after reversals rise", async () => {
   const directory = await mkdtemp(join(tmpdir(), "ladder-v11-stale-"));
   let clock = 1_800_000_000_000;
@@ -406,6 +459,7 @@ test("V11 report exposes the three hard execution diagnostics", () => {
       initialDecisionAgeMs: 1_500,
       decisionAgeMs: 100,
       staleDecisionRecalculated: true,
+      executionRevalidated: true,
       initialFavorite: "Down",
       finalFavorite: "Down",
       initialFavoritePrice: 0.6,

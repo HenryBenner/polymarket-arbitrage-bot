@@ -808,6 +808,14 @@ The report includes V11 P&L, selection rate, pair/favorite-only/cheap-only
 cohorts, drawdown, execution-synchronized V7/V10 shadows, stale recalculations,
 stale executions, sub-50-cent favorite fills, and non-BRTI trades.
 
+For small VPS operation, V11 does not calculate features before the five-minute
+entry window, reuses frozen decisions on ordinary book wakes, coalesces pending
+wakes, and stops terminal-market strategy passes except for the two-minute
+cheap-order cleanup. Routine V11 and paper status output is limited to once per
+five minutes when state is unchanged. `ladder-v11-events.jsonl` and
+`paper-events.jsonl` rotate at 5 MiB and retain four archives; process-manager
+stdout/stderr should still use the host's normal PM2 or systemd rotation.
+
 ### Odahoa pair-lock V2
 
 `STRATEGY_MODE=odahoa_ladder_2` keeps V1's BTC market selection, phases,

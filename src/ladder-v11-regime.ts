@@ -35,7 +35,12 @@ const STATE_VERSION = 1;
 const FEATURE_VERSION = "v10-heuristic-1";
 export const LADDER_V11_MAX_REVERSALS = 0.1;
 export const LADDER_V11_MAX_STORED_DECISION_AGE_MS = 1_000;
-const LADDER_V11_BRTI_STALE_MS = 2_000;
+/** The process must have received a BRTI frame within this interval. */
+export const LADDER_V11_BRTI_TRANSPORT_STALE_MS = 2_000;
+/** A newly received replayed/old benchmark value still cannot pass this cap. */
+export const LADDER_V11_BRTI_VALUE_STALE_MS = 10_000;
+/** Retry transient BRTI failures from 5:00 through 4:00 remaining. */
+export const LADDER_V11_BRTI_RECOVERY_CUTOFF_SECONDS = 240;
 
 export type LadderV11RejectionReason =
   | "NO_BRTI"
@@ -73,6 +78,15 @@ export interface LadderV11DecisionSnapshot {
   brtiTimestamp: string | null;
   brtiTimestampMs: number | null;
   brtiAgeMs: number | null;
+  brtiReceivedAt?: string | null;
+  brtiReceivedAtMs?: number | null;
+  brtiReceivedAgeMs?: number | null;
+  brtiObservedAt?: string | null;
+  brtiObservedAtMs?: number | null;
+  brtiObservedAgeMs?: number | null;
+  brtiSequenceValid?: boolean | null;
+  brtiCoverage?: number | null;
+  brtiScoreReason?: string | null;
   cheapTokenId: string;
   cheapOutcome: string;
   cheapPrice: number | null;
@@ -146,6 +160,9 @@ interface MarketContext {
   lastAskDepth: number | null;
   pendingTradeFlow: number;
   latestSnapshot: MarketExecutionSnapshot | null;
+  transientDecisionSecond: number;
+  transientDecisionPointKey: string;
+  transientDecision: LadderV11DecisionSnapshot | null;
 }
 
 export interface LadderV11RegimeOptions {
@@ -165,6 +182,35 @@ function emptyState(): LadderV11State {
 function round(value: number, places = 8): number {
   const factor = 10 ** places;
   return Math.round((value + Number.EPSILON) * factor) / factor;
+}
+
+function timestamp(value: number | undefined): string | null {
+  return value !== undefined && Number.isFinite(value)
+    ? new Date(value).toISOString()
+    : null;
+}
+
+function ageMs(nowMs: number, value: number | undefined): number | null {
+  return value !== undefined && Number.isFinite(value)
+    ? Math.max(0, nowMs - value)
+    : null;
+}
+
+function isTransientBrtiFailure(
+  reason: LadderV11DecisionSnapshot["reason"],
+): boolean {
+  return reason === "NO_BRTI" || reason === "INVALID_BRTI";
+}
+
+function pointKey(point: RegimePricePoint | undefined): string {
+  if (!point) return "none";
+  return [
+    point.timestampMs,
+    point.observedAtMs ?? "",
+    point.receivedAtMs ?? "",
+    point.sequence ?? "",
+    point.price,
+  ].join(":");
 }
 
 function cloneBooks(books: readonly TokenBook[]): TokenBook[] {
@@ -401,6 +447,9 @@ export class LadderV11RegimeEngine {
         lastAskDepth: null,
         pendingTradeFlow: 0,
         latestSnapshot: null,
+        transientDecisionSecond: -1,
+        transientDecisionPointKey: "",
+        transientDecision: null,
       });
     }
     const ticker = event.market.externalMarketId ?? event.market.id;
@@ -501,10 +550,41 @@ export class LadderV11RegimeEngine {
     // A normal execution wake never needs to recalculate a frozen decision.
     // The finalForExecution path intentionally bypasses this shortcut.
     if (existing && !finalForExecution) return existing.initialDecision;
+    const decisionSecond = Math.floor(nowMs / 1_000);
+    const currentPointKey = pointKey(this.brtiPoints.at(-1));
+    // Book updates can wake the strategy many times per second. While waiting
+    // for BRTI recovery, reuse the transient result until either the second or
+    // the latest BRTI point changes.
+    if (
+      !existing &&
+      !finalForExecution &&
+      context?.transientDecision &&
+      context.transientDecisionSecond === decisionSecond &&
+      context.transientDecisionPointKey === currentPointKey
+    ) {
+      return context.transientDecision;
+    }
     const result = this.calculateDecision(event, snapshot, nowMs);
     // Accumulate BRTI/book history before five minutes without freezing a
     // trade decision. The first persisted decision is the actual entry gate.
     if (!existing && result.reason === "MARKET_TOO_EARLY") return result;
+    // A short BRTI-only recovery window prevents a momentary transport delay
+    // at exactly 5:00 from freezing the market for its entire lifetime. No
+    // decision is persisted or logged until BRTI recovers or the window ends.
+    if (
+      !existing &&
+      isTransientBrtiFailure(result.reason) &&
+      event.windowEnd - nowMs / 1_000 >
+        LADDER_V11_BRTI_RECOVERY_CUTOFF_SECONDS
+    ) {
+      if (context) {
+        context.transientDecisionSecond = decisionSecond;
+        context.transientDecisionPointKey = currentPointKey;
+        context.transientDecision = result;
+      }
+      return result;
+    }
+    if (context) context.transientDecision = null;
     if (!existing) {
       const ranked = rankBooks(snapshot.books);
       const record: LadderV11DecisionRecord = {
@@ -776,6 +856,8 @@ export class LadderV11RegimeEngine {
   ): LadderV11DecisionSnapshot {
     const ranked = rankBooks(snapshot.books);
     const latest = this.brtiPoints.at(-1);
+    const latestObservedAtMs =
+      latest?.observedAtMs ?? latest?.receivedAtMs ?? latest?.timestampMs;
     const context = this.contexts.get(event.slug);
     const secondsLeft = event.windowEnd - nowMs / 1_000;
     // Before five minutes V11 only accumulates bounded in-memory history. It
@@ -792,7 +874,10 @@ export class LadderV11RegimeEngine {
           volatilityP10: null,
           volatilityP90: null,
           pairHistory: this.state.pairHistory.map((item) => item.paired),
-          staleMs: LADDER_V11_BRTI_STALE_MS,
+          staleMs: LADDER_V11_BRTI_TRANSPORT_STALE_MS,
+          latestObservedAtMs,
+          sourceValueStaleMs: LADDER_V11_BRTI_VALUE_STALE_MS,
+          priceWindowNowMs: latest?.timestampMs,
         })
       : null;
     const reversals = score?.valid ? score.features.reversals : null;
@@ -830,6 +915,15 @@ export class LadderV11RegimeEngine {
       brtiTimestamp: latest ? new Date(latest.timestampMs).toISOString() : null,
       brtiTimestampMs: latest?.timestampMs ?? null,
       brtiAgeMs: latest ? Math.max(0, nowMs - latest.timestampMs) : null,
+      brtiReceivedAt: timestamp(latest?.receivedAtMs),
+      brtiReceivedAtMs: latest?.receivedAtMs ?? null,
+      brtiReceivedAgeMs: ageMs(nowMs, latest?.receivedAtMs),
+      brtiObservedAt: timestamp(latest?.observedAtMs),
+      brtiObservedAtMs: latest?.observedAtMs ?? null,
+      brtiObservedAgeMs: ageMs(nowMs, latest?.observedAtMs),
+      brtiSequenceValid: latest?.sequenceValid ?? null,
+      brtiCoverage: score?.coverage ?? null,
+      brtiScoreReason: score?.reason ?? null,
       cheapTokenId: cheap?.tokenId ?? "",
       cheapOutcome: cheap?.outcome ?? "",
       cheapPrice: cheap?.bestAsk ?? null,
@@ -928,6 +1022,13 @@ export class LadderV11RegimeEngine {
       cheapTokenId: decision.cheapTokenId,
       brtiTimestamp: decision.brtiTimestamp,
       brtiAgeMs: decision.brtiAgeMs,
+      brtiReceivedAt: decision.brtiReceivedAt ?? null,
+      brtiReceivedAgeMs: decision.brtiReceivedAgeMs ?? null,
+      brtiObservedAt: decision.brtiObservedAt ?? null,
+      brtiObservedAgeMs: decision.brtiObservedAgeMs ?? null,
+      brtiSequenceValid: decision.brtiSequenceValid ?? null,
+      brtiCoverage: decision.brtiCoverage ?? null,
+      brtiScoreReason: decision.brtiScoreReason ?? null,
     };
     log("Ladder V11 decision", payload);
     await this.appendEventLog({ event: "decision", ...payload });

@@ -387,12 +387,27 @@ export function scoreOscillation(input: {
   volatilityP90: number | null;
   pairHistory: boolean[];
   staleMs: number;
+  /**
+   * Optional transport timestamp used only to decide whether the feed is live.
+   * V10 omits this and retains its original source-timestamp behavior.
+   */
+  latestObservedAtMs?: number | null;
+  /** Separate hard cap for the age of the source's published value. */
+  sourceValueStaleMs?: number;
+  /** End of the price history windows; useful for delayed published values. */
+  priceWindowNowMs?: number;
 }): OscillationScore {
   const latest = input.points.at(-1);
-  const coverage = sourceCoverage(input.points, input.nowMs, 120);
+  const priceWindowNowMs = input.priceWindowNowMs ?? input.nowMs;
+  const coverage = sourceCoverage(input.points, priceWindowNowMs, 120);
+  const latestObservedAtMs = input.latestObservedAtMs ?? latest?.timestampMs;
+  const sourceValueStaleMs = input.sourceValueStaleMs ?? input.staleMs;
   if (
     !latest ||
-    input.nowMs - latest.timestampMs > input.staleMs ||
+    latestObservedAtMs === undefined ||
+    latestObservedAtMs === null ||
+    input.nowMs - latestObservedAtMs > input.staleMs ||
+    input.nowMs - latest.timestampMs > sourceValueStaleMs ||
     coverage < 0.95
   ) {
     return {
@@ -408,7 +423,7 @@ export function scoreOscillation(input: {
 
   const windows = [30, 60, 120];
   const paths = windows.map((seconds) =>
-    windowPathFeatures(windowPoints(input.points, input.nowMs, seconds)),
+    windowPathFeatures(windowPoints(input.points, priceWindowNowMs, seconds)),
   );
   const volatilityRaw = mean(paths.map((path) => path.volatility));
   const p10 = input.volatilityP10 ?? 0;

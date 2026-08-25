@@ -10,12 +10,16 @@ export type RegimePriceSource = "brti" | "coinbase" | "kalshi_proxy";
 
 export interface RegimePricePoint {
   source: RegimePriceSource;
+  /** Timestamp published by the underlying price source. */
   timestampMs: number;
   price: number;
   sequence?: number;
   subscriptionId?: number;
   sequenceValid?: boolean;
+  /** Timestamp reported by the upstream transport, when provided. */
   receivedAtMs?: number;
+  /** Local wall-clock time when this process received the WebSocket frame. */
+  observedAtMs?: number;
   trailing60SecondAverage?: number;
   finalMinuteAverage15m?: number;
   finalMinuteWindowSize?: number;
@@ -251,6 +255,7 @@ export class KalshiBrtiProvider extends ReconnectingProvider {
   }
 
   protected handleMessage(data: unknown): void {
+    const observedAtMs = Date.now();
     const text = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
     try {
       const protocol = parseBrtiProtocolMessage(JSON.parse(text));
@@ -273,7 +278,7 @@ export class KalshiBrtiProvider extends ReconnectingProvider {
         }
         this.lastSequenceBySid.set(protocol.sid, protocol.sequence);
       }
-      this.onPoint?.(protocol.point);
+      this.onPoint?.({ ...protocol.point, observedAtMs });
     } catch {
       // Ignore non-JSON protocol frames.
     }

@@ -162,6 +162,24 @@ function emitTrend(
   }
 }
 
+function emitDelayedTrend(
+  provider: FakeBrtiProvider,
+  nowMs: number,
+  benchmarkDelayMs: number,
+): void {
+  const latestBenchmarkMs = nowMs - benchmarkDelayMs;
+  for (let index = 0; index <= 120; index += 1) {
+    const timestampMs = latestBenchmarkMs - (120 - index) * 1_000;
+    provider.emit({
+      source: "brti",
+      timestampMs,
+      observedAtMs: timestampMs + benchmarkDelayMs,
+      price: 60_000 + index,
+      sequenceValid: true,
+    });
+  }
+}
+
 test("V11 has only zero or fixed 40/40 orders at 10c and 80c", async () => {
   await withTracker(async (tracker) => {
     const event = testEvent();
@@ -288,7 +306,7 @@ test("V11 trades a complete low-reversal BRTI path without using score as a gate
   }
 });
 
-test("V11 freezes NO_TRADE when BRTI is unavailable at the entry decision", async () => {
+test("V11 keeps a transient missing-BRTI decision retryable during recovery", async () => {
   const directory = await mkdtemp(join(tmpdir(), "ladder-v11-no-brti-"));
   const clock = 1_800_000_000_000;
   const provider = new FakeBrtiProvider();
@@ -308,6 +326,13 @@ test("V11 freezes NO_TRADE when BRTI is unavailable at the entry decision", asyn
     assert.equal(missing.source, "none");
     assert.equal(missing.eligible, false);
     assert.equal(missing.reason, "NO_BRTI");
+    assert.equal(engine.snapshotState().decisions[event.slug], undefined);
+    assert.equal(
+      engine.shouldSkipExecutionPass(event, snapshot(), clock / 1_000),
+      false,
+    );
+    const cached = await engine.evaluate(event, snapshot(), false, clock + 100);
+    assert.strictEqual(cached, missing);
     await engine.close();
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -342,8 +367,35 @@ test("V11 skips full feature work before five minutes", async () => {
   }
 });
 
-test("V11 terminal markets skip stream-driven strategy passes until cleanup", async () => {
+test("V11 freezes a missing-BRTI market after the bounded recovery window", async () => {
   const directory = await mkdtemp(join(tmpdir(), "ladder-v11-terminal-"));
+  const clock = 1_800_000_000_000;
+  const provider = new FakeBrtiProvider();
+  try {
+    const event = testEvent();
+    event.windowEnd = clock / 1_000 + 240;
+    const engine = new LadderV11RegimeEngine(
+      testConfig({
+        strategyMode: "ladder_v11",
+        exchange: "kalshi",
+        paperStatePath: directory,
+      }),
+      { providers: [provider], now: () => clock },
+    );
+    await engine.init();
+    const rejected = await engine.evaluate(event, snapshot(), false, clock);
+    assert.equal(rejected.eligible, false);
+    assert.equal(rejected.reason, "NO_BRTI");
+    assert.ok(engine.snapshotState().decisions[event.slug]);
+    assert.equal(engine.shouldSkipExecutionPass(event, snapshot(), clock / 1_000), true);
+    await engine.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("V11 accepts a live BRTI feed with a delayed benchmark timestamp", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ladder-v11-delayed-brti-"));
   const clock = 1_800_000_000_000;
   const provider = new FakeBrtiProvider();
   try {
@@ -358,9 +410,74 @@ test("V11 terminal markets skip stream-driven strategy passes until cleanup", as
       { providers: [provider], now: () => clock },
     );
     await engine.init();
-    const rejected = await engine.evaluate(event, snapshot(), false, clock);
-    assert.equal(rejected.eligible, false);
-    assert.equal(engine.shouldSkipExecutionPass(event, snapshot(), clock / 1_000), true);
+    emitDelayedTrend(provider, clock, 4_000);
+    const result = await engine.evaluate(event, snapshot(), false, clock);
+    assert.equal(result.eligible, true);
+    assert.equal(result.source, "brti");
+    assert.equal(result.brtiAgeMs, 4_000);
+    assert.equal(result.brtiObservedAgeMs, 0);
+    assert.equal(result.brtiSequenceValid, true);
+    assert.ok((result.brtiCoverage ?? 0) >= 0.95);
+    await engine.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("V11 rejects an old benchmark value even when it was just received", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ladder-v11-old-brti-"));
+  const clock = 1_800_000_000_000;
+  const provider = new FakeBrtiProvider();
+  try {
+    const event = testEvent();
+    event.windowEnd = clock / 1_000 + 240;
+    const engine = new LadderV11RegimeEngine(
+      testConfig({
+        strategyMode: "ladder_v11",
+        exchange: "kalshi",
+        paperStatePath: directory,
+      }),
+      { providers: [provider], now: () => clock },
+    );
+    await engine.init();
+    emitDelayedTrend(provider, clock, 11_000);
+    const result = await engine.evaluate(event, snapshot(), false, clock);
+    assert.equal(result.eligible, false);
+    assert.equal(result.reason, "INVALID_BRTI");
+    assert.equal(result.brtiScoreReason, "stale_source");
+    assert.equal(result.brtiAgeMs, 11_000);
+    assert.equal(result.brtiObservedAgeMs, 0);
+    await engine.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("V11 can recover and trade before the BRTI retry window closes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ladder-v11-brti-recovery-"));
+  let clock = 1_800_000_000_000;
+  const provider = new FakeBrtiProvider();
+  try {
+    const event = testEvent();
+    event.windowEnd = clock / 1_000 + 300;
+    const engine = new LadderV11RegimeEngine(
+      testConfig({
+        strategyMode: "ladder_v11",
+        exchange: "kalshi",
+        paperStatePath: directory,
+      }),
+      { providers: [provider], now: () => clock },
+    );
+    await engine.init();
+    const missing = await engine.evaluate(event, snapshot(), false, clock);
+    assert.equal(missing.reason, "NO_BRTI");
+    assert.equal(engine.snapshotState().decisions[event.slug], undefined);
+
+    clock += 15_000;
+    emitDelayedTrend(provider, clock, 4_000);
+    const recovered = await engine.evaluate(event, snapshot(), false, clock);
+    assert.equal(recovered.eligible, true);
+    assert.ok(engine.snapshotState().decisions[event.slug]);
     await engine.close();
   } finally {
     await rm(directory, { recursive: true, force: true });

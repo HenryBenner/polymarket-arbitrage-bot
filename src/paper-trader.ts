@@ -723,7 +723,10 @@ export class PaperTrader implements OrderExecutor {
     const previousReport = this.reportStateByMarket.get(marketSlug);
     const now = Date.now();
     const unchangedReportIntervalMs =
-      this.config.strategyMode === "ladder_v11" ? 300_000 : 30_000;
+      this.config.strategyMode === "ladder_v11" ||
+      this.config.strategyMode === "ladder_v12"
+        ? 300_000
+        : 30_000;
     if (
       previousReport?.signature === signature &&
       now - previousReport.loggedAt < unchangedReportIntervalMs
@@ -879,6 +882,8 @@ export class PaperTrader implements OrderExecutor {
                     ? "ladder_v10 regime-gated V7 / strict FOK completion"
                   : this.config.strategyMode === "ladder_v11"
                     ? "ladder_v11 BRTI-only low-reversal 40/40 ladder"
+                  : this.config.strategyMode === "ladder_v12"
+                    ? "ladder_v12 BRTI 0/20/40 cheap-first completion ladder"
                   : this.config.strategyMode === "ladder_v7"
                     ? "ladder_v7 fixed cheap maker / capped favorite FAK"
                     : this.config.strategyMode === "ladder_v8"
@@ -1253,7 +1258,8 @@ export class PaperTrader implements OrderExecutor {
       if (this.contexts.get(marketSlug)?.marketDataValid === false) continue;
       if (
         this.config.strategyMode === "ladder_v10" ||
-        this.config.strategyMode === "ladder_v11"
+        this.config.strategyMode === "ladder_v11" ||
+        this.config.strategyMode === "ladder_v12"
       ) {
         // Do not block the WebSocket decoder on strategy work: an active book
         // can otherwise retain every incoming delta in its pending queue.

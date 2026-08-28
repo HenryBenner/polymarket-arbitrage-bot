@@ -11,7 +11,8 @@ export type StrategyMode =
   | "ladder_v8"
   | "ladder_v9"
   | "ladder_v10"
-  | "ladder_v11";
+  | "ladder_v11"
+  | "ladder_v12";
 export type ExecutionMode = "dry_run" | "paper" | "live";
 export type ExchangeName = "polymarket" | "kalshi";
 export type LadderPreset = "odahoa_v1";

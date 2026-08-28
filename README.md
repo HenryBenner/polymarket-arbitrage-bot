@@ -236,6 +236,17 @@ Implementation:
 - `src/ladder-v11-regime.ts`
 - `src/ladder-v11-report.ts`
 
+### `ladder_v12`
+
+A scored, cheap-first BTC strategy that recalculates V10's BRTI oscillation score from five through two minutes remaining. The score targets 0, 20, or 40 cheap-side shares at a fixed 10-cent post-only price.
+
+The opposite outcome is ordered only after cheap shares fill. Each completion is an exact-size FOK constrained by visible depth and a fee-adjusted all-in pair-cost cap of `0.95`. V12 revalidates the BRTI state, outcome roles, inventory, completion price, and depth immediately before execution, and never lets either side exceed 40 shares.
+
+Implementation:
+
+- `src/ladder-v12.ts`
+- `src/ladder-v12-regime.ts`
+
 ## Paper trading engine
 
 `src/paper-trader.ts` is a full execution backend rather than a simple log-only mock.
@@ -317,6 +328,7 @@ There are also strategy-specific examples such as:
 .env.ladder-v9-paper.example
 .env.ladder-v10-paper.example
 .env.ladder-v11-paper.example
+.env.ladder-v12-paper.example
 .env.kalshi-paper.example
 ```
 
@@ -395,7 +407,7 @@ Coverage includes:
 - order validation
 - pair locking
 - static maker logic
-- ladder strategies V5 through V11
+- ladder strategies V5 through V12
 - multi-market strategy behavior
 - regression tests for the original reversal strategy
 - rotating JSONL storage
@@ -462,6 +474,8 @@ src/
 ├── ladder-v10-regime.ts      V10 regime engine
 ├── ladder-v11.ts             V11 strategy planner
 ├── ladder-v11-regime.ts      V11 regime engine
+├── ladder-v12.ts             V12 strategy planner
+├── ladder-v12-regime.ts      V12 regime engine
 ├── regime-price-stream.ts    External regime price feed
 │
 ├── ladder-v10-report.ts      V10 analysis/reporting

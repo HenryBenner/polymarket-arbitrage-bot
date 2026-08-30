@@ -247,6 +247,18 @@ Implementation:
 - `src/ladder-v12.ts`
 - `src/ladder-v12-regime.ts`
 
+### `ladder_v13`
+
+A BTC-specific, direction-agnostic Kalshi pair-arbitrage market maker. V13 derives a common YES-space microprice from both complementary books, applies inventory skew, and evaluates fee-adjusted pair-edge rungs from 2 through 10 cents. It quotes only positive-EV post-only pairs using Bayesian-smoothed historical fill outcomes and persists the learned buckets under `PAPER_STATE_PATH`.
+
+Confirmed one-sided fills immediately stop further orders on the surplus outcome. V13 then uses exact visible depth for a profitable FOK completion or posts the missing maker leg at the highest fee-aware price that preserves its dynamic required edge. It permits at most 40 completed pairs, caps unmatched inventory at 10 shares (5 inside three minutes), creates no new inventory in the final minute, and uses a reduce-only FOK sale to flatten residual exposure in the final 15 seconds when a profitable pair is unavailable. It does not initialize or consult any BRTI regime engine.
+
+Implementation:
+
+- `src/ladder-v13.ts`
+- `src/ladder-v13-history.ts`
+- `.env.ladder-v13-paper.example`
+
 ## Paper trading engine
 
 `src/paper-trader.ts` is a full execution backend rather than a simple log-only mock.

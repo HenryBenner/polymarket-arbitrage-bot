@@ -182,21 +182,26 @@ export class KalshiClient {
     price: number;
     timeInForce: "fill_or_kill" | "immediate_or_cancel" | "good_till_canceled";
     postOnly: boolean;
+    action?: "buy" | "sell";
   }): Promise<KalshiOrderResponse> {
     const yesPrice = input.outcome === "yes" ? input.price : 1 - input.price;
+    const buying = (input.action ?? "buy") === "buy";
+    const bookSide = buying
+      ? input.outcome === "yes" ? "bid" : "ask"
+      : input.outcome === "yes" ? "ask" : "bid";
     return this.request<KalshiOrderResponse>("/portfolio/events/orders", {
       method: "POST",
       body: {
         ticker: input.ticker,
         client_order_id: input.clientOrderId,
-        side: input.outcome === "yes" ? "bid" : "ask",
+        side: bookSide,
         count: input.count.toFixed(2),
         price: yesPrice.toFixed(4),
         time_in_force: input.timeInForce,
         self_trade_prevention_type: "taker_at_cross",
         post_only: input.postOnly,
         cancel_order_on_pause: true,
-        reduce_only: false,
+        reduce_only: !buying,
         subaccount: this.config.kalshiSubaccount,
         exchange_index: 0,
       },

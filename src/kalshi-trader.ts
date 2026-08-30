@@ -153,6 +153,116 @@ export class KalshiTrader implements OrderExecutor {
     );
   }
 
+  async placeSell(opportunity: TradeOpportunity): Promise<OrderResult> {
+    return this.serializeExecution(opportunity.event.slug, () =>
+      this.placeSellLocked(opportunity),
+    );
+  }
+
+  private async placeSellLocked(
+    opportunity: TradeOpportunity,
+  ): Promise<OrderResult> {
+    const minimumFailure = validateOrderMinimum(opportunity);
+    if (minimumFailure) {
+      return minimumOrderRejection(
+        opportunity,
+        minimumFailure,
+        this.config.dryRun,
+      );
+    }
+    const token = parseKalshiTokenId(opportunity.token.tokenId);
+    if (!token) throw new Error(`Invalid Kalshi token ID: ${opportunity.token.tokenId}`);
+    const existing = this.state.orders.find(
+      (order) => order.tradeKey === opportunity.tradeKey,
+    );
+    if (existing) {
+      return {
+        dryRun: this.config.dryRun,
+        accepted: true,
+        tokenId: existing.tokenId,
+        side: "SELL",
+        price: existing.limitPrice,
+        size: existing.originalSize,
+        response: { duplicate: true, order_id: existing.id },
+      };
+    }
+    const position = derivePositions(
+      this.state.fills.filter((fill) => fill.marketSlug === opportunity.event.slug),
+    ).find((candidate) => candidate.tokenId === opportunity.token.tokenId);
+    if (!this.config.dryRun && (!position || position.shares + 1e-8 < opportunity.size)) {
+      return {
+        dryRun: false,
+        accepted: false,
+        tokenId: opportunity.token.tokenId,
+        side: "SELL",
+        price: opportunity.price,
+        size: opportunity.size,
+        response: { status: "rejected", reason: "position_too_small" },
+      };
+    }
+    if (this.config.dryRun) {
+      return {
+        dryRun: true,
+        accepted: true,
+        tokenId: opportunity.token.tokenId,
+        side: "SELL",
+        price: opportunity.price,
+        size: opportunity.size,
+      };
+    }
+    const timeInForce = opportunity.orderPolicy === "fok"
+      ? "fill_or_kill"
+      : opportunity.orderPolicy === "fak"
+        ? "immediate_or_cancel"
+        : "good_till_canceled";
+    const response = await this.client.createOrder({
+      ticker: token.ticker,
+      clientOrderId: crypto.randomUUID(),
+      outcome: token.outcome,
+      count: opportunity.size,
+      price: opportunity.price,
+      timeInForce,
+      postOnly: opportunity.orderPolicy === "post_only",
+      action: "sell",
+    });
+    const filled = Number(response.fill_count) || 0;
+    const remaining = Number(response.remaining_count) || 0;
+    this.state.orders.push({
+      id: response.order_id,
+      tradeKey: opportunity.tradeKey,
+      marketSlug: opportunity.event.slug,
+      marketTitle: opportunity.event.title,
+      conditionId: token.ticker,
+      tokenId: opportunity.token.tokenId,
+      outcome: opportunity.token.outcome,
+      limitPrice: opportunity.price,
+      originalSize: opportunity.size,
+      remainingSize: remaining,
+      queueAhead: 0,
+      status: remaining <= 1e-8
+        ? filled > 0 ? "filled" : "cancelled"
+        : filled > 0 ? "partial" : "open",
+      side: "SELL",
+      phaseId: opportunity.phaseId,
+      pairId: opportunity.pairId,
+      orderPolicy: opportunity.orderPolicy ?? "fak",
+      createdAt: new Date().toISOString(),
+      submittedMinutesLeft:
+        (opportunity.event.windowEnd - Date.now() / 1_000) / 60,
+    });
+    this.expectedFillCounts.set(response.order_id, filled);
+    await this.persist();
+    return {
+      dryRun: false,
+      accepted: true,
+      tokenId: opportunity.token.tokenId,
+      side: "SELL",
+      price: opportunity.price,
+      size: opportunity.size,
+      response,
+    };
+  }
+
   private async placeBuyLocked(
     opportunity: TradeOpportunity,
   ): Promise<OrderResult> {
@@ -475,11 +585,19 @@ export class KalshiTrader implements OrderExecutor {
     );
     const positions = derivePositions(fills);
     const capitalUsed = fills.reduce(
-      (sum, fill) => sum + fill.price * fill.size + fill.fee,
+      (sum, fill) =>
+        sum +
+        ((fill.side ?? "BUY") === "SELL"
+          ? -fill.price * fill.size
+          : fill.price * fill.size) +
+        fill.fee,
       0,
     );
     const openCommitted = openOrders.reduce(
-      (sum, order) => sum + order.limitPrice * order.remainingSize,
+      (sum, order) =>
+        sum + ((order.side ?? "BUY") === "BUY"
+          ? order.limitPrice * order.remainingSize
+          : 0),
       0,
     );
     return structuredClone({
@@ -544,14 +662,20 @@ export class KalshiTrader implements OrderExecutor {
       (fill) => fill.marketSlug === marketSlug,
     );
     const capitalUsed = fills.reduce(
-      (sum, fill) => sum + fill.price * fill.size + fill.fee,
+      (sum, fill) =>
+        sum +
+        ((fill.side ?? "BUY") === "SELL"
+          ? -fill.price * fill.size
+          : fill.price * fill.size) +
+        fill.fee,
       0,
     );
     const openCommitted = this.state.orders
       .filter(
         (order) =>
           order.marketSlug === marketSlug &&
-          (order.status === "open" || order.status === "partial"),
+          (order.status === "open" || order.status === "partial") &&
+          (order.side ?? "BUY") === "BUY",
       )
       .reduce(
         (sum, order) =>
@@ -564,7 +688,9 @@ export class KalshiTrader implements OrderExecutor {
   private availableCashForOrders(): number {
     const openCommitted = this.state.orders
       .filter(
-        (order) => order.status === "open" || order.status === "partial",
+        (order) =>
+          (order.status === "open" || order.status === "partial") &&
+          (order.side ?? "BUY") === "BUY",
       )
       .reduce(
         (sum, order) => sum + order.limitPrice * order.remainingSize,
@@ -719,7 +845,7 @@ export class KalshiTrader implements OrderExecutor {
       size,
       fee,
       liquidity: event.is_taker ? "taker" : "maker",
-      side: "BUY",
+      side: order.side ?? "BUY",
       timestamp: new Date(
         Number(event.ts_ms) || Number(event.ts) * 1_000 || Date.now(),
       ).toISOString(),
@@ -734,9 +860,13 @@ export class KalshiTrader implements OrderExecutor {
       this.unconfirmedOrderReservations.delete(order.id);
       this.expectedFillCounts.delete(order.id);
     }
-    this.lastAvailableCash = round(
-      Math.max(0, this.lastAvailableCash - price * size - fee),
-    );
+    this.lastAvailableCash = round(Math.max(
+      0,
+      this.lastAvailableCash +
+        ((order.side ?? "BUY") === "SELL"
+          ? price * size - fee
+          : -price * size - fee),
+    ));
     await this.persist();
     this.notifyExecutionWake(marketSlug, "fill");
   }
@@ -895,7 +1025,7 @@ function addFill(
     size,
     fee: Math.max(0, Number(remote.fee_cost) || 0),
     liquidity: remote.is_taker ? "taker" : "maker",
-    side: "BUY",
+    side: order.side ?? "BUY",
     timestamp:
       remote.created_time ??
       new Date((remote.ts ?? Date.now() / 1_000) * 1_000).toISOString(),
@@ -936,17 +1066,18 @@ function parseBookLevels(
 function derivePositions(fills: PaperFill[]): PaperPosition[] {
   const result = new Map<string, PaperPosition>();
   for (const fill of fills) {
+    const sign = (fill.side ?? "BUY") === "SELL" ? -1 : 1;
     const existing = result.get(fill.tokenId);
     if (existing) {
-      existing.shares = round(existing.shares + fill.size);
-      existing.totalCost = round(existing.totalCost + fill.price * fill.size);
+      existing.shares = round(existing.shares + sign * fill.size);
+      existing.totalCost = round(existing.totalCost + sign * fill.price * fill.size);
     } else {
       result.set(fill.tokenId, {
         marketSlug: fill.marketSlug,
         tokenId: fill.tokenId,
         outcome: fill.outcome,
-        shares: fill.size,
-        totalCost: round(fill.price * fill.size),
+        shares: sign * fill.size,
+        totalCost: round(sign * fill.price * fill.size),
       });
     }
   }

@@ -147,6 +147,16 @@ test("Kalshi order entry maps Up to a YES bid and Down to a complementary YES as
       timeInForce: "fill_or_kill",
       postOnly: false,
     });
+    await client.createOrder({
+      ticker: "KXBTC15M-TEST",
+      clientOrderId: "flatten-yes",
+      outcome: "yes",
+      count: 10,
+      price: 0.4,
+      timeInForce: "fill_or_kill",
+      postOnly: false,
+      action: "sell",
+    });
     await client.amendOrder({
       orderId: "order-1",
       ticker: "KXBTC15M-TEST",
@@ -163,10 +173,13 @@ test("Kalshi order entry maps Up to a YES bid and Down to a complementary YES as
   assert.equal(requests[1]?.side, "ask");
   assert.equal(requests[1]?.price, "0.6500");
   assert.equal(requests[1]?.time_in_force, "fill_or_kill");
-  assert.match(requestUrls[2]!, /portfolio\/events\/orders\/order-1\/amend$/);
   assert.equal(requests[2]?.side, "ask");
-  assert.equal(requests[2]?.price, "0.8500");
-  assert.equal(requests[2]?.count, "20.00");
+  assert.equal(requests[2]?.price, "0.4000");
+  assert.equal(requests[2]?.reduce_only, true);
+  assert.match(requestUrls[3]!, /portfolio\/events\/orders\/order-1\/amend$/);
+  assert.equal(requests[3]?.side, "ask");
+  assert.equal(requests[3]?.price, "0.8500");
+  assert.equal(requests[3]?.count, "20.00");
 });
 
 test("Kalshi balance is loaded from the configured subaccount in dollars", async () => {

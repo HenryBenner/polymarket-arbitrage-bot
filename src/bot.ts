@@ -27,6 +27,13 @@ import {
   planLadderV12,
 } from "./ladder-v12.js";
 import {
+  LADDER_V13_CANDIDATE_EDGES,
+  LADDER_V13_MAX_PAIRED_SHARES,
+  LADDER_V13_MAX_UNPAIRED_SHARES,
+  planLadderV13,
+} from "./ladder-v13.js";
+import { LadderV13HistoryStore } from "./ladder-v13-history.js";
+import {
   LADDER_V12_MAX_STORED_DECISION_AGE_MS,
   LadderV12RegimeEngine,
   type LadderV12DecisionSnapshot,
@@ -71,6 +78,7 @@ export class ReverseBot {
   private readonly ladderV10Events = new Map<string, UpDownEvent>();
   private readonly ladderV11Events = new Map<string, UpDownEvent>();
   private readonly ladderV12Events = new Map<string, UpDownEvent>();
+  private readonly ladderV13Events = new Map<string, UpDownEvent>();
   private readonly ladderV55Events = new Map<string, UpDownEvent>();
   private readonly ladderV55Queues = new Map<string, Promise<void>>();
   private readonly ladderV6Queues = new Map<string, Promise<void>>();
@@ -83,6 +91,9 @@ export class ReverseBot {
   private readonly ladderV11WakePending = new Set<string>();
   private readonly ladderV12Queues = new Map<string, Promise<void>>();
   private readonly ladderV12WakePending = new Set<string>();
+  private readonly ladderV13Queues = new Map<string, Promise<void>>();
+  private readonly ladderV13WakePending = new Set<string>();
+  private ladderV13History: LadderV13HistoryStore | null = null;
   private readonly marketQueues = new Map<string, Promise<void>>();
   private ladderTickRunning = false;
   private readonly ladderV10Regime: LadderV10RegimeEngine | null;
@@ -131,6 +142,8 @@ export class ReverseBot {
                       ? "ladder-v11-state.json"
                       : config.strategyMode === "ladder_v12"
                         ? "ladder-v12-state.json"
+                        : config.strategyMode === "ladder_v13"
+                          ? "ladder-v13-state.json"
                         : "ladder-state.json",
     );
     this.trader.setExecutionWakeHandler?.((marketSlug) =>
@@ -148,6 +161,8 @@ export class ReverseBot {
                 ? this.enqueueLadderV11Market(marketSlug)
                 : this.config.strategyMode === "ladder_v12"
                   ? this.enqueueLadderV12Market(marketSlug)
+                  : this.config.strategyMode === "ladder_v13"
+                    ? this.enqueueLadderV13Market(marketSlug)
                   : this.enqueueLadderV8Market(marketSlug),
     );
     if (this.ladderV10Regime) {
@@ -180,6 +195,17 @@ export class ReverseBot {
         this.ladderV12WakePending.delete(settlement.marketSlug);
       });
     }
+    if (this.config.strategyMode === "ladder_v13") {
+      this.trader.setSettlementHandler?.(async (settlement) => {
+        const event = this.ladderV13Events.get(settlement.marketSlug);
+        const snapshot = this.trader.getMarketExecutionSnapshot?.(settlement.marketSlug);
+        if (event && snapshot) {
+          await this.ladderV13History?.finalize(event, snapshot);
+        }
+        this.ladderV13Events.delete(settlement.marketSlug);
+        this.ladderV13WakePending.delete(settlement.marketSlug);
+      });
+    }
   }
 
   async init(): Promise<void> {
@@ -195,13 +221,19 @@ export class ReverseBot {
       this.config.strategyMode === "ladder_v9" ||
       this.config.strategyMode === "ladder_v10" ||
       this.config.strategyMode === "ladder_v11" ||
-      this.config.strategyMode === "ladder_v12"
+      this.config.strategyMode === "ladder_v12" ||
+      this.config.strategyMode === "ladder_v13"
     ) {
       await this.ladderTracker.init();
     }
     await this.ladderV10Regime?.init();
     await this.ladderV11Regime?.init();
     await this.ladderV12Regime?.init();
+    if (this.config.strategyMode === "ladder_v13") {
+      this.ladderV13History = await LadderV13HistoryStore.load(
+        this.config.paperStatePath,
+      );
+    }
   }
 
   async run(): Promise<void> {
@@ -232,6 +264,8 @@ export class ReverseBot {
                          ? "BRTI-only low-reversal binary 40/40 ladder"
                          : this.config.strategyMode === "ladder_v12"
                            ? "BRTI-scored 0/20/40 cheap-first fill-driven ladder"
+                           : this.config.strategyMode === "ladder_v13"
+                             ? "dynamic microprice pair-arbitrage market maker"
                            : "early two-sided static maker ladder",
       strategyMode: this.config.strategyMode,
       executionMode: this.config.executionMode,
@@ -348,6 +382,17 @@ export class ReverseBot {
               cheapPrice: 0.1,
               maxPairCost: LADDER_V12_MAX_PAIR_COST,
               favoriteRequiresCheapFill: true,
+            }
+          : undefined,
+      ladderV13Parameters:
+        this.config.strategyMode === "ladder_v13"
+          ? {
+              candidatePairEdges: LADDER_V13_CANDIDATE_EDGES,
+              maxPairedShares: LADDER_V13_MAX_PAIRED_SHARES,
+              maxUnpairedShares: LADDER_V13_MAX_UNPAIRED_SHARES,
+              btcDirectionSignals: false,
+              quotePolicy: "post_only",
+              completionPolicy: "profitable_fok_then_maker",
             }
           : undefined,
       staticMakerShares:
@@ -539,6 +584,11 @@ export class ReverseBot {
       await this.enqueueLadderV12Market(event.slug);
       return;
     }
+    if (this.config.strategyMode === "ladder_v13") {
+      this.ladderV13Events.set(event.slug, event);
+      await this.enqueueLadderV13Market(event.slug);
+      return;
+    }
 
     const opportunities =
       this.config.strategyMode === "reverse"
@@ -625,7 +675,8 @@ export class ReverseBot {
       this.config.strategyMode === "ladder_v9" ||
       this.config.strategyMode === "ladder_v10" ||
       this.config.strategyMode === "ladder_v11" ||
-      this.config.strategyMode === "ladder_v12"
+      this.config.strategyMode === "ladder_v12" ||
+      this.config.strategyMode === "ladder_v13"
     ) {
       await this.ladderTracker.mark(opportunity.tradeKey);
     } else {
@@ -1414,6 +1465,101 @@ export class ReverseBot {
     this.trader.reportMarket?.(event.slug);
   }
 
+  private enqueueLadderV13Market(marketSlug: string): Promise<void> {
+    if (this.config.strategyMode !== "ladder_v13") return Promise.resolve();
+    const active = this.ladderV13Queues.get(marketSlug);
+    if (active) {
+      this.ladderV13WakePending.add(marketSlug);
+      return active;
+    }
+    const queued = this.drainLadderV13Market(marketSlug);
+    this.ladderV13Queues.set(marketSlug, queued);
+    const cleanup = () => {
+      if (this.ladderV13Queues.get(marketSlug) === queued) {
+        this.ladderV13Queues.delete(marketSlug);
+      }
+    };
+    void queued.then(cleanup, cleanup);
+    return queued;
+  }
+
+  private async drainLadderV13Market(marketSlug: string): Promise<void> {
+    do {
+      this.ladderV13WakePending.delete(marketSlug);
+      const event = this.ladderV13Events.get(marketSlug);
+      if (!event) return;
+      await this.processLadderV13Event(event);
+    } while (this.ladderV13WakePending.delete(marketSlug));
+  }
+
+  private async processLadderV13Event(event: UpDownEvent): Promise<void> {
+    let submitted = 0;
+    let cancelled = 0;
+    let lastPlan: Awaited<ReturnType<typeof planLadderV13>> | undefined;
+    // One mutation per snapshot makes every inventory decision fill-driven.
+    for (let iteration = 0; iteration < 12; iteration += 1) {
+      const snapshot = this.trader.getMarketExecutionSnapshot?.(event.slug);
+      if (!snapshot) {
+        throw new Error("ladder_v13 requires a fill-aware executor snapshot");
+      }
+      if (snapshot.marketDataValid === false) return;
+      const plan = await planLadderV13(
+        this.ladderTracker,
+        event,
+        snapshot,
+        this.ladderV13History?.model,
+        Date.now() / 1_000,
+        true,
+        this.ladderV13History?.marketFeatures(event, snapshot) ?? {
+          volatility: 0,
+          orderFlow: 0,
+        },
+      );
+      lastPlan = plan;
+      await this.ladderV13History?.observe(event, snapshot, plan);
+      if (plan.cancelOrderIds.length > 0) {
+        if (!this.trader.cancelOrders) {
+          throw new Error("ladder_v13 requires executor order cancellation");
+        }
+        await this.trader.cancelOrders(plan.cancelOrderIds);
+        cancelled += plan.cancelOrderIds.length;
+        continue;
+      }
+      const flatten = plan.flattenOpportunities[0];
+      if (flatten) {
+        if (!(await this.executeSellOpportunity(flatten))) break;
+        submitted += 1;
+        continue;
+      }
+      const opportunity = plan.opportunities[0];
+      if (!opportunity) break;
+      if (!(await this.executeOpportunity(opportunity))) break;
+      submitted += 1;
+    }
+    if (submitted === 0 && cancelled === 0) {
+      logThrottled(
+        "Watching ladder_v13 market",
+        event.slug,
+        {
+          market: event.title,
+          slug: event.slug,
+          stage: lastPlan?.managementStage ?? "observing",
+          center: lastPlan?.center ?? null,
+          adjustedCenter: lastPlan?.adjustedCenter ?? null,
+          selectedEdge: lastPlan?.selectedCandidate?.edgeRung ?? null,
+          expectedValue: lastPlan?.selectedCandidate?.expectedValue ?? null,
+          pairedShares: lastPlan?.pairedShares ?? 0,
+          unpairedShares: lastPlan?.unpairedShares ?? 0,
+          lockedPnl: lastPlan?.lockedPnl ?? 0,
+          requiredEdge: lastPlan?.requiredEdge ?? null,
+          maximumCompletionPrice: lastPlan?.maximumCompletionPrice ?? null,
+        },
+        60_000,
+      );
+    }
+    this.trader.reportMarket?.(event.slug);
+  }
+
   private async executeSellOpportunity(
     opportunity: TradeOpportunity,
   ): Promise<boolean> {
@@ -1698,6 +1844,7 @@ export class ReverseBot {
     prune(this.ladderV10Events);
     prune(this.ladderV11Events);
     prune(this.ladderV12Events);
+    prune(this.ladderV13Events);
     for (const [slug, context] of this.ladderV6Events) {
       if (context.event.windowEnd <= now) this.ladderV6Events.delete(slug);
     }
@@ -1709,6 +1856,9 @@ export class ReverseBot {
     }
     for (const slug of this.ladderV12WakePending) {
       if (!this.ladderV12Events.has(slug)) this.ladderV12WakePending.delete(slug);
+    }
+    for (const slug of this.ladderV13WakePending) {
+      if (!this.ladderV13Events.has(slug)) this.ladderV13WakePending.delete(slug);
     }
   }
 

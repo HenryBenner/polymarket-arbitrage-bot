@@ -212,10 +212,11 @@ export function loadConfig(): BotConfig {
     strategyRaw !== "ladder_v9" &&
     strategyRaw !== "ladder_v10" &&
     strategyRaw !== "ladder_v11" &&
-    strategyRaw !== "ladder_v12"
+    strategyRaw !== "ladder_v12" &&
+    strategyRaw !== "ladder_v13"
   ) {
     throw new Error(
-      "STRATEGY_MODE must be reverse, odahoa_ladder, odahoa_ladder_2, odahoa_static_maker, ladder_v5, ladder_v5.5, ladder_v6, ladder_v7, ladder_v8, ladder_v9, ladder_v10, ladder_v11, or ladder_v12",
+      "STRATEGY_MODE must be reverse, odahoa_ladder, odahoa_ladder_2, odahoa_static_maker, ladder_v5, ladder_v5.5, ladder_v6, ladder_v7, ladder_v8, ladder_v9, ladder_v10, ladder_v11, ladder_v12, or ladder_v13",
     );
   }
 
@@ -801,6 +802,18 @@ export function validateTradingConfig(config: BotConfig): void {
       "ladder_v12 is BTC-only Kalshi paper/live mode and requires the full BRTI observation window",
     );
   }
+  if (
+    config.strategyMode === "ladder_v13" &&
+    (config.exchange !== "kalshi" ||
+      (config.executionMode !== "paper" && config.executionMode !== "live") ||
+      config.minutesBeforeCloseMax < 15 ||
+      config.kalshiSeriesTickers.length !== 1 ||
+      config.kalshiSeriesTickers[0] !== "KXBTC15M")
+  ) {
+    throw new Error(
+      "ladder_v13 is BTC-only Kalshi paper/live mode and requires the full 15-minute market window",
+    );
+  }
   if (!Number.isInteger(config.signatureType) || config.signatureType < 0 || config.signatureType > 3) {
     throw new Error("SIGNATURE_TYPE must be one of 0, 1, 2, or 3");
   }
@@ -928,7 +941,8 @@ export function validateTradingConfig(config: BotConfig): void {
     config.strategyMode === "ladder_v5" ||
     config.strategyMode === "ladder_v5.5" ||
     config.strategyMode === "ladder_v11" ||
-    config.strategyMode === "ladder_v12"
+    config.strategyMode === "ladder_v12" ||
+    config.strategyMode === "ladder_v13"
   ) {
     if (
       config.ladderLiveAck !==

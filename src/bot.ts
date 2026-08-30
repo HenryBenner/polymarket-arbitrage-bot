@@ -27,9 +27,7 @@ import {
   planLadderV12,
 } from "./ladder-v12.js";
 import {
-  LADDER_V13_CANDIDATE_EDGES,
-  LADDER_V13_MAX_PAIRED_SHARES,
-  LADDER_V13_MAX_UNPAIRED_SHARES,
+  LADDER_V13_QUOTE_SHARES,
   planLadderV13,
 } from "./ladder-v13.js";
 import { LadderV13HistoryStore } from "./ladder-v13-history.js";
@@ -196,6 +194,9 @@ export class ReverseBot {
       });
     }
     if (this.config.strategyMode === "ladder_v13") {
+      this.trader.setMarketTelemetryHandler?.((event) =>
+        this.ladderV13History?.ingestTelemetry(event),
+      );
       this.trader.setSettlementHandler?.(async (settlement) => {
         const event = this.ladderV13Events.get(settlement.marketSlug);
         const snapshot = this.trader.getMarketExecutionSnapshot?.(settlement.marketSlug);
@@ -387,12 +388,13 @@ export class ReverseBot {
       ladderV13Parameters:
         this.config.strategyMode === "ladder_v13"
           ? {
-              candidatePairEdges: LADDER_V13_CANDIDATE_EDGES,
-              maxPairedShares: LADDER_V13_MAX_PAIRED_SHARES,
-              maxUnpairedShares: LADDER_V13_MAX_UNPAIRED_SHARES,
+              quoteSharesPerCycle: LADDER_V13_QUOTE_SHARES,
+              lifetimePairCap: false,
+              perMarketCapitalCap: false,
+              quoteWindow: "full_15_minutes",
               btcDirectionSignals: false,
-              quotePolicy: "post_only",
-              completionPolicy: "profitable_fok_then_maker",
+              quotePolicy: "sticky_post_only_batch",
+              completionPolicy: "any_positive_edge_fok_then_maker",
             }
           : undefined,
       staticMakerShares:
@@ -1465,6 +1467,31 @@ export class ReverseBot {
     this.trader.reportMarket?.(event.slug);
   }
 
+  private async executeOpportunityBatch(
+    opportunities: readonly TradeOpportunity[],
+  ): Promise<number> {
+    if (opportunities.length === 0) return 0;
+    log("Placing atomic opening pair", {
+      market: opportunities[0]!.event.title,
+      orders: opportunities.map((opportunity) => ({
+        outcome: opportunity.token.outcome,
+        limitPrice: opportunity.price,
+        size: opportunity.size,
+      })),
+    });
+    const prepared = opportunities.map((opportunity) => this.withCapitalEffect(opportunity));
+    const results = this.trader.placeBuys
+      ? await this.trader.placeBuys(prepared)
+      : await Promise.all(prepared.map((opportunity) => this.trader.placeBuy(opportunity)));
+    let accepted = 0;
+    for (let index = 0; index < opportunities.length; index += 1) {
+      if (results[index]?.accepted === false) continue;
+      accepted += 1;
+      await this.ladderTracker.mark(opportunities[index]!.tradeKey);
+    }
+    return accepted;
+  }
+
   private enqueueLadderV13Market(marketSlug: string): Promise<void> {
     if (this.config.strategyMode !== "ladder_v13") return Promise.resolve();
     const active = this.ladderV13Queues.get(marketSlug);
@@ -1511,8 +1538,7 @@ export class ReverseBot {
         Date.now() / 1_000,
         true,
         this.ladderV13History?.marketFeatures(event, snapshot) ?? {
-          volatility: 0,
-          orderFlow: 0,
+          eligibleVolumePerSecondByToken: {},
         },
       );
       lastPlan = plan;
@@ -1531,10 +1557,15 @@ export class ReverseBot {
         submitted += 1;
         continue;
       }
-      const opportunity = plan.opportunities[0];
-      if (!opportunity) break;
-      if (!(await this.executeOpportunity(opportunity))) break;
-      submitted += 1;
+      if (plan.opportunities.length === 0) break;
+      if (plan.opportunities.length > 1) {
+        const accepted = await this.executeOpportunityBatch(plan.opportunities);
+        submitted += accepted;
+        if (accepted !== plan.opportunities.length) break;
+      } else {
+        if (!(await this.executeOpportunity(plan.opportunities[0]!))) break;
+        submitted += 1;
+      }
     }
     if (submitted === 0 && cancelled === 0) {
       logThrottled(
@@ -1546,8 +1577,8 @@ export class ReverseBot {
           stage: lastPlan?.managementStage ?? "observing",
           center: lastPlan?.center ?? null,
           adjustedCenter: lastPlan?.adjustedCenter ?? null,
-          selectedEdge: lastPlan?.selectedCandidate?.edgeRung ?? null,
-          expectedValue: lastPlan?.selectedCandidate?.expectedValue ?? null,
+          selectedEdge: lastPlan?.selectedCandidate?.pairEdge ?? null,
+          expectedProfitRate: lastPlan?.selectedCandidate?.profitRate ?? null,
           pairedShares: lastPlan?.pairedShares ?? 0,
           unpairedShares: lastPlan?.unpairedShares ?? 0,
           lockedPnl: lastPlan?.lockedPnl ?? 0,

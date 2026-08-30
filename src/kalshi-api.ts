@@ -38,6 +38,18 @@ export interface KalshiOrderResponse {
   average_fill_price?: string;
   average_fee_paid?: string;
   ts_ms: number;
+  error?: unknown;
+}
+
+export interface KalshiCreateOrderInput {
+  ticker: string;
+  clientOrderId: string;
+  outcome: "yes" | "no";
+  count: number;
+  price: number;
+  timeInForce: "fill_or_kill" | "immediate_or_cancel" | "good_till_canceled";
+  postOnly: boolean;
+  action?: "buy" | "sell";
 }
 
 export interface KalshiOrder {
@@ -174,24 +186,31 @@ export class KalshiClient {
     );
   }
 
-  async createOrder(input: {
-    ticker: string;
-    clientOrderId: string;
-    outcome: "yes" | "no";
-    count: number;
-    price: number;
-    timeInForce: "fill_or_kill" | "immediate_or_cancel" | "good_till_canceled";
-    postOnly: boolean;
-    action?: "buy" | "sell";
-  }): Promise<KalshiOrderResponse> {
+  async createOrder(input: KalshiCreateOrderInput): Promise<KalshiOrderResponse> {
+    return this.request<KalshiOrderResponse>("/portfolio/events/orders", {
+      method: "POST",
+      body: this.orderBody(input),
+    });
+  }
+
+  async createOrders(inputs: readonly KalshiCreateOrderInput[]): Promise<KalshiOrderResponse[]> {
+    const response = await this.request<{ orders: KalshiOrderResponse[] }>(
+      "/portfolio/events/orders/batched",
+      {
+        method: "POST",
+        body: { orders: inputs.map((input) => this.orderBody(input)) },
+      },
+    );
+    return response.orders ?? [];
+  }
+
+  private orderBody(input: KalshiCreateOrderInput): Record<string, unknown> {
     const yesPrice = input.outcome === "yes" ? input.price : 1 - input.price;
     const buying = (input.action ?? "buy") === "buy";
     const bookSide = buying
       ? input.outcome === "yes" ? "bid" : "ask"
       : input.outcome === "yes" ? "ask" : "bid";
-    return this.request<KalshiOrderResponse>("/portfolio/events/orders", {
-      method: "POST",
-      body: {
+    return {
         ticker: input.ticker,
         client_order_id: input.clientOrderId,
         side: bookSide,
@@ -204,8 +223,7 @@ export class KalshiClient {
         reduce_only: !buying,
         subaccount: this.config.kalshiSubaccount,
         exchange_index: 0,
-      },
-    });
+    };
   }
 
   async cancelOrder(orderId: string): Promise<void> {

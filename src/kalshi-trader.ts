@@ -7,6 +7,7 @@ import {
   type KalshiFill,
 } from "./kalshi-api.js";
 import { KalshiMarketStream } from "./kalshi-market-stream.js";
+import { exactKalshiOrderFee } from "./kalshi-fees.js";
 import { log, logThrottled } from "./logger.js";
 import type { MarketStreamEvent } from "./market-stream.js";
 import {
@@ -65,6 +66,9 @@ export class KalshiTrader implements OrderExecutor {
   private executionWakeHandler:
     | ((marketSlug: string) => void | Promise<void>)
     | undefined;
+  private marketTelemetryHandler:
+    | ((event: Record<string, unknown>) => void | Promise<void>)
+    | undefined;
 
   constructor(
     private readonly config: BotConfig,
@@ -103,6 +107,12 @@ export class KalshiTrader implements OrderExecutor {
     handler: (marketSlug: string) => void | Promise<void>,
   ): void {
     this.executionWakeHandler = handler;
+  }
+
+  setMarketTelemetryHandler(
+    handler: (event: Record<string, unknown>) => void | Promise<void>,
+  ): void {
+    this.marketTelemetryHandler = handler;
   }
 
   async observeMarket(event: UpDownEvent, books: TokenBook[]): Promise<void> {
@@ -151,6 +161,97 @@ export class KalshiTrader implements OrderExecutor {
     return this.serializeExecution(opportunity.event.slug, () =>
       this.placeBuyLocked(opportunity),
     );
+  }
+
+  async placeBuys(opportunities: readonly TradeOpportunity[]): Promise<OrderResult[]> {
+    if (opportunities.length === 0) return [];
+    const slug = opportunities[0]!.event.slug;
+    if (opportunities.some((opportunity) => opportunity.event.slug !== slug)) {
+      throw new Error("Kalshi batch orders must belong to one market");
+    }
+    return this.serializeExecution(slug, () => this.placeBuysLocked(opportunities));
+  }
+
+  private async placeBuysLocked(opportunities: readonly TradeOpportunity[]): Promise<OrderResult[]> {
+    for (const opportunity of opportunities) {
+      const failure = validateOrderMinimum(opportunity);
+      if (failure) return opportunities.map((candidate) => minimumOrderRejection(candidate, failure, this.config.dryRun));
+    }
+    if (this.config.dryRun) return opportunities.map((opportunity) => ({
+      dryRun: true, accepted: true, tokenId: opportunity.token.tokenId,
+      side: "BUY" as const, price: opportunity.price, size: opportunity.size,
+      response: { batch: true },
+    }));
+    const parsed = opportunities.map((opportunity) => {
+      const token = parseKalshiTokenId(opportunity.token.tokenId);
+      if (!token) throw new Error(`Invalid Kalshi token ID: ${opportunity.token.tokenId}`);
+      return token;
+    });
+    const reserves = opportunities.map((opportunity) => {
+      const rate = opportunity.orderPolicy === "post_only"
+        ? (opportunity.event.market.feeSchedule?.makerRate ?? this.config.kalshiMakerFeeRate)
+        : Math.max(
+            opportunity.event.market.feeSchedule?.rate ?? this.config.kalshiTakerFeeRate,
+            opportunity.event.market.feeSchedule?.makerRate ?? this.config.kalshiMakerFeeRate,
+          );
+      return opportunity.price * opportunity.size + exactKalshiOrderFee({
+        price: opportunity.price, size: opportunity.size, rate,
+        exponent: opportunity.event.market.feeSchedule?.exponent ?? 1,
+      });
+    });
+    const totalReserve = reserves.reduce((sum, value) => sum + value, 0);
+    if (totalReserve > this.availableCashForOrders() + 1e-8) {
+      throw new Error(`Kalshi balance too low: $${this.availableCashForOrders().toFixed(2)} available, $${totalReserve.toFixed(2)} required`);
+    }
+    this.inFlightReservedCash = round(this.inFlightReservedCash + totalReserve);
+    try {
+      const responses = await this.client.createOrders(opportunities.map((opportunity, index) => ({
+        ticker: parsed[index]!.ticker,
+        clientOrderId: crypto.randomUUID(),
+        outcome: parsed[index]!.outcome,
+        count: opportunity.size,
+        price: opportunity.price,
+        timeInForce: opportunity.orderPolicy === "fok" ? "fill_or_kill" as const
+          : opportunity.orderPolicy === "fak" ? "immediate_or_cancel" as const
+          : "good_till_canceled" as const,
+        postOnly: opportunity.orderPolicy === "post_only",
+      })));
+      const createdAt = new Date().toISOString();
+      const results = opportunities.map((opportunity, index): OrderResult => {
+        const response = responses[index];
+        if (!response || response.error || !response.order_id) return {
+          dryRun: false, accepted: false, tokenId: opportunity.token.tokenId,
+          side: "BUY", price: opportunity.price, size: opportunity.size,
+          response: response ?? { status: "rejected", reason: "missing_batch_response" },
+        };
+        const filled = Number(response.fill_count) || 0;
+        const remaining = Number(response.remaining_count) || 0;
+        this.state.orders.push({
+          id: response.order_id, tradeKey: opportunity.tradeKey,
+          marketSlug: opportunity.event.slug, marketTitle: opportunity.event.title,
+          conditionId: parsed[index]!.ticker, tokenId: opportunity.token.tokenId,
+          outcome: opportunity.token.outcome, limitPrice: opportunity.price,
+          originalSize: opportunity.size, remainingSize: remaining, queueAhead: 0,
+          status: remaining <= 1e-8 ? (filled > 0 ? "filled" : "cancelled") : (filled > 0 ? "partial" : "open"),
+          side: "BUY", phaseId: opportunity.phaseId, pairId: opportunity.pairId,
+          orderPolicy: opportunity.orderPolicy ?? "gtc", pairLockRole: opportunity.pairLockRole,
+          pairLockSourceFillId: opportunity.pairLockSourceFillId,
+          pairLockEntryPrice: opportunity.pairLockEntryPrice,
+          referenceTokenId: opportunity.referenceTokenId,
+          referenceAllInPrice: opportunity.referenceAllInPrice,
+          plannedAllInPairCost: opportunity.plannedAllInPairCost,
+          plannedNetEdgePerPair: opportunity.plannedNetEdgePerPair,
+          createdAt, submittedMinutesLeft: (opportunity.event.windowEnd - Date.now() / 1_000) / 60,
+        });
+        this.unconfirmedOrderReservations.set(response.order_id, reserves[index]!);
+        this.expectedFillCounts.set(response.order_id, filled);
+        return { dryRun: false, accepted: true, tokenId: opportunity.token.tokenId, side: "BUY", price: opportunity.price, size: opportunity.size, response };
+      });
+      await this.persist();
+      return results;
+    } finally {
+      this.inFlightReservedCash = round(Math.max(0, this.inFlightReservedCash - totalReserve));
+    }
   }
 
   async placeSell(opportunity: TradeOpportunity): Promise<OrderResult> {
@@ -314,13 +415,12 @@ export class KalshiTrader implements OrderExecutor {
           );
     const exponent =
       opportunity.event.market.feeSchedule?.exponent ?? 1;
-    const estimatedFee =
-      opportunity.size *
-      feeRate *
-      Math.pow(
-        opportunity.price * (1 - opportunity.price),
-        exponent,
-      );
+    const estimatedFee = exactKalshiOrderFee({
+      price: opportunity.price,
+      size: opportunity.size,
+      rate: feeRate,
+      exponent,
+    });
     const reserveNeeded =
       opportunity.price * opportunity.size + estimatedFee;
     const capitalCommitted = this.marketCapitalCommitted(
@@ -334,6 +434,7 @@ export class KalshiTrader implements OrderExecutor {
         ? (opportunity.capitalEffect ?? "increase")
         : undefined;
     if (
+      opportunity.strategyMode !== "ladder_v13" &&
       ladderCapitalEffect === "increase" &&
       projectedCommitment > this.config.ladderMaxUsdcPerMarket + 1e-8
     ) {
@@ -637,14 +738,12 @@ export class KalshiTrader implements OrderExecutor {
       market: marketSlug,
       series: context?.event.market.seriesTicker,
       capitalCommitted: snapshot.capitalCommitted,
-      remainingMarketCapacity: round(
-        Math.max(
-          0,
-          this.config.ladderMaxUsdcPerMarket -
-            snapshot.capitalCommitted,
-        ),
-        4,
-      ),
+      remainingMarketCapacity: this.config.strategyMode === "ladder_v13"
+        ? snapshot.availableCash
+        : round(
+            Math.max(0, this.config.ladderMaxUsdcPerMarket - snapshot.capitalCommitted),
+            4,
+          ),
       availableCash: snapshot.availableCash,
       pairedShares: round(pairedShares, 4),
       unmatchedShares: round(maximumShares - pairedShares, 4),
@@ -730,6 +829,7 @@ export class KalshiTrader implements OrderExecutor {
   }
 
   async ingestMarketEvent(event: MarketStreamEvent): Promise<void> {
+    await this.marketTelemetryHandler?.(event);
     const eventType = String(event.event_type ?? "");
     if (eventType === "market_books") {
       const ticker = String(event.market_ticker ?? "");

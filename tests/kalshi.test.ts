@@ -182,6 +182,42 @@ test("Kalshi order entry maps Up to a YES bid and Down to a complementary YES as
   assert.equal(requests[3]?.count, "20.00");
 });
 
+test("Kalshi V2 batch entry sends both complementary openings in one request", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const originalFetch = globalThis.fetch;
+  let requestedUrl = "";
+  let body: Record<string, unknown> = {};
+  globalThis.fetch = async (input, init) => {
+    requestedUrl = String(input);
+    body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(JSON.stringify({ orders: [
+      { order_id: "yes-order", fill_count: "0.00", remaining_count: "20.00", ts_ms: Date.now() },
+      { order_id: "no-order", fill_count: "0.00", remaining_count: "20.00", ts_ms: Date.now() },
+    ] }), { status: 201, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const client = new KalshiClient(testConfig({
+      exchange: "kalshi", kalshiApiKeyId: "test-key",
+      kalshiPrivateKeyPem: privateKey.export({ format: "pem", type: "pkcs8" }).toString(),
+    }));
+    await client.init();
+    const responses = await client.createOrders([
+      { ticker: "KXBTC15M-TEST", clientOrderId: "yes", outcome: "yes", count: 20, price: 0.39, timeInForce: "good_till_canceled", postOnly: true },
+      { ticker: "KXBTC15M-TEST", clientOrderId: "no", outcome: "no", count: 20, price: 0.59, timeInForce: "good_till_canceled", postOnly: true },
+    ]);
+    assert.equal(responses.length, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.match(requestedUrl, /portfolio\/events\/orders\/batched$/);
+  const orders = body.orders as Array<Record<string, unknown>>;
+  assert.equal(orders.length, 2);
+  assert.equal(orders[0]?.side, "bid");
+  assert.equal(orders[1]?.side, "ask");
+  assert.equal(orders[1]?.price, "0.4100");
+  assert.ok(orders.every((value) => value.post_only === true));
+});
+
 test("Kalshi balance is loaded from the configured subaccount in dollars", async () => {
   const { privateKey } = generateKeyPairSync("rsa", {
     modulusLength: 2048,

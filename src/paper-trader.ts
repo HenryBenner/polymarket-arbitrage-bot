@@ -4,6 +4,7 @@ import { ClobClient } from "@polymarket/clob-client-v2";
 import type { BotConfig } from "./config.js";
 import { KalshiClient, kalshiTokenId } from "./kalshi-api.js";
 import { KalshiMarketStream } from "./kalshi-market-stream.js";
+import { exactKalshiDepthCost, exactKalshiFee, exactKalshiOrderFee } from "./kalshi-fees.js";
 import { log, logThrottled } from "./logger.js";
 import { MarketStream, type MarketStreamEvent } from "./market-stream.js";
 import {
@@ -35,6 +36,7 @@ interface PaperState {
   positions: PaperPosition[];
   settlements: PaperSettlement[];
   seenEventKeys: string[];
+  feeAccumulators?: Record<string, number>;
 }
 
 interface MarketContext {
@@ -43,6 +45,7 @@ interface MarketContext {
   liquidity: Map<string, OrderBookLevel[]>;
   marketDataValid: boolean;
   streamBacked: boolean;
+  lastEventTimestampMs: number;
 }
 
 interface PriceChange {
@@ -78,6 +81,18 @@ function parseNumber(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function marketEventTimestampMs(event: Record<string, unknown>): number | null {
+  const raw = event.source_timestamp ?? event.timestamp ?? event.ts;
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw < 1e12 ? raw * 1_000 : raw;
+  if (typeof raw === "string") {
+    const numeric = Number(raw);
+    if (Number.isFinite(numeric)) return numeric < 1e12 ? numeric * 1_000 : numeric;
+    const parsed = Date.parse(raw);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
 function normalizeRebateRate(value: number | undefined, fallback: number): number {
   if (value === undefined || !Number.isFinite(value)) return fallback;
   if (value > 100 && value <= 10_000) return value / 10_000;
@@ -110,6 +125,7 @@ function emptyState(startingBalance: number): PaperState {
     positions: [],
     settlements: [],
     seenEventKeys: [],
+    feeAccumulators: {},
   };
 }
 
@@ -187,6 +203,7 @@ export class PaperTrader implements OrderExecutor {
       }
       this.state = parsed;
       this.state.positions ??= this.derivePositions(parsed.fills);
+      this.state.feeAccumulators ??= {};
       for (const key of parsed.seenEventKeys) this.seenEvents.add(key);
     } catch (error) {
       const code =
@@ -226,6 +243,7 @@ export class PaperTrader implements OrderExecutor {
   }
 
   async observeMarket(event: UpDownEvent, books: TokenBook[]): Promise<void> {
+    const existingContext = this.contexts.get(event.slug);
     const nextContext: MarketContext = {
       event,
       books: new Map(books.map((book) => [book.tokenId, book])),
@@ -237,8 +255,8 @@ export class PaperTrader implements OrderExecutor {
       ),
       marketDataValid: true,
       streamBacked: false,
+      lastEventTimestampMs: existingContext?.lastEventTimestampMs ?? 0,
     };
-    const existingContext = this.contexts.get(event.slug);
     if (
       existingContext &&
       (existingContext.streamBacked || !existingContext.marketDataValid)
@@ -270,6 +288,31 @@ export class PaperTrader implements OrderExecutor {
 
   async placeBuy(opportunity: TradeOpportunity): Promise<OrderResult> {
     return this.serializeExecution(() => this.placeBuyLocked(opportunity));
+  }
+
+  async placeBuys(opportunities: readonly TradeOpportunity[]): Promise<OrderResult[]> {
+    return this.serializeExecution(async () => {
+      if (opportunities.length === 0) return [];
+      const slug = opportunities[0]!.event.slug;
+      if (opportunities.some((opportunity) => opportunity.event.slug !== slug)) {
+        throw new Error("Paper batch orders must belong to one market");
+      }
+      const required = opportunities.reduce((sum, opportunity) => {
+        const fees = this.feeConfig(opportunity.event.market);
+        const rate = opportunity.orderPolicy === "post_only"
+          ? fees.makerRate : Math.max(fees.rate, fees.makerRate);
+        const fee = this.config.exchange === "kalshi"
+          ? exactKalshiOrderFee({ price: opportunity.price, size: opportunity.size, rate, exponent: fees.exponent })
+          : opportunity.size * rate * Math.pow(opportunity.price * (1 - opportunity.price), fees.exponent);
+        return sum + opportunity.price * opportunity.size + fee;
+      }, 0);
+      if (required > this.availableCash() + 1e-8) {
+        throw new Error(`Paper balance too low: $${this.availableCash().toFixed(2)} available, $${required.toFixed(2)} required`);
+      }
+      const results: OrderResult[] = [];
+      for (const opportunity of opportunities) results.push(await this.placeBuyLocked(opportunity));
+      return results;
+    });
   }
 
   async placeSell(opportunity: TradeOpportunity): Promise<OrderResult> {
@@ -327,13 +370,16 @@ export class PaperTrader implements OrderExecutor {
       opportunity.orderPolicy === "post_only"
         ? feeConfig.makerRate
         : Math.max(feeConfig.rate, feeConfig.makerRate);
-    const estimatedFee =
-      opportunity.size *
-      feeRate *
-      Math.pow(
-        opportunity.price * (1 - opportunity.price),
-        feeConfig.exponent,
-      );
+    const estimatedFee = this.config.exchange === "kalshi"
+      ? exactKalshiOrderFee({
+          price: opportunity.price,
+          size: opportunity.size,
+          rate: feeRate,
+          exponent: feeConfig.exponent,
+        })
+      : opportunity.size * feeRate * Math.pow(
+          opportunity.price * (1 - opportunity.price), feeConfig.exponent,
+        );
     const reserveNeeded =
       opportunity.price * opportunity.size + estimatedFee;
     const capitalCommitted = this.marketCapitalCommitted(
@@ -347,6 +393,7 @@ export class PaperTrader implements OrderExecutor {
         ? (opportunity.capitalEffect ?? "increase")
         : undefined;
     if (
+      opportunity.strategyMode !== "ladder_v13" &&
       ladderCapitalEffect === "increase" &&
       projectedCommitment > this.config.ladderMaxUsdcPerMarket + 1e-8
     ) {
@@ -384,29 +431,29 @@ export class PaperTrader implements OrderExecutor {
     }
     let fokCanFill = opportunity.orderPolicy !== "fok";
     if (opportunity.orderPolicy === "fok") {
-      let remaining = opportunity.size;
-      let totalCost = 0;
-      for (const level of asks) {
-        if (
-          remaining <= 1e-8 ||
-          level.price > opportunity.price + 1e-9
-        ) {
-          break;
-        }
-        const selected = Math.min(remaining, level.size);
-        if (selected <= 1e-8) continue;
-        const fee =
-          selected *
-          feeConfig.rate *
-          Math.pow(
-            level.price * (1 - level.price),
-            feeConfig.exponent,
+      if (this.config.exchange === "kalshi") {
+        const depth = exactKalshiDepthCost({
+          levels: asks.filter((level) => level.price <= opportunity.price + 1e-9),
+          size: opportunity.size,
+          rate: feeConfig.rate,
+          exponent: feeConfig.exponent,
+        });
+        fokCanFill = depth !== null && depth.total <= available + 1e-8;
+      } else {
+        let remaining = opportunity.size;
+        let totalCost = 0;
+        for (const level of asks) {
+          if (remaining <= 1e-8 || level.price > opportunity.price + 1e-9) break;
+          const selected = Math.min(remaining, level.size);
+          if (selected <= 1e-8) continue;
+          const fee = selected * feeConfig.rate * Math.pow(
+            level.price * (1 - level.price), feeConfig.exponent,
           );
-        totalCost += selected * level.price + fee;
-        remaining = round(remaining - selected);
+          totalCost += selected * level.price + fee;
+          remaining = round(remaining - selected);
+        }
+        fokCanFill = remaining <= 1e-8 && totalCost <= available + 1e-8;
       }
-      fokCanFill =
-        remaining <= 1e-8 && totalCost <= available + 1e-8;
     }
     const queueAhead = (context?.books.get(opportunity.token.tokenId)?.bids ?? [])
       .filter((level) => Math.abs(level.price - opportunity.price) < 1e-9)
@@ -814,10 +861,12 @@ export class PaperTrader implements OrderExecutor {
       partial: orders.filter((order) => order.status === "partial").length,
       unfilled: orders.filter((order) => order.status === "open").length,
       capitalCommitted: round(committed, 4),
-      remainingMarketCapacity: round(
-        Math.max(0, this.config.ladderMaxUsdcPerMarket - committed),
-        4,
-      ),
+      remainingMarketCapacity: this.config.strategyMode === "ladder_v13"
+        ? round(this.availableCash(), 4)
+        : round(
+            Math.max(0, this.config.ladderMaxUsdcPerMarket - committed),
+            4,
+          ),
       capitalUsed: round(used, 4),
       byOutcome: [...outcomeTotals.entries()].map(([outcome, value]) => ({
         outcome,
@@ -981,8 +1030,37 @@ export class PaperTrader implements OrderExecutor {
   }
 
   async ingestMarketEvent(event: MarketStreamEvent): Promise<void> {
+    if (!this.acceptMonotonicEvent(event)) return;
     await this.handleStreamEvent(event);
     await this.marketTelemetryHandler?.(event);
+  }
+
+  private acceptMonotonicEvent(event: MarketStreamEvent): boolean {
+    const atMs = marketEventTimestampMs(event);
+    if (atMs === null) return true;
+    const tokenIds = new Set<string>();
+    const direct = String(event.asset_id ?? "");
+    if (direct) tokenIds.add(direct);
+    if (Array.isArray(event.price_changes)) {
+      for (const change of event.price_changes as PriceChange[]) {
+        const id = String(change.asset_id ?? direct);
+        if (id) tokenIds.add(id);
+      }
+    }
+    if (Array.isArray(event.books)) {
+      for (const book of event.books as MarketStreamEvent[]) {
+        const id = String(book.asset_id ?? "");
+        if (id) tokenIds.add(id);
+      }
+    }
+    const contexts = [...tokenIds]
+      .map((id) => this.tokenToMarket.get(id))
+      .filter((slug): slug is string => Boolean(slug))
+      .map((slug) => this.contexts.get(slug))
+      .filter((context): context is MarketContext => Boolean(context));
+    if (contexts.some((context) => atMs + 1e-6 < context.lastEventTimestampMs)) return false;
+    for (const context of contexts) context.lastEventTimestampMs = Math.max(context.lastEventTimestampMs, atMs);
+    return true;
   }
 
   private availableCash(): number {
@@ -1056,10 +1134,22 @@ export class PaperTrader implements OrderExecutor {
     if (actualSize <= 0) return;
     const feeRate =
       liquidity === "taker" ? feeConfig.rate : feeConfig.makerRate;
-    const fee = round(
-      actualSize *
-        feeRate *
-        Math.pow(price * (1 - price), feeConfig.exponent),
+    const kalshiFee = this.config.exchange === "kalshi"
+      ? exactKalshiFee({
+          price,
+          size: actualSize,
+          rate: feeRate,
+          exponent: feeConfig.exponent,
+          side: "BUY",
+          accumulator: this.state.feeAccumulators?.[order.id] ?? 0,
+        })
+      : null;
+    if (kalshiFee) {
+      this.state.feeAccumulators ??= {};
+      this.state.feeAccumulators[order.id] = kalshiFee.accumulator;
+    }
+    const fee = kalshiFee?.netFee ?? round(
+      actualSize * feeRate * Math.pow(price * (1 - price), feeConfig.exponent),
       5,
     );
     const makerFeeEquivalent =
@@ -1145,10 +1235,22 @@ export class PaperTrader implements OrderExecutor {
       Math.min(size, order.remainingSize, position?.shares ?? 0),
     );
     if (actualSize <= 0 || !position) return;
-    const fee = round(
-      actualSize *
-        feeConfig.rate *
-        Math.pow(price * (1 - price), feeConfig.exponent),
+    const kalshiFee = this.config.exchange === "kalshi"
+      ? exactKalshiFee({
+          price,
+          size: actualSize,
+          rate: feeConfig.rate,
+          exponent: feeConfig.exponent,
+          side: "SELL",
+          accumulator: this.state.feeAccumulators?.[order.id] ?? 0,
+        })
+      : null;
+    if (kalshiFee) {
+      this.state.feeAccumulators ??= {};
+      this.state.feeAccumulators[order.id] = kalshiFee.accumulator;
+    }
+    const fee = kalshiFee?.netFee ?? round(
+      actualSize * feeConfig.rate * Math.pow(price * (1 - price), feeConfig.exponent),
       5,
     );
     const proceeds = round(actualSize * price - fee);
@@ -1359,6 +1461,7 @@ export class PaperTrader implements OrderExecutor {
     const price = parseNumber(event.price);
     const size = parseNumber(event.size);
     if (!tokenId || side !== "SELL" || price === null || size === null) return;
+    const atMs = marketEventTimestampMs(event) ?? Date.now();
 
     const marketSlug = this.tokenToMarket.get(tokenId);
     const orders = (marketSlug ? this.ordersByMarket.get(marketSlug) : undefined)
@@ -1366,7 +1469,8 @@ export class PaperTrader implements OrderExecutor {
         (order) =>
           order.tokenId === tokenId &&
           (order.status === "open" || order.status === "partial") &&
-          order.limitPrice + 1e-9 >= price,
+          order.limitPrice + 1e-9 >= price &&
+          atMs + 1e-6 >= Date.parse(order.createdAt),
       )
       .sort(
         (left, right) =>
@@ -1420,7 +1524,7 @@ export class PaperTrader implements OrderExecutor {
               closed: false,
             },
           ),
-        String(event.timestamp ?? new Date().toISOString()),
+        new Date(atMs).toISOString(),
       );
       remainingTradeSize = round(remainingTradeSize - fillSize);
     }

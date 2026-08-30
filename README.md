@@ -249,9 +249,11 @@ Implementation:
 
 ### `ladder_v13`
 
-A BTC-specific, direction-agnostic Kalshi pair-arbitrage market maker. V13 derives a common YES-space microprice from both complementary books, applies inventory skew, and evaluates fee-adjusted pair-edge rungs from 2 through 10 cents. It quotes only positive-EV post-only pairs using Bayesian-smoothed historical fill outcomes and persists the learned buckets under `PAPER_STATE_PATH`.
+A BTC-specific, direction-agnostic Kalshi pair-arbitrage market maker. V13 enumerates passive YES/NO price combinations from the actual best bids, applies Kalshi's centicent and cent-alignment fee rounding, and selects the highest expected profit rate among combinations with strictly positive pair profit. A cold start chooses the most aggressive profitable pair. Both opening legs are planned from one frozen book and sent through Kalshi's V2 batch-order endpoint.
 
-Confirmed one-sided fills immediately stop further orders on the surplus outcome. V13 then uses exact visible depth for a profitable FOK completion or posts the missing maker leg at the highest fee-aware price that preserves its dynamic required edge. It permits at most 40 completed pairs, caps unmatched inventory at 10 shares (5 inside three minutes), creates no new inventory in the final minute, and uses a reduce-only FOK sale to flatten residual exposure in the final 15 seconds when a profitable pair is unavailable. It does not initialize or consult any BRTI regime engine.
+Quotes are sticky: queue position is retained through small book or microprice changes and replaced only for a material economic improvement or when the pair-safe price envelope is no longer profitable. Fill learning is per resting order using queue ahead, tick distance, eligible market-order volume, exposure time, and censored cancellations. Confirmed one-sided fills immediately enter completion mode: any strictly profitable visible completion is taken FOK; otherwise V13 posts the most aggressive strictly profitable missing maker leg.
+
+V13 hunts pairs throughout the full 15-minute market and completed pairs immediately free the strategy to begin another cycle. It has no 40/10/5 lifetime or time-bucket contract limits, no final-minute entry ban, and no generic ladder per-market capital cap; available account cash remains the hard funding constraint. It does not initialize or consult any BRTI direction engine.
 
 Implementation:
 

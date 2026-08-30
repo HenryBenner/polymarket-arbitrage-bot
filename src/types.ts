@@ -237,6 +237,7 @@ export interface MarketExecutionSnapshot {
 export interface OrderExecutor {
   init(): Promise<void>;
   placeBuy(opportunity: TradeOpportunity): Promise<OrderResult>;
+  placeBuys?(opportunities: readonly TradeOpportunity[]): Promise<OrderResult[]>;
   placeSell?(opportunity: TradeOpportunity): Promise<OrderResult>;
   amendOrder?(
     orderId: string,

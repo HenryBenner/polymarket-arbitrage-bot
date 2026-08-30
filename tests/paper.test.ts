@@ -99,6 +99,7 @@ test("paper trading handles immediate partial fills, queue-ahead, resting fills,
     assert.equal(state.orders[0]?.remainingSize, 0.23);
     assert.ok(state.fills.every((fill) => fill.liquidity === "taker"));
     assert.ok(state.fills.every((fill) => fill.fee > 0));
+    const restingAt = Date.parse(state.orders[0]!.createdAt);
 
     await trader.ingestMarketEvent({
       event_type: "last_trade_price",
@@ -106,7 +107,7 @@ test("paper trading handles immediate partial fills, queue-ahead, resting fills,
       side: "SELL",
       price: "0.45",
       size: "1",
-      timestamp: "1",
+      timestamp: String(restingAt + 1_000),
     });
     state = trader.snapshot();
     assert.equal(state.orders[0]?.queueAhead, 0.5);
@@ -118,7 +119,7 @@ test("paper trading handles immediate partial fills, queue-ahead, resting fills,
       side: "SELL",
       price: "0.45",
       size: "1",
-      timestamp: "2",
+      timestamp: String(restingAt + 2_000),
     };
     await trader.ingestMarketEvent(fillEvent);
     state = trader.snapshot();
@@ -146,6 +147,63 @@ test("paper trading handles immediate partial fills, queue-ahead, resting fills,
       execution.capitalUsed + execution.openCommitted,
     );
     assert.equal(execution.books.length, 2);
+    await trader.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("paper chronology never lets a pre-submission trade fill a later order", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paper-chronology-"));
+  try {
+    const trader = new PaperTrader(testConfig({ paperStatePath: directory }), {
+      stream: fakeStream,
+      feeLoader: async () => ({ rate: 0.07, exponent: 1 }),
+      settlementLoader: async () => null,
+    });
+    await trader.init();
+    const books = testBooks(0.5, 0.6);
+    await trader.observeMarket(testEvent(), books);
+    await trader.placeBuy({
+      ...opportunity(books[0]!, "chronology", 0.39, 2),
+      orderPolicy: "post_only",
+    });
+    const createdAt = Date.parse(trader.snapshot().orders[0]!.createdAt);
+    await trader.ingestMarketEvent({
+      event_type: "last_trade_price", asset_id: "up-token", side: "SELL",
+      price: "0.39", size: "20", timestamp: String(createdAt - 1_000),
+    });
+    assert.equal(trader.snapshot().orders[0]?.status, "open");
+    assert.equal(trader.snapshot().orders[0]?.queueAhead, 10);
+    await trader.ingestMarketEvent({
+      event_type: "last_trade_price", asset_id: "up-token", side: "SELL",
+      price: "0.39", size: "20", timestamp: String(createdAt + 1_000),
+    });
+    assert.equal(trader.snapshot().orders[0]?.status, "filled");
+    await trader.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("paper V13 submits both openings together and bypasses the generic market cap", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paper-v13-batch-"));
+  try {
+    const trader = new PaperTrader(testConfig({
+      exchange: "kalshi", strategyMode: "ladder_v13",
+      paperStatePath: directory, paperStartingUsdc: 100,
+      ladderMaxUsdcPerMarket: 1,
+    }), { stream: fakeStream, settlementLoader: async () => null });
+    await trader.init();
+    const books = testBooks();
+    await trader.observeMarket(testEvent(), books);
+    const pair = [
+      { ...opportunity(books[0]!, "v13-yes", 0.39, 20), strategyMode: "ladder_v13" as const, orderPolicy: "post_only" as const, pairId: "ladder-v13:opening-yes:1" },
+      { ...opportunity(books[1]!, "v13-no", 0.59, 20), strategyMode: "ladder_v13" as const, orderPolicy: "post_only" as const, pairId: "ladder-v13:opening-no:1" },
+    ];
+    const results = await trader.placeBuys(pair);
+    assert.ok(results.every((result) => result.accepted === true));
+    assert.equal(trader.getMarketExecutionSnapshot(testEvent().slug)?.openOrders.length, 2);
     await trader.close();
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -389,6 +447,7 @@ test("paper market events wake V6 immediately after a maker fill", async () => {
       pairId: "ladder-v6:opening:0.10",
       pairLockRole: "opening",
     });
+    const submittedAt = Date.parse(trader.snapshot().orders[0]!.createdAt);
 
     const wakeFillCounts: number[] = [];
     trader.setExecutionWakeHandler((marketSlug) => {
@@ -402,7 +461,7 @@ test("paper market events wake V6 immediately after a maker fill", async () => {
       side: "SELL",
       price: "0.1",
       size: "20",
-      timestamp: "1767225600",
+      timestamp: String(submittedAt + 1_000),
     });
     assert.deepEqual(wakeFillCounts, [1]);
     await trader.close();

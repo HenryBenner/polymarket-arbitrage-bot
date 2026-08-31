@@ -1,8 +1,10 @@
-import { exactKalshiDepthCost, exactKalshiOrderFee } from "./kalshi-fees.js";
+import { exactKalshiOrderFee } from "./kalshi-fees.js";
+import { LadderV13CompletionHazardModel, type LadderV13CompletionModel, type LadderV13CompletionContext } from "./ladder-v13-completion-model.js";
+import { ladderV13Inventory, type LadderV13ResidualEpisode } from "./ladder-v13-inventory.js";
+import { planLadderV13Residual, type LadderV13LiquidationDecision } from "./ladder-v13-residual.js";
 import { LadderTracker } from "./ladder.js";
 import type {
   MarketExecutionSnapshot,
-  PaperFill,
   PaperOrder,
   TokenBook,
   TradeOpportunity,
@@ -159,6 +161,9 @@ export interface LadderV13Plan {
   maximumCompletionPrice: number | null;
   plannedPairCost: number | null;
   requiredEdge: number;
+  residualEpisode: LadderV13ResidualEpisode | null;
+  completionContext: LadderV13CompletionContext | null;
+  liquidation: LadderV13LiquidationDecision | null;
 }
 
 function floorToTick(value: number, tick: number): number {
@@ -195,37 +200,6 @@ function isV13Order(order: PaperOrder): boolean {
 
 function role(order: PaperOrder): string {
   return isV13Order(order) ? (order.pairId ?? "").slice(V13_PREFIX.length) : "";
-}
-
-function strategyFills(snapshot: MarketExecutionSnapshot): PaperFill[] {
-  const ids = new Set(snapshot.orders.filter(isV13Order).map((order) => order.id));
-  return snapshot.fills.filter((fill) => ids.has(fill.orderId));
-}
-
-function tokenShares(fills: readonly PaperFill[], tokenId: string): number {
-  return round(fills.filter((fill) => fill.tokenId === tokenId).reduce(
-    (sum, fill) => sum + ((fill.side ?? "BUY") === "SELL" ? -fill.size : fill.size),
-    0,
-  ));
-}
-
-function selectedLotCost(fills: readonly PaperFill[], tokenId: string, shares: number): number {
-  let remaining = shares;
-  let total = 0;
-  const lots = fills
-    .filter((fill) => fill.tokenId === tokenId && (fill.side ?? "BUY") === "BUY")
-    .map((fill) => ({
-      shares: fill.size,
-      allIn: fill.price + (fill.size > EPSILON ? fill.fee / fill.size : 0),
-    }))
-    .sort((left, right) => right.allIn - left.allIn);
-  for (const lot of lots) {
-    const selected = Math.min(remaining, lot.shares);
-    total += selected * lot.allIn;
-    remaining = round(remaining - selected);
-    if (remaining <= EPSILON) break;
-  }
-  return remaining <= EPSILON ? total : Number.POSITIVE_INFINITY;
 }
 
 function validMaker(book: TokenBook, price: number, size: number): boolean {
@@ -427,20 +401,16 @@ export async function planLadderV13(
   nowSeconds = Date.now() / 1_000,
   _allowFlatten = false,
   features: LadderV13MarketFeatures = { eligibleVolumePerSecondByToken: {} },
+  completionModel: LadderV13CompletionModel = new LadderV13CompletionHazardModel(),
+  deferFractionalSale = false,
 ): Promise<LadderV13Plan> {
-  const orders = snapshot.orders.filter(isV13Order);
   const openOrders = snapshot.openOrders.filter(isV13Order);
-  const fills = strategyFills(snapshot);
+  const inventory = ladderV13Inventory(snapshot, nowSeconds);
   const books = [...snapshot.books].sort((left, right) => left.outcomeIndex - right.outcomeIndex);
   const yes = books[0];
   const no = books[1];
   const secondsLeft = event.windowEnd - nowSeconds;
-  const yesShares = yes ? tokenShares(fills, yes.tokenId) : 0;
-  const noShares = no ? tokenShares(fills, no.tokenId) : 0;
-  const paired = round(Math.min(yesShares, noShares));
-  const unpaired = round(Math.abs(yesShares - noShares));
-  const pairedCost = paired <= EPSILON || !yes || !no ? 0
-    : selectedLotCost(fills, yes.tokenId, paired) + selectedLotCost(fills, no.tokenId, paired);
+  const { yesShares, noShares, pairedShares: paired, unpairedShares: unpaired } = inventory;
   const center = yes && no ? ladderV13Center(yes, no) : null;
   const base: LadderV13Plan = {
     cancelOrderIds: [], opportunities: [], flattenOpportunities: [],
@@ -448,68 +418,25 @@ export async function planLadderV13(
     selectedCandidate: null, candidates: [],
     yesFilledShares: yesShares, noFilledShares: noShares,
     pairedShares: paired, unpairedShares: unpaired,
-    lockedPnl: round(paired - pairedCost), maximumCompletionPrice: null,
+    lockedPnl: inventory.lockedPnl, maximumCompletionPrice: null,
     plannedPairCost: null, requiredEdge: 0,
+    residualEpisode: inventory.episode, completionContext: null, liquidation: null,
   };
-  if (!yes || !no || center === null) {
+  if (!yes || !no || snapshot.marketDataValid === false) {
     return { ...base, cancelOrderIds: openOrders.map((order) => order.id), managementStage: "invalid-book" };
   }
   if (secondsLeft <= 0) {
     return { ...base, cancelOrderIds: openOrders.map((order) => order.id), managementStage: "market-expired" };
   }
+  if (snapshot.executionPending) return { ...base,
+    cancelOrderIds: openOrders.map((order) => order.id),
+    managementStage: "await-execution-reconciliation" };
 
   if (unpaired > EPSILON) {
-    const surplus = yesShares > noShares ? yes : no;
-    const deficient = yesShares > noShares ? no : yes;
-    const surplusOpen = openOrders.filter((order) => (order.side ?? "BUY") === "BUY" && order.tokenId === surplus.tokenId);
-    if (surplusOpen.length) {
-      return { ...base, cancelOrderIds: surplusOpen.map((order) => order.id), managementStage: "cancel-imbalance-increasing-orders" };
-    }
-    const completionOpen = openOrders.filter((order) => (order.side ?? "BUY") === "BUY" && order.tokenId === deficient.tokenId);
-    const entryCost = selectedLotCost(fills, surplus.tokenId, unpaired);
-    const taker = exactKalshiDepthCost({
-      levels: deficient.asks, size: unpaired,
-      rate: snapshot.takerFeeRate, exponent: snapshot.takerFeeExponent,
-    });
-    if (taker && entryCost + taker.total < unpaired - EPSILON) {
-      const pairCost = (entryCost + taker.total) / unpaired;
-      if (completionOpen.length) {
-        return { ...base, cancelOrderIds: completionOpen.map((order) => order.id), plannedPairCost: pairCost, managementStage: "cancel-maker-before-fok" };
-      }
-      const key = `${V13_PREFIX}${event.slug}:completion-fok:${deficient.tokenId}:${unpaired}:${taker.limitPrice}`;
-      if (!tracker.has(key) && !orders.some((order) => order.tradeKey === key)) {
-        return {
-          ...base, plannedPairCost: pairCost,
-          opportunities: [opportunity(event, deficient, taker.limitPrice, unpaired, key, "completion-fok", "fok", pairCost)],
-          managementStage: "profitable-fok-completion",
-        };
-      }
-    }
-    const tick = Number(tickSizeFromMarket(event.market));
-    let makerPrice = 0;
-    for (const price of levels(deficient, tick)) {
-      const fee = exactKalshiOrderFee({ price, size: unpaired, rate: snapshot.makerFeeRate ?? 0, exponent: snapshot.takerFeeExponent });
-      if (entryCost + price * unpaired + fee < unpaired - EPSILON) makerPrice = price;
-    }
-    base.maximumCompletionPrice = makerPrice || null;
-    if (makerPrice > 0) base.plannedPairCost = (entryCost + makerPrice * unpaired + exactKalshiOrderFee({
-      price: makerPrice, size: unpaired, rate: snapshot.makerFeeRate ?? 0, exponent: snapshot.takerFeeExponent,
-    })) / unpaired;
-    const matching = completionOpen.find((order) => order.orderPolicy === "post_only" &&
-      Math.abs(order.limitPrice - makerPrice) <= EPSILON && Math.abs(order.remainingSize - unpaired) <= EPSILON);
-    const stale = completionOpen.filter((order) => order.id !== matching?.id);
-    if (stale.length) return { ...base, cancelOrderIds: stale.map((order) => order.id), managementStage: "replace-completion-maker" };
-    if (matching) return { ...base, managementStage: "waiting-completion-maker" };
-    if (validMaker(deficient, makerPrice, unpaired)) {
-      const key = `${V13_PREFIX}${event.slug}:completion-maker:${deficient.tokenId}:${makerPrice}:${unpaired}:${orders.length + 1}`;
-      return {
-        ...base,
-        opportunities: [opportunity(event, deficient, makerPrice, unpaired, key, "completion-maker", "post_only", base.plannedPairCost ?? undefined)],
-        managementStage: "maker-completion",
-      };
-    }
-    return { ...base, cancelOrderIds: completionOpen.map((order) => order.id), managementStage: "wait-profitable-completion" };
+    return { ...base, ...planLadderV13Residual(tracker, event, snapshot, completionModel,
+      nowSeconds, features.eligibleVolumePerSecondByToken, deferFractionalSale) };
   }
+  if (center === null) return { ...base, managementStage: "invalid-book" };
 
   const tick = Number(tickSizeFromMarket(event.market));
   const available = candidates(snapshot, yes, no, secondsLeft, tick, model, features);

@@ -5,6 +5,7 @@ import type { BotConfig } from "./config.js";
 import { KalshiClient, kalshiTokenId } from "./kalshi-api.js";
 import { KalshiMarketStream } from "./kalshi-market-stream.js";
 import { exactKalshiDepthCost, exactKalshiFee, exactKalshiOrderFee } from "./kalshi-fees.js";
+import { ladderV13SellGuard } from "./ladder-v13-inventory.js";
 import { log, logThrottled } from "./logger.js";
 import { MarketStream, type MarketStreamEvent } from "./market-stream.js";
 import {
@@ -544,6 +545,15 @@ export class PaperTrader implements OrderExecutor {
   private async placeSellLocked(
     opportunity: TradeOpportunity,
   ): Promise<OrderResult> {
+    if (opportunity.strategyMode === "ladder_v13") {
+      const snapshot = this.getMarketExecutionSnapshot(opportunity.event.slug);
+      const failure = validateOrderMinimum(opportunity);
+      const reason = failure?.reason ?? (opportunity.orderPolicy !== "fak" ? "v13_sale_requires_ioc" :
+        snapshot ? ladderV13SellGuard(snapshot, opportunity.token.tokenId, opportunity.size) : "missing_market_snapshot");
+      if (reason) return { dryRun: true, accepted: false, tokenId: opportunity.token.tokenId,
+        side: "SELL", price: opportunity.price, size: opportunity.size,
+        response: { paper: true, status: "rejected", reason } };
+    }
     const existing = this.orderByTradeKey.get(opportunity.tradeKey);
     if (existing) {
       return {
@@ -577,7 +587,7 @@ export class PaperTrader implements OrderExecutor {
     const context = this.contexts.get(opportunity.event.slug);
     const book =
       context?.books.get(opportunity.token.tokenId) ?? opportunity.token;
-    const bids = book.bids.map((level) => ({ ...level }));
+    const bids = book.bids.map((level) => ({ ...level })).sort((a, b) => b.price - a.price);
     const feeConfig = this.feeConfig(opportunity.event.market);
     const now = new Date().toISOString();
     const order: PaperOrder = {
@@ -1030,9 +1040,13 @@ export class PaperTrader implements OrderExecutor {
   }
 
   async ingestMarketEvent(event: MarketStreamEvent): Promise<void> {
-    if (!this.acceptMonotonicEvent(event)) return;
-    await this.handleStreamEvent(event);
-    await this.marketTelemetryHandler?.(event);
+    const ingest = async (): Promise<void> => {
+      if (!this.acceptMonotonicEvent(event)) return;
+      await this.handleStreamEvent(event);
+      await this.marketTelemetryHandler?.(event);
+    };
+    if (this.config.strategyMode === "ladder_v13") await this.serializeExecution(ingest);
+    else await ingest();
   }
 
   private acceptMonotonicEvent(event: MarketStreamEvent): boolean {

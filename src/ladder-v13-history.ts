@@ -8,6 +8,8 @@ import {
   type LadderV13Plan,
 } from "./ladder-v13.js";
 import type { MarketExecutionSnapshot, PaperOrder, UpDownEvent } from "./types.js";
+import { LadderV13CompletionHazardModel, type LadderV13CompletionContext, type LadderV13CompletionObservation } from "./ladder-v13-completion-model.js";
+import type { LadderV13ResidualEpisode } from "./ladder-v13-inventory.js";
 
 const EPSILON = 1e-8;
 
@@ -16,10 +18,22 @@ interface LiveObservation {
   startedAtMs: number;
 }
 
-interface HistoryStateV2 {
-  version: 2;
+interface CompletionExposure {
+  context: LadderV13CompletionContext;
+  startedAtMs: number;
+  initialFilledSize: number;
+  targetShares: number;
+}
+
+interface HistoryState {
+  version: number;
   observations: LadderV13HazardObservation[];
   observedOrderIds: string[];
+  completionObservations?: LadderV13CompletionObservation[];
+  completionObservedIds?: string[];
+  completionLive?: Array<[string, CompletionExposure]>;
+  completionPlanned?: Array<[string, LadderV13CompletionContext]>;
+  residualEpisodes?: Array<[string, LadderV13ResidualEpisode]>;
 }
 
 function eventTimestampMs(event: Record<string, unknown>): number | null {
@@ -51,33 +65,44 @@ function isOpening(order: PaperOrder): boolean {
 /** Persists fill-time and censored-cancel observations for individual V13 orders. */
 export class LadderV13HistoryStore {
   readonly model: LadderV13FillHazardModel;
+  readonly completionModel: LadderV13CompletionHazardModel;
+  private readonly completionObservedIds: Set<string>;
+  private readonly completionLive: Map<string, CompletionExposure>;
+  private readonly completionPlanned: Map<string, LadderV13CompletionContext>;
+  private readonly residualEpisodes: Map<string, LadderV13ResidualEpisode>;
   private readonly path: string;
   private readonly observedOrderIds: Set<string>;
   private readonly live = new Map<string, LiveObservation>();
   private readonly trades = new Map<string, Array<{ atMs: number; size: number }>>();
   private persistence: Promise<void> = Promise.resolve();
 
-  private constructor(path: string, state: HistoryStateV2) {
+  private constructor(path: string, state: HistoryState) {
     this.path = path;
     this.model = new LadderV13FillHazardModel(state.observations);
     this.observedOrderIds = new Set(state.observedOrderIds);
+    this.completionModel = new LadderV13CompletionHazardModel(state.completionObservations);
+    this.completionObservedIds = new Set(state.completionObservedIds);
+    this.completionLive = new Map(state.completionLive);
+    this.completionPlanned = new Map(state.completionPlanned);
+    this.residualEpisodes = new Map(state.residualEpisodes);
   }
 
   static async load(directory: string): Promise<LadderV13HistoryStore> {
     const path = join(directory, "ladder-v13-history.json");
     try {
-      const parsed = JSON.parse(await readFile(path, "utf8")) as Partial<HistoryStateV2> & { version?: number };
+      const parsed = JSON.parse(await readFile(path, "utf8")) as Partial<HistoryState>;
       // V1 stored incompatible eight-dimensional attempt buckets. Starting the
       // new order-hazard model empty is the only unbiased migration.
-      return new LadderV13HistoryStore(path, parsed.version === 2 ? {
-        version: 2,
+      return new LadderV13HistoryStore(path, parsed.version === 2 || parsed.version === 3 ? {
+        ...parsed,
+        version: 3,
         observations: parsed.observations ?? [],
         observedOrderIds: parsed.observedOrderIds ?? [],
-      } : { version: 2, observations: [], observedOrderIds: [] });
+      } : { version: 3, observations: [], observedOrderIds: [] });
     } catch (error) {
       const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
       if (code !== "ENOENT") throw error;
-      return new LadderV13HistoryStore(path, { version: 2, observations: [], observedOrderIds: [] });
+      return new LadderV13HistoryStore(path, { version: 3, observations: [], observedOrderIds: [] });
     }
   }
 
@@ -111,7 +136,7 @@ export class LadderV13HistoryStore {
   }
 
   async observe(
-    _event: UpDownEvent,
+    event: UpDownEvent,
     snapshot: MarketExecutionSnapshot,
     plan: LadderV13Plan,
     nowMs = Date.now(),
@@ -121,7 +146,7 @@ export class LadderV13HistoryStore {
       contexts.set(snapshot.books[0]?.tokenId ?? "", plan.selectedCandidate.yesContext);
       contexts.set(snapshot.books[1]?.tokenId ?? "", plan.selectedCandidate.noContext);
     }
-    let changed = false;
+    let changed = this.observeCompletion(event, snapshot, plan, nowMs);
     for (const order of snapshot.orders.filter(isOpening)) {
       if (this.observedOrderIds.has(order.id)) continue;
       if (!this.live.has(order.id)) {
@@ -152,10 +177,24 @@ export class LadderV13HistoryStore {
   }
 
   async finalize(
-    _event: UpDownEvent,
+    event: UpDownEvent,
     snapshot: MarketExecutionSnapshot,
     nowMs = Date.now(),
   ): Promise<void> {
+    // An immediately filled final submission may settle before another plan.
+    // Attach its saved placement context without reconstructing later features.
+    for (const order of snapshot.orders) {
+      const context = this.completionPlanned.get(order.tradeKey);
+      if (!context || this.completionObservedIds.has(order.id) || this.completionLive.has(order.id)) continue;
+      this.completionLive.set(order.id, { context, startedAtMs: Date.parse(order.createdAt) || nowMs,
+        initialFilledSize: 0, targetShares: order.originalSize });
+      this.completionPlanned.delete(order.tradeKey);
+    }
+    this.finishCompletionObservations(snapshot, nowMs, true);
+    this.residualEpisodes.delete(event.slug);
+    for (const key of this.completionPlanned.keys()) {
+      if (key.startsWith(`ladder-v13:${event.slug}:`)) this.completionPlanned.delete(key);
+    }
     for (const order of snapshot.orders.filter(isOpening)) {
       if (this.observedOrderIds.has(order.id)) continue;
       const active = this.live.get(order.id);
@@ -172,6 +211,66 @@ export class LadderV13HistoryStore {
       this.live.delete(order.id);
     }
     await this.persist();
+  }
+
+  private observeCompletion(event: UpDownEvent, snapshot: MarketExecutionSnapshot, plan: LadderV13Plan, nowMs: number): boolean {
+    let changed = false;
+    if (plan.residualEpisode) {
+      const previous = this.residualEpisodes.get(event.slug);
+      changed = previous?.id !== plan.residualEpisode.id ||
+        previous?.residualQuantity !== plan.residualEpisode.residualQuantity ||
+        previous?.hasMatchedShares !== plan.residualEpisode.hasMatchedShares;
+      this.residualEpisodes.set(event.slug, { ...plan.residualEpisode });
+    } else if (this.residualEpisodes.delete(event.slug)) changed = true;
+    if (plan.completionContext) {
+      for (const opportunity of plan.opportunities.filter((item) => item.orderPolicy === "post_only")) {
+        this.completionPlanned.set(opportunity.tradeKey, { ...plan.completionContext });
+        changed = true;
+      }
+    }
+    for (const order of snapshot.orders) {
+      if (!order.pairId?.startsWith("ladder-v13:") || order.orderPolicy !== "post_only" ||
+        (order.side ?? "BUY") !== "BUY" || this.completionLive.has(order.id) || this.completionObservedIds.has(order.id)) continue;
+      const planned = this.completionPlanned.get(order.tradeKey);
+      const retainedCompletion = plan.managementStage === "waiting-completion-maker" &&
+        plan.residualEpisode && order.tokenId !== plan.residualEpisode.surplusTokenId &&
+        snapshot.openOrders.some((item) => item.id === order.id);
+      const context = planned ?? (retainedCompletion ? plan.completionContext : null);
+      // Never reconstruct placement features from a later book: missing legacy
+      // contexts are skipped instead of biasing the cross-market estimator.
+      if (!context) continue;
+      const filledSize = snapshot.fills.filter((fill) => fill.orderId === order.id)
+        .reduce((sum, fill) => sum + fill.size, 0);
+      this.completionLive.set(order.id, {
+        context: { ...context }, startedAtMs: planned ? Date.parse(order.createdAt) || nowMs : nowMs,
+        targetShares: planned ? order.originalSize : order.remainingSize,
+        initialFilledSize: planned ? 0 : filledSize,
+      });
+      this.completionPlanned.delete(order.tradeKey);
+      changed = true;
+    }
+    return this.finishCompletionObservations(snapshot, nowMs) || changed;
+  }
+
+  private finishCompletionObservations(snapshot: MarketExecutionSnapshot, nowMs: number, finalize = false): boolean {
+    if (snapshot.executionPending) return false;
+    let changed = false;
+    for (const order of snapshot.orders) {
+      const active = this.completionLive.get(order.id);
+      if (!active) continue;
+      const fills = snapshot.fills.filter((fill) => fill.orderId === order.id);
+      const filledSize = fills.reduce((sum, fill) => sum + fill.size, 0) - active.initialFilledSize;
+      const filled = filledSize + EPSILON >= active.targetShares;
+      if (!filled && !finalize && order.status !== "cancelled") continue;
+      const lastFillMs = Math.max(...fills.map((fill) => Date.parse(fill.timestamp)).filter(Number.isFinite));
+      const exposureSeconds = Math.max(0.01, ((filled && Number.isFinite(lastFillMs) ? lastFillMs : nowMs) - active.startedAtMs) / 1_000);
+      this.completionModel.observe({ context: active.context, filled, exposureSeconds,
+        fillSeconds: filled ? exposureSeconds : undefined });
+      this.completionObservedIds.add(order.id);
+      this.completionLive.delete(order.id);
+      changed = true;
+    }
+    return changed;
   }
 
   private contextForOrder(
@@ -193,10 +292,15 @@ export class LadderV13HistoryStore {
   }
 
   private async persist(): Promise<void> {
-    const state: HistoryStateV2 = {
-      version: 2,
+    const state: HistoryState = {
+      version: 3,
       observations: this.model.toJSON(),
       observedOrderIds: [...this.observedOrderIds],
+      completionObservations: this.completionModel.toJSON(),
+      completionObservedIds: [...this.completionObservedIds],
+      completionLive: [...this.completionLive],
+      completionPlanned: [...this.completionPlanned],
+      residualEpisodes: [...this.residualEpisodes],
     };
     const operation = async (): Promise<void> => {
       await mkdir(dirname(this.path), { recursive: true });

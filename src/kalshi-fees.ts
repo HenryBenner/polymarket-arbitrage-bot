@@ -103,3 +103,33 @@ export function exactKalshiDepthCost(input: {
     ? { total: round(total), limitPrice, fee: round(feeTotal) }
     : null;
 }
+
+/** Executable FAK sell depth; shallow books return a partial quantity, not null. */
+export function exactKalshiDepthProceeds(input: {
+  levels: readonly { price: number; size: number }[];
+  size: number;
+  rate: number;
+  exponent: number;
+}): { total: number; averageNetPrice: number; limitPrice: number; fee: number; size: number } | null {
+  let remaining = input.size;
+  let total = 0;
+  let feeTotal = 0;
+  let accumulator = 0;
+  let limitPrice = 0;
+  for (const level of [...input.levels].sort((left, right) => right.price - left.price)) {
+    if (remaining <= EPSILON) break;
+    if (!Number.isFinite(level.price) || level.price <= 0 || level.price >= 1 || !Number.isFinite(level.size)) continue;
+    const size = Math.min(remaining, Math.max(0, level.size));
+    if (size <= EPSILON) continue;
+    const fee = exactKalshiFee({ ...input, price: level.price, size, side: "SELL", accumulator });
+    accumulator = fee.accumulator;
+    total += size * level.price - fee.netFee;
+    feeTotal += fee.netFee;
+    limitPrice = level.price;
+    remaining = round(remaining - size);
+  }
+  const size = round(input.size - remaining);
+  return size > EPSILON && limitPrice > 0
+    ? { total: round(total), averageNetPrice: round(total / size), limitPrice, fee: round(feeTotal), size }
+    : null;
+}

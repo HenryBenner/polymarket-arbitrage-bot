@@ -1522,6 +1522,7 @@ export class ReverseBot {
   private async processLadderV13Event(event: UpDownEvent): Promise<void> {
     let submitted = 0;
     let cancelled = 0;
+    let fractionalSaleSubmitted = false;
     let lastPlan: Awaited<ReturnType<typeof planLadderV13>> | undefined;
     // One mutation per snapshot makes every inventory decision fill-driven.
     for (let iteration = 0; iteration < 12; iteration += 1) {
@@ -1540,6 +1541,8 @@ export class ReverseBot {
         this.ladderV13History?.marketFeatures(event, snapshot) ?? {
           eligibleVolumePerSecondByToken: {},
         },
+        this.ladderV13History?.completionModel,
+        fractionalSaleSubmitted,
       );
       lastPlan = plan;
       await this.ladderV13History?.observe(event, snapshot, plan);
@@ -1555,6 +1558,9 @@ export class ReverseBot {
       if (flatten) {
         if (!(await this.executeSellOpportunity(flatten))) break;
         submitted += 1;
+        // Replan the filled remainder, allowing only one mixed-evidence slice
+        // per evaluation while retaining maker completion for what remains.
+        if ((plan.liquidation?.sellFraction ?? 1) < 1) fractionalSaleSubmitted = true;
         continue;
       }
       if (plan.opportunities.length === 0) break;
@@ -1595,7 +1601,7 @@ export class ReverseBot {
     opportunity: TradeOpportunity,
   ): Promise<boolean> {
     if (!this.trader.placeSell) {
-      throw new Error("ladder_v9 requires executor sell support");
+      throw new Error(`${opportunity.strategyMode ?? "strategy"} requires executor sell support`);
     }
     log("Flattening residual position", {
       market: opportunity.event.title,

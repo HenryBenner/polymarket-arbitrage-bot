@@ -8,6 +8,7 @@ import {
 } from "./kalshi-api.js";
 import { KalshiMarketStream } from "./kalshi-market-stream.js";
 import { exactKalshiOrderFee } from "./kalshi-fees.js";
+import { ladderV13SellGuard } from "./ladder-v13-inventory.js";
 import { log, logThrottled } from "./logger.js";
 import type { MarketStreamEvent } from "./market-stream.js";
 import {
@@ -30,6 +31,8 @@ interface LiveState {
   version: 1;
   orders: PaperOrder[];
   fills: PaperFill[];
+  expectedFillCounts?: Array<[string, number]>;
+  pendingV13Cancellations?: string[];
 }
 
 interface MarketContext {
@@ -62,6 +65,7 @@ export class KalshiTrader implements OrderExecutor {
   private inFlightReservedCash = 0;
   private readonly unconfirmedOrderReservations = new Map<string, number>();
   private readonly expectedFillCounts = new Map<string, number>();
+  private readonly pendingV13Cancellations = new Set<string>();
   private readonly stream: Pick<KalshiMarketStream, "subscribe" | "close">;
   private executionWakeHandler:
     | ((marketSlug: string) => void | Promise<void>)
@@ -92,6 +96,8 @@ export class KalshiTrader implements OrderExecutor {
       this.state = parsed;
       this.state.orders ??= [];
       this.state.fills ??= [];
+      for (const [id, count] of parsed.expectedFillCounts ?? []) this.expectedFillCounts.set(id, count);
+      for (const id of parsed.pendingV13Cancellations ?? []) this.pendingV13Cancellations.add(id);
     } catch (error) {
       const code =
         error && typeof error === "object" && "code" in error
@@ -154,6 +160,8 @@ export class KalshiTrader implements OrderExecutor {
     if (!this.config.dryRun && !this.reconciledMarkets.has(event.slug)) {
       await this.reconcile(event);
       this.reconciledMarkets.add(event.slug);
+    } else if (!this.config.dryRun && this.getMarketExecutionSnapshot(event.slug)?.executionPending) {
+      await this.serializeExecution(event.slug, () => this.reconcile(event));
     }
   }
 
@@ -263,6 +271,15 @@ export class KalshiTrader implements OrderExecutor {
   private async placeSellLocked(
     opportunity: TradeOpportunity,
   ): Promise<OrderResult> {
+    if (opportunity.strategyMode === "ladder_v13") {
+      if (!this.config.dryRun) await this.reconcile(opportunity.event);
+      const snapshot = this.getMarketExecutionSnapshot(opportunity.event.slug);
+      const reason = opportunity.orderPolicy !== "fak" ? "v13_sale_requires_ioc" :
+        snapshot ? ladderV13SellGuard(snapshot, opportunity.token.tokenId, opportunity.size) : "missing_market_snapshot";
+      if (reason) return { dryRun: this.config.dryRun, accepted: false, tokenId: opportunity.token.tokenId,
+        side: "SELL", price: opportunity.price, size: opportunity.size,
+        response: { status: "rejected", reason } };
+    }
     const minimumFailure = validateOrderMinimum(opportunity);
     if (minimumFailure) {
       return minimumOrderRejection(
@@ -338,9 +355,9 @@ export class KalshiTrader implements OrderExecutor {
       outcome: opportunity.token.outcome,
       limitPrice: opportunity.price,
       originalSize: opportunity.size,
-      remainingSize: remaining,
+      remainingSize: opportunity.orderPolicy === "fak" ? round(Math.max(0, opportunity.size - filled)) : remaining,
       queueAhead: 0,
-      status: remaining <= 1e-8
+      status: opportunity.orderPolicy === "fak" ? (filled + 1e-8 >= opportunity.size ? "filled" : "cancelled") : remaining <= 1e-8
         ? filled > 0 ? "filled" : "cancelled"
         : filled > 0 ? "partial" : "open",
       side: "SELL",
@@ -580,7 +597,15 @@ export class KalshiTrader implements OrderExecutor {
 
   private async cancelOrdersLocked(orderIds: string[]): Promise<void> {
     if (orderIds.length === 0 || this.config.dryRun) return;
+    const v13Markets = new Set<string>();
     for (const orderId of orderIds) {
+      const source = this.state.orders.find((candidate) => candidate.id === orderId);
+      if (source?.pairId?.startsWith("ladder-v13:")) {
+        this.pendingV13Cancellations.add(orderId);
+        v13Markets.add(source.marketSlug);
+        // Keep the cancellation barrier through a restart or an uncertain ACK.
+        await this.persist();
+      }
       await this.client.cancelOrder(orderId);
       const order = this.state.orders.find((candidate) => candidate.id === orderId);
       if (order && (order.status === "open" || order.status === "partial")) {
@@ -588,6 +613,10 @@ export class KalshiTrader implements OrderExecutor {
       }
     }
     await this.persist();
+    for (const slug of v13Markets) {
+      const context = this.contexts.get(slug);
+      if (context) await this.reconcile(context.event);
+    }
   }
 
   async amendOrder(
@@ -704,6 +733,9 @@ export class KalshiTrader implements OrderExecutor {
     return structuredClone({
       marketSlug,
       marketDataValid: !this.invalidMarkets.has(marketSlug),
+      executionPending: orders.some((order) => this.pendingV13Cancellations.has(order.id) ||
+        (this.expectedFillCounts.get(order.id) ?? 0) >
+        fills.filter((fill) => fill.orderId === order.id).reduce((sum, fill) => sum + fill.size, 0) + 1e-8),
       orders,
       openOrders,
       fills,
@@ -954,7 +986,8 @@ export class KalshiTrader implements OrderExecutor {
       .filter((fill) => fill.orderId === order.id)
       .reduce((sum, fill) => sum + fill.size, 0);
     order.remainingSize = round(Math.max(0, order.originalSize - filled));
-    order.status = order.remainingSize <= 1e-8 ? "filled" : "partial";
+    order.status = order.remainingSize <= 1e-8 ? "filled" :
+      order.status === "cancelled" || order.orderPolicy === "fak" || order.orderPolicy === "fok" ? "cancelled" : "partial";
     const expectedFill = this.expectedFillCounts.get(order.id);
     if (expectedFill === undefined || filled + 1e-8 >= expectedFill) {
       this.unconfirmedOrderReservations.delete(order.id);
@@ -981,24 +1014,24 @@ export class KalshiTrader implements OrderExecutor {
     if (!order) return;
     const remaining = Number(event.remaining_count_fp);
     const filled = Number(event.fill_count_fp);
-    if (Number.isFinite(filled)) this.expectedFillCounts.set(order.id, filled);
+    if (Number.isFinite(filled)) this.expectedFillCounts.set(order.id, Math.max(filled, this.expectedFillCounts.get(order.id) ?? 0));
     if (Number.isFinite(remaining)) order.remainingSize = Math.max(0, remaining);
     const status = String(event.status ?? "").toLowerCase();
-    if (order.remainingSize <= 1e-8 && (filled > 0 || status === "executed")) {
+    const immediate = order.orderPolicy === "fak" || order.orderPolicy === "fok";
+    if (immediate && Number.isFinite(filled)) {
+      order.remainingSize = round(Math.max(0, order.originalSize - filled));
+      order.status = order.remainingSize <= 1e-8 ? "filled" : "cancelled";
+    } else if (status === "canceled" || status === "cancelled" || status === "rejected") {
+      order.status = "cancelled";
+    } else if (order.remainingSize <= 1e-8 && (filled > 0 || status === "executed")) {
       order.status = "filled";
     } else if (status === "resting") {
       order.status = filled > 0 ? "partial" : "open";
-    } else if (
-      status === "canceled" ||
-      status === "cancelled" ||
-      status === "rejected"
-    ) {
-      order.status = "cancelled";
     }
     const locallyFilled = this.state.fills
       .filter((fill) => fill.orderId === order.id)
       .reduce((sum, fill) => sum + fill.size, 0);
-    if (!Number.isFinite(filled) || locallyFilled + 1e-8 >= filled) {
+    if (locallyFilled + 1e-8 >= (this.expectedFillCounts.get(order.id) ?? 0)) {
       this.unconfirmedOrderReservations.delete(order.id);
       this.expectedFillCounts.delete(order.id);
     }
@@ -1052,6 +1085,9 @@ export class KalshiTrader implements OrderExecutor {
         .reduce((sum, fill) => sum + fill.size, 0);
       order.remainingSize = round(Math.max(0, order.originalSize - filled));
       const remote = remoteById.get(order.id);
+      const remoteFilled = Number(remote?.fill_count_fp);
+      const expected = Math.max(this.expectedFillCounts.get(order.id) ?? 0,
+        Number.isFinite(remoteFilled) ? remoteFilled : 0);
       if (order.remainingSize <= 1e-8) order.status = "filled";
       else if (remote?.status === "resting") {
         order.status = filled > 0 ? "partial" : "open";
@@ -1064,8 +1100,13 @@ export class KalshiTrader implements OrderExecutor {
       ) {
         order.status = "cancelled";
       }
-      this.unconfirmedOrderReservations.delete(order.id);
-      this.expectedFillCounts.delete(order.id);
+      if (filled + 1e-8 >= expected) {
+        this.unconfirmedOrderReservations.delete(order.id);
+        this.expectedFillCounts.delete(order.id);
+        if (remote && ["canceled", "cancelled", "executed"].includes(remote.status) && Number.isFinite(remoteFilled)) {
+          this.pendingV13Cancellations.delete(order.id);
+        }
+      } else this.expectedFillCounts.set(order.id, expected);
     }
     await this.persist();
     if (this.state.fills.length > previousFillCount) {
@@ -1077,7 +1118,9 @@ export class KalshiTrader implements OrderExecutor {
     const operation = async (): Promise<void> => {
       await mkdir(dirname(this.statePath), { recursive: true });
       const temporaryPath = `${this.statePath}.${process.pid}.tmp`;
-      const serialized = JSON.stringify(this.state);
+      const serialized = JSON.stringify({ ...this.state,
+        expectedFillCounts: [...this.expectedFillCounts],
+        pendingV13Cancellations: [...this.pendingV13Cancellations] });
       await writeFile(temporaryPath, serialized, "utf8");
       try {
         await rename(temporaryPath, this.statePath);

@@ -88,6 +88,7 @@ export interface LadderV14Plan {
   unpairedShares: number;
   lockedPnl: number;
   expectedPortfolioValue: number;
+  bestEvaluatedCandidate: LadderV14Candidate | null;
 }
 
 function isV14Order(order: PaperOrder): boolean {
@@ -253,12 +254,6 @@ function openingCandidate(
   );
   const fill = model.estimateFill(context, secondsRemaining);
 
-  const immediateCompletion = exactKalshiDepthCost({
-    levels: opposite.asks,
-    size: conditionalQuantity,
-    rate: snapshot.takerFeeRate,
-    exponent: snapshot.takerFeeExponent,
-  });
   const completionMakerPrice = opposite.bestAsk === null
     ? opposite.bestBid
     : Math.max(tick, round(opposite.bestAsk - tick, 4));
@@ -285,9 +280,12 @@ function openingCandidate(
     rate: snapshot.makerFeeRate ?? 0,
     exponent: snapshot.takerFeeExponent,
   });
-  const fallbackCompletionCost = immediateCompletion
-    ? immediateCompletion.total / conditionalQuantity
-    : completionMakerPrice + makerCompletionFee / conditionalQuantity;
+  // The completion probability is for this passive opposite-side maker
+  // order, so its conditional cost must use the same maker price. Pricing a
+  // successful maker fill at the current taker ask made cold-start EV
+  // systematically too pessimistic and could suppress every opening quote.
+  const fallbackCompletionCost =
+    completionMakerPrice + makerCompletionFee / conditionalQuantity;
   const expectedCompletionCost = model.expectedCompletionCost(
     completionContext,
     fallbackCompletionCost,
@@ -350,8 +348,12 @@ function selectOpeningTargets(
   tick: number,
   features: LadderV14MarketFeatures,
   model: LadderV14ConditionalModel,
-): LadderV14Candidate[] {
+): {
+  selected: LadderV14Candidate[];
+  bestEvaluated: LadderV14Candidate | null;
+} {
   const selected: LadderV14Candidate[] = [];
+  let bestEvaluated: LadderV14Candidate | null = null;
   for (let sideIndex = 0; sideIndex < 2; sideIndex += 1) {
     const book = books[sideIndex]!;
     const opposite = books[1 - sideIndex]!;
@@ -382,6 +384,12 @@ function selectOpeningTargets(
           model,
         );
         if (!candidate) continue;
+        if (
+          !bestEvaluated ||
+          candidate.expectedValue > bestEvaluated.expectedValue
+        ) {
+          bestEvaluated = candidate;
+        }
         candidate.marginalValue = candidate.expectedValue - previousValue;
         previousValue = candidate.expectedValue;
         if (candidate.expectedValue > EPSILON) {
@@ -410,7 +418,7 @@ function selectOpeningTargets(
       }
     }
   }
-  return selected;
+  return { selected, bestEvaluated };
 }
 
 function opportunity(
@@ -686,6 +694,7 @@ export function planLadderV14(
     unpairedShares: inventory.unpairedShares,
     lockedPnl: inventory.lockedPnl,
     expectedPortfolioValue: 0,
+    bestEvaluatedCandidate: null,
   };
   const books = [...snapshot.books].sort(
     (left, right) => left.outcomeIndex - right.outcomeIndex,
@@ -709,7 +718,7 @@ export function planLadderV14(
   }
 
   const tick = Number(tickSizeFromMarket(event.market));
-  const candidates = selectOpeningTargets(
+  const openingSelection = selectOpeningTargets(
     config,
     event,
     snapshot,
@@ -719,7 +728,9 @@ export function planLadderV14(
     features,
     model,
   );
+  const candidates = openingSelection.selected;
   base.candidates = candidates;
+  base.bestEvaluatedCandidate = openingSelection.bestEvaluated;
   base.expectedPortfolioValue = candidates.reduce(
     (sum, candidate) => sum + candidate.expectedValue,
     0,

@@ -1784,6 +1784,21 @@ export class ReverseBot {
         lockedPnl: plan.lockedPnl,
         positiveEvLevels: plan.candidates.length,
         expectedPortfolioValue: plan.expectedPortfolioValue,
+        bestEvaluatedEv: plan.bestEvaluatedCandidate?.expectedValue ?? null,
+        bestEvaluatedEvPerShare:
+          plan.bestEvaluatedCandidate?.expectedValuePerShare ?? null,
+        bestEvaluatedOutcome: plan.bestEvaluatedCandidate?.outcome ?? null,
+        bestEvaluatedPrice: plan.bestEvaluatedCandidate?.price ?? null,
+        bestFillProbability:
+          plan.bestEvaluatedCandidate?.fillProbability ?? null,
+        bestPairProbability:
+          plan.bestEvaluatedCandidate?.pairProbability ?? null,
+        bestExpectedCompletionCost:
+          plan.bestEvaluatedCandidate?.expectedCompletionCost ?? null,
+        bestExpectedFailedExit:
+          plan.bestEvaluatedCandidate?.expectedFailedExit ?? null,
+        bestSweepPrefixShares:
+          plan.bestEvaluatedCandidate?.sweepPrefixShares ?? null,
       }, 60_000);
       this.trader.reportMarket?.(event.slug);
     }

@@ -165,6 +165,34 @@ test("V14 conditions deeper maker layers on all more-aggressive fills", () => {
   assert.ok(plan.candidates.every((candidate) => candidate.expectedValue > 0));
 });
 
+test("V14 prices conditional passive completion at its maker quote", () => {
+  const books = testBooks(0.5, 0.52);
+  books[0]!.bids = [{ price: 0.48, size: 100 }];
+  books[1]!.bids = [{ price: 0.49, size: 100 }];
+  books[0]!.asks = [{ price: 0.5, size: 100 }];
+  books[1]!.asks = [{ price: 0.52, size: 100 }];
+  const alwaysPairs = {
+    estimateFill: () => ({ probability: 1 }),
+    estimateCompletion: () => ({ probability: 1 }),
+    expectedCompletionCost: (_context: LadderV14ConditionalContext, fallback: number) => fallback,
+    expectedFailedExit: (context: LadderV14ConditionalContext) => context.currentBid ?? 0,
+  } as unknown as LadderV14ConditionalModel;
+  const plan = planLadderV14(
+    testConfig({ exchange: "kalshi", strategyMode: "ladder_v14" }),
+    event,
+    snapshot(books),
+    alwaysPairs,
+    features(books),
+    event.windowEnd - 600,
+  );
+  const yesAt48 = plan.candidates.find(
+    (candidate) => candidate.tokenId === "up-token" && candidate.price === 0.48,
+  );
+  assert.ok(yesAt48);
+  assert.equal(yesAt48.expectedCompletionCost, 0.51);
+  assert.ok(yesAt48.expectedValue > 0);
+});
+
 test("V14 keeps one aggregate maker order per outcome and price", () => {
   const books = testBooks(0.45, 0.55);
   books[0]!.bids = [{ price: 0.4, size: 40 }];

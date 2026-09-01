@@ -181,6 +181,10 @@ export interface BotConfig {
   ladderV14FlowWindowSeconds: number;
   ladderV14VolatilityWindowSeconds: number;
   ladderV14FinalCleanupSeconds: number;
+  ladderV14QuoteLifetimeSeconds: number;
+  ladderV14PseudoFlowDepthFraction: number;
+  ladderV14QuantityQueueWeight: number;
+  ladderV14ReachabilityMultiplier: number;
   paperStartingUsdc: number;
   paperStatePath: string;
 }
@@ -392,6 +396,22 @@ export function loadConfig(): BotConfig {
     ladderV14FinalCleanupSeconds: envNumber(
       "LADDER_V14_FINAL_CLEANUP_SECONDS",
       30,
+    ),
+    ladderV14QuoteLifetimeSeconds: envNumber(
+      "LADDER_V14_QUOTE_LIFETIME_SECONDS",
+      5,
+    ),
+    ladderV14PseudoFlowDepthFraction: envNumber(
+      "LADDER_V14_PSEUDO_FLOW_DEPTH_FRACTION",
+      1,
+    ),
+    ladderV14QuantityQueueWeight: envNumber(
+      "LADDER_V14_QUANTITY_QUEUE_WEIGHT",
+      1,
+    ),
+    ladderV14ReachabilityMultiplier: envNumber(
+      "LADDER_V14_REACHABILITY_MULTIPLIER",
+      1.5,
     ),
     paperStartingUsdc: envNumber("PAPER_STARTING_USDC", 100),
     paperStatePath: envString("PAPER_STATE_PATH", "./data/paper"),
@@ -848,7 +868,15 @@ export function validateTradingConfig(config: BotConfig): void {
     !Number.isFinite(config.ladderV14VolatilityWindowSeconds) ||
     config.ladderV14VolatilityWindowSeconds <= 0 ||
     !Number.isFinite(config.ladderV14FinalCleanupSeconds) ||
-    config.ladderV14FinalCleanupSeconds < 0
+    config.ladderV14FinalCleanupSeconds < 0 ||
+    !Number.isFinite(config.ladderV14QuoteLifetimeSeconds) ||
+    config.ladderV14QuoteLifetimeSeconds <= 0 ||
+    !Number.isFinite(config.ladderV14PseudoFlowDepthFraction) ||
+    config.ladderV14PseudoFlowDepthFraction < 0 ||
+    !Number.isFinite(config.ladderV14QuantityQueueWeight) ||
+    config.ladderV14QuantityQueueWeight <= 0 ||
+    !Number.isFinite(config.ladderV14ReachabilityMultiplier) ||
+    config.ladderV14ReachabilityMultiplier <= 0
   ) {
     throw new Error("LADDER_V14 model and window settings must be finite and positive");
   }

@@ -26,6 +26,17 @@ function features(books: readonly TokenBook[]): LadderV14MarketFeatures {
   };
 }
 
+function flowingFeatures(
+  books: readonly TokenBook[],
+  flowPerSecond: number,
+): LadderV14MarketFeatures {
+  const result = features(books);
+  result.eligibleVolumePerSecondByToken = Object.fromEntries(
+    books.map((book) => [book.tokenId, flowPerSecond]),
+  );
+  return result;
+}
+
 function snapshot(
   books: TokenBook[],
   orders: PaperOrder[] = [],
@@ -139,15 +150,106 @@ test("V14 learns completion cost and failed-completion recovery separately by se
   );
 });
 
+test("V14 permits exactly zero hazard and makes pseudo-flow quantity-aware", () => {
+  const model = new LadderV14ConditionalModel(parameters);
+  const zero = model.estimateFill({
+    ...baseContext,
+    flowPerSecond: 0,
+    queueAhead: 0,
+    depth: 0,
+  }, 5);
+  assert.equal(zero.hazard, 0);
+  assert.equal(zero.probability, 0);
+
+  const small = model.estimateFill({
+    ...baseContext,
+    flowPerSecond: 0,
+    queueAhead: 20,
+    depth: 60,
+    quantity: 10,
+  }, 5);
+  const large = model.estimateFill({
+    ...baseContext,
+    flowPerSecond: 0,
+    queueAhead: 20,
+    depth: 60,
+    quantity: 1_000,
+  }, 5);
+  assert.ok(small.probability > 0);
+  assert.ok(large.probability < small.probability);
+});
+
+test("V14 requires every cumulative quantity segment to have positive marginal EV", () => {
+  const books = testBooks(0.45, 0.45, 1);
+  const marginalModel = {
+    estimateFill: (context: LadderV14ConditionalContext) => ({
+      probability: context.quantity <= 10 ? 1 : context.quantity <= 20 ? 0.4 : 0.01,
+      hazard: 1,
+    }),
+    estimateCompletion: () => ({ probability: 1, hazard: 1 }),
+    expectedCompletionCost: (_context: LadderV14ConditionalContext, fallback: number) => fallback,
+    expectedFailedExit: () => 0,
+  } as unknown as LadderV14ConditionalModel;
+  const plan = planLadderV14(
+    testConfig({ exchange: "kalshi", strategyMode: "ladder_v14" }),
+    event,
+    snapshot(books),
+    marginalModel,
+    flowingFeatures(books, 100),
+    event.windowEnd - 600,
+  );
+  assert.ok(plan.candidates.length > 0);
+  assert.ok(plan.candidates.every((candidate) => candidate.size <= 10));
+  assert.ok(plan.candidates.every((candidate) =>
+    candidate.quantityOptions.every((option) => option.marginalValue > 0)
+  ));
+});
+
+test("V14 bounds quotes by reachable flow and ranks them by profit turnover", () => {
+  const books = testBooks(0.65, 0.37, 1);
+  books[0]!.bestBid = 0.63;
+  books[0]!.bids = [{ price: 0.63, size: 500 }];
+  books[1]!.bestBid = 0.35;
+  books[1]!.bids = [{ price: 0.35, size: 500 }];
+  const alwaysPairs = {
+    estimateFill: () => ({ probability: 0.7, hazard: 0.25 }),
+    estimateCompletion: () => ({ probability: 1, hazard: 0.5 }),
+    expectedCompletionCost: (_context: LadderV14ConditionalContext, fallback: number) => fallback,
+    expectedFailedExit: () => 0,
+  } as unknown as LadderV14ConditionalModel;
+  const plan = planLadderV14(
+    testConfig({
+      exchange: "kalshi",
+      strategyMode: "ladder_v14",
+      ladderV14QuoteLifetimeSeconds: 5,
+      ladderV14ReachabilityMultiplier: 1,
+    }),
+    event,
+    snapshot(books),
+    alwaysPairs,
+    flowingFeatures(books, 40),
+    event.windowEnd - 600,
+  );
+  assert.ok(plan.candidates.length > 0);
+  assert.ok(plan.candidates.every((candidate) => candidate.size <= 200));
+  assert.ok(plan.candidates.every((candidate) => candidate.price > 0.1));
+  for (let index = 1; index < plan.candidates.length; index += 1) {
+    assert.ok(
+      plan.candidates[index - 1]!.expectedProfitRate + 1e-12 >=
+        plan.candidates[index]!.expectedProfitRate,
+    );
+  }
+});
+
 test("V14 conditions deeper maker layers on all more-aggressive fills", () => {
-  const books = testBooks(0.45, 0.55);
+  const books = testBooks(0.45, 0.55, 1);
   books[0]!.bids = [{ price: 0.4, size: 40 }];
   books[1]!.bids = [{ price: 0.5, size: 40 }];
   books[0]!.asks = [{ price: 0.45, size: 100 }];
   books[1]!.asks = [{ price: 0.55, size: 100 }];
   const alwaysPairs = {
-    estimateFill: () => ({ probability: 1 }),
-    estimateCompletion: () => ({ probability: 1 }),
+    estimateFill: () => ({ probability: 1, hazard: 1 }),
+    estimateCompletion: () => ({ probability: 1, hazard: 1 }),
     expectedCompletionCost: (_context: LadderV14ConditionalContext, fallback: number) => fallback,
     expectedFailedExit: (context: LadderV14ConditionalContext) => context.currentBid ?? 0,
   } as unknown as LadderV14ConditionalModel;
@@ -156,24 +258,32 @@ test("V14 conditions deeper maker layers on all more-aggressive fills", () => {
     event,
     snapshot(books),
     alwaysPairs,
-    features(books),
+    flowingFeatures(books, 100),
     event.windowEnd - 600,
   );
-  assert.ok(plan.candidates.length > 2);
-  assert.equal(plan.candidates[0]!.sweepPrefixShares, 0);
+  assert.ok(plan.candidates.length >= 2);
   assert.ok(plan.candidates.some((candidate) => candidate.sweepPrefixShares > 0));
   assert.ok(plan.candidates.every((candidate) => candidate.expectedValue > 0));
+  for (const outcome of ["Up", "Down"]) {
+    let selectedPrefix = 0;
+    for (const candidate of plan.candidates
+      .filter((item) => item.outcome === outcome)
+      .sort((left, right) => right.price - left.price)) {
+      assert.equal(candidate.sweepPrefixShares, selectedPrefix);
+      selectedPrefix += candidate.size;
+    }
+  }
 });
 
 test("V14 prices conditional passive completion at its maker quote", () => {
-  const books = testBooks(0.5, 0.52);
+  const books = testBooks(0.5, 0.52, 1);
   books[0]!.bids = [{ price: 0.48, size: 100 }];
   books[1]!.bids = [{ price: 0.49, size: 100 }];
   books[0]!.asks = [{ price: 0.5, size: 100 }];
   books[1]!.asks = [{ price: 0.52, size: 100 }];
   const alwaysPairs = {
-    estimateFill: () => ({ probability: 1 }),
-    estimateCompletion: () => ({ probability: 1 }),
+    estimateFill: () => ({ probability: 1, hazard: 1 }),
+    estimateCompletion: () => ({ probability: 1, hazard: 1 }),
     expectedCompletionCost: (_context: LadderV14ConditionalContext, fallback: number) => fallback,
     expectedFailedExit: (context: LadderV14ConditionalContext) => context.currentBid ?? 0,
   } as unknown as LadderV14ConditionalModel;
@@ -182,30 +292,31 @@ test("V14 prices conditional passive completion at its maker quote", () => {
     event,
     snapshot(books),
     alwaysPairs,
-    features(books),
+    flowingFeatures(books, 100),
     event.windowEnd - 600,
   );
   const yesAt48 = plan.candidates.find(
     (candidate) => candidate.tokenId === "up-token" && candidate.price === 0.48,
   );
   assert.ok(yesAt48);
-  assert.equal(yesAt48.expectedCompletionCost, 0.51);
+  assert.ok(yesAt48.expectedCompletionCost >= 0.51);
+  assert.ok(yesAt48.expectedCompletionCost < 0.511);
   assert.ok(yesAt48.expectedValue > 0);
 });
 
 test("V14 keeps one aggregate maker order per outcome and price", () => {
-  const books = testBooks(0.45, 0.55);
+  const books = testBooks(0.45, 0.55, 1);
   books[0]!.bids = [{ price: 0.4, size: 40 }];
   books[1]!.bids = [{ price: 0.5, size: 40 }];
   const alwaysPairs = {
-    estimateFill: () => ({ probability: 1 }),
-    estimateCompletion: () => ({ probability: 1 }),
+    estimateFill: () => ({ probability: 1, hazard: 1 }),
+    estimateCompletion: () => ({ probability: 1, hazard: 1 }),
     expectedCompletionCost: (_context: LadderV14ConditionalContext, fallback: number) => fallback,
     expectedFailedExit: (context: LadderV14ConditionalContext) => context.currentBid ?? 0,
   } as unknown as LadderV14ConditionalModel;
   const config = testConfig({ exchange: "kalshi", strategyMode: "ladder_v14" });
   const initial = planLadderV14(
-    config, event, snapshot(books), alwaysPairs, features(books), event.windowEnd - 600,
+    config, event, snapshot(books), alwaysPairs, flowingFeatures(books, 100), event.windowEnd - 600,
   );
   const target = initial.opportunities[0]!;
   const first = v14Order("duplicate-a", target.token.tokenId, target.price, target.size, "open");
@@ -215,7 +326,7 @@ test("V14 keeps one aggregate maker order per outcome and price", () => {
     event,
     snapshot(books, [first, second]),
     alwaysPairs,
-    features(books),
+    flowingFeatures(books, 100),
     event.windowEnd - 600,
   );
   assert.deepEqual(reconciled.cancelOrderIds, [second.id]);
@@ -235,7 +346,11 @@ test("V14 economically locks a small loss when it beats selling or waiting", () 
     testConfig({ exchange: "kalshi", strategyMode: "ladder_v14" }),
     event,
     state,
-    new LadderV14ConditionalModel(parameters),
+    {
+      estimateCompletion: () => ({ probability: 0, hazard: 0 }),
+      expectedCompletionCost: () => 0.42,
+      expectedFailedExit: () => 0.1,
+    } as unknown as LadderV14ConditionalModel,
     features(books),
     event.windowEnd - 300,
   );

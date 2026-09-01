@@ -1,14 +1,18 @@
 import type { ExecutionMode } from "./types.js";
 
 const EPSILON = 1e-10;
-const GLOBAL_COMPLETION_PROBABILITY = 0.5;
 const GLOBAL_RECOVERY_RATIO = 0.522;
+const DISTANCE_DECAY_PER_TICK = 0.65;
 
 export interface LadderV14Parameters {
   priorStrength: number;
   flowWindowSeconds: number;
   volatilityWindowSeconds: number;
   finalCleanupSeconds: number;
+  quoteLifetimeSeconds: number;
+  pseudoFlowDepthFraction: number;
+  quantityQueueWeight: number;
+  reachabilityMultiplier: number;
 }
 
 export interface LadderV14ConditionalContext {
@@ -100,6 +104,27 @@ function emptyMoment(): MomentStats {
   return { count: 0, sum: 0, sumSquares: 0 };
 }
 
+export function ladderV14DistancePenalty(distanceTicks: number): number {
+  return Math.exp(-DISTANCE_DECAY_PER_TICK * Math.max(0, distanceTicks));
+}
+
+/** Conservative cold-start flow derived from displayed depth, never order size. */
+export function ladderV14EffectiveFlow(
+  context: LadderV14ConditionalContext,
+  parameters: Pick<
+    LadderV14Parameters,
+    "flowWindowSeconds" | "pseudoFlowDepthFraction"
+  >,
+): number {
+  if (context.flowPerSecond > EPSILON) return context.flowPerSecond;
+  const referenceDepth = Math.max(0, context.depth, context.queueAhead);
+  if (referenceDepth <= EPSILON || parameters.pseudoFlowDepthFraction <= 0) {
+    return 0;
+  }
+  return referenceDepth * parameters.pseudoFlowDepthFraction /
+    parameters.flowWindowSeconds;
+}
+
 /** Indexed conditional sufficient statistics; estimate calls never scan observations. */
 export class LadderV14ConditionalModel {
   private readonly hazards: Map<string, HazardStats>;
@@ -135,16 +160,16 @@ export class LadderV14ConditionalModel {
     horizonSeconds: number,
   ): LadderV14HazardEstimate {
     const horizon = Math.max(0, horizonSeconds);
-    const queueWork = Math.max(0.01, context.queueAhead + 0.5 * context.quantity);
-    const globalHazard = -Math.log(1 - GLOBAL_COMPLETION_PROBABILITY) / 900;
-    const baseAnalytical = context.flowPerSecond > EPSILON
-      ? context.flowPerSecond / queueWork
-      : globalHazard;
-    // Resting orders several ticks behind the touch should not inherit the
-    // same cold-start hazard as the current best bid.
-    const analytical = baseAnalytical * Math.exp(
-      -0.65 * Math.max(0, context.distanceTicks),
+    const effectiveFlow = ladderV14EffectiveFlow(context, this.parameters);
+    const queueWork = Math.max(
+      EPSILON,
+      context.queueAhead +
+        this.parameters.quantityQueueWeight * Math.max(0, context.quantity),
     );
+    const analytical = effectiveFlow <= EPSILON
+      ? 0
+      : effectiveFlow / queueWork *
+        ladderV14DistancePenalty(context.distanceTicks);
     const key = `${kind}|${contextBucket(context)}`;
     const direct = this.hazards.get(key);
     let source: LadderV14HazardEstimate["source"] = "analytical";
@@ -168,7 +193,7 @@ export class LadderV14ConditionalModel {
     const events = analytical * priorExposure + boot.events + (direct?.events ?? 0);
     const exposure = priorExposure + boot.exposureSeconds +
       (direct?.exposureSeconds ?? 0);
-    const hazard = Math.max(EPSILON, events / Math.max(EPSILON, exposure));
+    const hazard = Math.max(0, events / Math.max(EPSILON, exposure));
     if (direct && direct.observations > 0) source = "posterior";
     return {
       hazard,
@@ -301,6 +326,16 @@ export function ladderV14Parameters(input: {
   flowWindowSeconds: number;
   volatilityWindowSeconds: number;
   finalCleanupSeconds: number;
+  quoteLifetimeSeconds?: number;
+  pseudoFlowDepthFraction?: number;
+  quantityQueueWeight?: number;
+  reachabilityMultiplier?: number;
 }): LadderV14Parameters {
-  return { ...input };
+  return {
+    ...input,
+    quoteLifetimeSeconds: input.quoteLifetimeSeconds ?? 5,
+    pseudoFlowDepthFraction: input.pseudoFlowDepthFraction ?? 1,
+    quantityQueueWeight: input.quantityQueueWeight ?? 1,
+    reachabilityMultiplier: input.reachabilityMultiplier ?? 1.5,
+  };
 }

@@ -5,9 +5,11 @@ import {
   exactKalshiOrderFee,
 } from "./kalshi-fees.js";
 import { ladderV14Inventory } from "./ladder-v14-inventory.js";
-import type {
-  LadderV14ConditionalContext,
-  LadderV14ConditionalModel,
+import {
+  ladderV14DistancePenalty,
+  ladderV14EffectiveFlow,
+  type LadderV14ConditionalContext,
+  type LadderV14ConditionalModel,
 } from "./ladder-v14-model.js";
 import type {
   MarketExecutionSnapshot,
@@ -39,6 +41,8 @@ export interface LadderV14Candidate {
   expectedValue: number;
   marginalValue: number;
   expectedValuePerShare: number;
+  expectedProfitRate: number;
+  expectedExposureSeconds: number;
   fillProbability: number;
   pairProbability: number;
   expectedCompletionCost: number;
@@ -53,6 +57,8 @@ export interface LadderV14QuantityOption {
   expectedValue: number;
   marginalValue: number;
   expectedValuePerShare: number;
+  expectedProfitRate: number;
+  expectedExposureSeconds: number;
   context: LadderV14ConditionalContext;
 }
 
@@ -121,6 +127,22 @@ function depthAtOrBetter(book: TokenBook, price: number): number {
     .reduce((sum, level) => sum + Math.max(0, level.size), 0);
 }
 
+function flowReferenceDepth(book: TokenBook, price: number): number {
+  const touchDepth = book.bestBid === null
+    ? 0
+    : book.bids
+      .filter((level) => Math.abs(level.price - book.bestBid!) <= EPSILON)
+      .reduce((sum, level) => sum + Math.max(0, level.size), 0);
+  return Math.max(touchDepth, depthAtOrBetter(book, price));
+}
+
+function expectedMinimumTime(hazard: number, horizonSeconds: number): number {
+  const horizon = Math.max(0, horizonSeconds);
+  if (horizon <= EPSILON) return 0;
+  if (hazard <= EPSILON) return horizon;
+  return (1 - Math.exp(-hazard * horizon)) / hazard;
+}
+
 function contextFor(
   config: BotConfig,
   event: UpDownEvent,
@@ -169,10 +191,15 @@ function makerPrices(book: TokenBook, tick: number): number[] {
 }
 
 function quantityBreakpoints(
+  config: BotConfig,
+  event: UpDownEvent,
   book: TokenBook,
   opposite: TokenBook,
-  flowPerSecond: number,
+  price: number,
+  sweepPrefixShares: number,
   secondsRemaining: number,
+  tick: number,
+  features: LadderV14MarketFeatures,
 ): number[] {
   const minimum = Math.max(
     0.01,
@@ -187,14 +214,46 @@ function quantityBreakpoints(
     if (next > EPSILON) values.push(next);
     return values;
   }, []);
-  const physicalHorizon = Math.max(
-    minimum,
-    ...bookBreakpoints,
-    flowPerSecond * Math.max(0, secondsRemaining),
+  const queue = queueAhead(book, price);
+  const distanceTicks = Math.max(
+    0,
+    Math.round(((book.bestBid ?? price) - price) / tick),
   );
+  const reachabilityContext = contextFor(
+    config,
+    event,
+    book,
+    price,
+    minimum,
+    queue,
+    distanceTicks,
+    secondsRemaining,
+    features,
+    { depth: flowReferenceDepth(book, price) },
+  );
+  const effectiveFlow = ladderV14EffectiveFlow(reachabilityContext, {
+    flowWindowSeconds: config.ladderV14FlowWindowSeconds,
+    pseudoFlowDepthFraction: config.ladderV14PseudoFlowDepthFraction,
+  });
+  const quoteLifetime = Math.min(
+    Math.max(0, secondsRemaining),
+    config.ladderV14QuoteLifetimeSeconds,
+  );
+  const grossReachable = effectiveFlow * quoteLifetime *
+    ladderV14DistancePenalty(distanceTicks) *
+    config.ladderV14ReachabilityMultiplier;
+  const queueBurden = queue +
+    config.ladderV14QuantityQueueWeight * Math.max(0, sweepPrefixShares);
+  const physicalHorizon = grossReachable <= EPSILON
+    ? 0
+    : grossReachable / (1 + queueBurden / grossReachable);
+  if (physicalHorizon + EPSILON < minimum) return [];
   const result = new Set<number>([round(minimum, 2)]);
   for (const value of bookBreakpoints) {
-    if (value + EPSILON >= minimum) result.add(round(value, 2));
+    if (
+      value + EPSILON >= minimum &&
+      value <= physicalHorizon + EPSILON
+    ) result.add(round(value, 2));
   }
   let magnitude = 1;
   while (magnitude <= physicalHorizon * 10 + EPSILON) {
@@ -246,13 +305,18 @@ function openingCandidate(
     event,
     book,
     entryAllIn,
-    conditionalQuantity,
+    quantity,
     queueAhead(book, price),
     distance,
     secondsRemaining,
     features,
+    { depth: flowReferenceDepth(book, price) },
   );
-  const fill = model.estimateFill(context, secondsRemaining);
+  const quoteLifetime = Math.min(
+    secondsRemaining,
+    config.ladderV14QuoteLifetimeSeconds,
+  );
+  const fill = model.estimateFill(context, quoteLifetime);
 
   const completionMakerPrice = opposite.bestAsk === null
     ? opposite.bestBid
@@ -261,6 +325,7 @@ function openingCandidate(
   const completionQueue = queueAhead(opposite, completionMakerPrice);
   const completionContext: LadderV14ConditionalContext = {
     ...context,
+    quantity: conditionalQuantity,
     queueAhead: completionQueue,
     flowPerSecond:
       features.eligibleVolumePerSecondByToken[opposite.tokenId] ?? 0,
@@ -268,7 +333,7 @@ function openingCandidate(
       0,
       Math.round(((opposite.bestBid ?? completionMakerPrice) - completionMakerPrice) / tick),
     ),
-    depth: depthAtOrBetter(opposite, completionMakerPrice),
+    depth: flowReferenceDepth(opposite, completionMakerPrice),
   };
   const completion = model.estimateCompletion(
     completionContext,
@@ -321,6 +386,16 @@ function openingCandidate(
   // Quantity is the new marginal layer. Probabilities and recovery are
   // conditioned on every more-aggressive layer having swept first.
   const expectedValue = fill.probability * filledValuePerShare * quantity;
+  const restingExposure = expectedMinimumTime(fill.hazard, quoteLifetime);
+  const postFillExposure = expectedMinimumTime(
+    completion.hazard,
+    secondsRemaining,
+  );
+  const expectedExposureSeconds = restingExposure +
+    fill.probability * postFillExposure;
+  const committedCapital = Math.max(EPSILON, entryAllIn * quantity);
+  const expectedProfitRate = expectedValue /
+    (committedCapital * Math.max(EPSILON, expectedExposureSeconds));
   return {
     tokenId: book.tokenId,
     outcome: book.outcome,
@@ -329,6 +404,8 @@ function openingCandidate(
     expectedValue,
     marginalValue: expectedValue,
     expectedValuePerShare: expectedValue / quantity,
+    expectedProfitRate,
+    expectedExposureSeconds,
     fillProbability: fill.probability,
     pairProbability: completion.probability,
     expectedCompletionCost,
@@ -360,13 +437,19 @@ function selectOpeningTargets(
     let sweepPrefix = 0;
     for (const price of makerPrices(book, tick)) {
       const breakpoints = quantityBreakpoints(
+        config,
+        event,
         book,
         opposite,
-        features.eligibleVolumePerSecondByToken[book.tokenId] ?? 0,
+        price,
+        sweepPrefix,
         secondsRemaining,
+        tick,
+        features,
       );
       let previousValue = 0;
       let best: LadderV14Candidate | null = null;
+      let marginalChainPositive = true;
       const options: LadderV14QuantityOption[] = [];
       for (const quantity of breakpoints) {
         const candidate = openingCandidate(
@@ -392,20 +475,22 @@ function selectOpeningTargets(
         }
         candidate.marginalValue = candidate.expectedValue - previousValue;
         previousValue = candidate.expectedValue;
-        if (candidate.expectedValue > EPSILON) {
+        const marginalPositive = candidate.marginalValue > EPSILON;
+        if (!marginalPositive) marginalChainPositive = false;
+        if (marginalChainPositive && marginalPositive) {
           options.push({
             size: candidate.size,
             expectedValue: candidate.expectedValue,
             marginalValue: candidate.marginalValue,
             expectedValuePerShare: candidate.expectedValuePerShare,
+            expectedProfitRate: candidate.expectedProfitRate,
+            expectedExposureSeconds: candidate.expectedExposureSeconds,
             context: candidate.context,
           });
         }
-        // Evaluate every distinct breakpoint; do not assume monotonic marginal EV.
-        if (
-          candidate.expectedValue > EPSILON &&
-          (!best || candidate.expectedValue > best.expectedValue)
-        ) {
+        // A cumulative size is eligible only when every segment needed to
+        // reach it has strictly positive marginal portfolio EV.
+        if (marginalChainPositive && marginalPositive) {
           best = candidate;
         }
       }
@@ -728,7 +813,9 @@ export function planLadderV14(
     features,
     model,
   );
-  const candidates = openingSelection.selected;
+  const candidates = openingSelection.selected.sort(
+    (left, right) => right.expectedProfitRate - left.expectedProfitRate,
+  );
   base.candidates = candidates;
   base.bestEvaluatedCandidate = openingSelection.bestEvaluated;
   base.expectedPortfolioValue = candidates.reduce(

@@ -286,7 +286,17 @@ evaluated as if all more-aggressive layers filled in one sweep. The planner
 maintains at most one aggregate order at each market/outcome/price and amends
 that order when its optimal quantity changes. Quantity comes from actual book,
 queue, flow, fee, completion, recovery, and inventory breakpoints; there is no
-fixed 20-share size or strategy-level contract cap.
+fixed 20-share size or strategy-level contract cap. Every cumulative quantity
+must add strictly positive marginal EV. A flow-and-queue reachability horizon
+prevents unlimited paper capital from producing physically unreachable sizes.
+
+Zero modeled flow can produce exactly zero fill probability. Until qualifying
+flow is observed, cold start converts a configurable fraction of displayed
+touch depth into conservative pseudo-flow and then applies
+`flow / (queue + alpha * quantity)` plus a distance penalty. Opening fills use
+a configurable quote lifetime (five seconds by default), not the entire time
+left in the market. Only selected, simultaneously resting aggressive levels
+enter deeper-layer sweep exposure.
 
 When a one-sided fill exists, V14 stops ordinary opening accumulation and
 compares marginal `hedge`, `sell`, and `wait` value on every update. A hedge may
@@ -307,8 +317,10 @@ or ETH pairing rates.
 Paper mode sets `capitalConstraint=false`: normal cash never becomes negative,
 while theoretical cash, gross deployment, marked inventory, and realized and
 unrealized P&L remain explicit metrics. Live mode uses one global allocator,
-ranks positive opening segments by marginal EV per committed dollar, executes
-one acknowledged mutation, and then replans every market against current cash.
+ranks positive opening segments by expected profit per capital-exposure second,
+executes one acknowledged mutation, and then replans every market against
+current cash. This favors realizable pair turnover over remote quotes with
+similar theoretical EV and negligible fill probability.
 
 Implementation:
 

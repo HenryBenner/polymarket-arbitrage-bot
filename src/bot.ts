@@ -1685,7 +1685,10 @@ export class ReverseBot {
                   context: option.context,
                 },
                 releasedCash: currentOrder.limitPrice * currentOrder.remainingSize,
-                score: incrementalValue / Math.max(1e-8, incrementalCash),
+                score: incrementalValue / Math.max(
+                  1e-8,
+                  incrementalCash * option.expectedExposureSeconds,
+                ),
               };
             })
             .filter((item) => item.score > 0);
@@ -1698,7 +1701,7 @@ export class ReverseBot {
             : undefined,
           releasedCash: 0,
           score: candidate
-            ? candidate.expectedValue / Math.max(1e-8, amendment.opportunity.price * amendment.opportunity.size)
+            ? candidate.expectedProfitRate
             : 0,
         }];
       }),
@@ -1739,6 +1742,9 @@ export class ReverseBot {
             : [{
                 size: opportunity.size,
                 expectedValue: candidate?.expectedValue ?? 0,
+                expectedProfitRate: candidate?.expectedProfitRate ?? 0,
+                expectedExposureSeconds:
+                  candidate?.expectedExposureSeconds ?? Number.POSITIVE_INFINITY,
                 context: candidate?.context,
               }];
           return options.map((option) => {
@@ -1749,14 +1755,13 @@ export class ReverseBot {
                   size: option.size,
                   tradeKey: `${opportunity.tradeKey}:q${option.size}`,
                 };
-            const committed = Math.max(1e-8, allocated.price * allocated.size);
             return {
               entry,
               opportunity: allocated,
               placement: option.context
                 ? { kind: "fill" as const, context: option.context }
                 : undefined,
-              score: option.expectedValue / committed,
+              score: option.expectedProfitRate,
             };
           });
         }),
@@ -1787,6 +1792,10 @@ export class ReverseBot {
         bestEvaluatedEv: plan.bestEvaluatedCandidate?.expectedValue ?? null,
         bestEvaluatedEvPerShare:
           plan.bestEvaluatedCandidate?.expectedValuePerShare ?? null,
+        bestEvaluatedProfitRate:
+          plan.bestEvaluatedCandidate?.expectedProfitRate ?? null,
+        bestExpectedExposureSeconds:
+          plan.bestEvaluatedCandidate?.expectedExposureSeconds ?? null,
         bestEvaluatedOutcome: plan.bestEvaluatedCandidate?.outcome ?? null,
         bestEvaluatedPrice: plan.bestEvaluatedCandidate?.price ?? null,
         bestFillProbability:

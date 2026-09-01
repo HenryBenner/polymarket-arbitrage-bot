@@ -122,6 +122,10 @@ export class LadderV14HistoryStore {
         flowWindowSeconds: config.ladderV14FlowWindowSeconds,
         volatilityWindowSeconds: config.ladderV14VolatilityWindowSeconds,
         finalCleanupSeconds: config.ladderV14FinalCleanupSeconds,
+        quoteLifetimeSeconds: config.ladderV14QuoteLifetimeSeconds,
+        pseudoFlowDepthFraction: config.ladderV14PseudoFlowDepthFraction,
+        quantityQueueWeight: config.ladderV14QuantityQueueWeight,
+        reachabilityMultiplier: config.ladderV14ReachabilityMultiplier,
       }),
       state?.model,
     );

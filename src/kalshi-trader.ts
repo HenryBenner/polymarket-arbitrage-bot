@@ -9,6 +9,7 @@ import {
 import { KalshiMarketStream } from "./kalshi-market-stream.js";
 import { exactKalshiOrderFee } from "./kalshi-fees.js";
 import { ladderV13SellGuard } from "./ladder-v13-inventory.js";
+import { ladderV14SellGuard } from "./ladder-v14-inventory.js";
 import { log, logThrottled } from "./logger.js";
 import type { MarketStreamEvent } from "./market-stream.js";
 import {
@@ -280,6 +281,24 @@ export class KalshiTrader implements OrderExecutor {
         side: "SELL", price: opportunity.price, size: opportunity.size,
         response: { status: "rejected", reason } };
     }
+    if (opportunity.strategyMode === "ladder_v14") {
+      if (!this.config.dryRun) await this.reconcile(opportunity.event);
+      const snapshot = this.getMarketExecutionSnapshot(opportunity.event.slug);
+      const reason = opportunity.orderPolicy !== "fak"
+        ? "v14_sale_requires_ioc"
+        : snapshot
+          ? ladderV14SellGuard(snapshot, opportunity.token.tokenId, opportunity.size)
+          : "missing_market_snapshot";
+      if (reason) return {
+        dryRun: this.config.dryRun,
+        accepted: false,
+        tokenId: opportunity.token.tokenId,
+        side: "SELL",
+        price: opportunity.price,
+        size: opportunity.size,
+        response: { status: "rejected", reason },
+      };
+    }
     const minimumFailure = validateOrderMinimum(opportunity);
     if (minimumFailure) {
       return minimumOrderRejection(
@@ -452,6 +471,7 @@ export class KalshiTrader implements OrderExecutor {
         : undefined;
     if (
       opportunity.strategyMode !== "ladder_v13" &&
+      opportunity.strategyMode !== "ladder_v14" &&
       ladderCapitalEffect === "increase" &&
       projectedCommitment > this.config.ladderMaxUsdcPerMarket + 1e-8
     ) {
@@ -600,7 +620,10 @@ export class KalshiTrader implements OrderExecutor {
     const v13Markets = new Set<string>();
     for (const orderId of orderIds) {
       const source = this.state.orders.find((candidate) => candidate.id === orderId);
-      if (source?.pairId?.startsWith("ladder-v13:")) {
+      if (
+        source?.pairId?.startsWith("ladder-v13:") ||
+        source?.pairId?.startsWith("ladder-v14:")
+      ) {
         this.pendingV13Cancellations.add(orderId);
         v13Markets.add(source.marketSlug);
         // Keep the cancellation barrier through a restart or an uncertain ACK.
@@ -669,6 +692,7 @@ export class KalshiTrader implements OrderExecutor {
       totalCount,
     });
     order.limitPrice = opportunity.price;
+    order.tradeKey = opportunity.tradeKey;
     order.originalSize = totalCount;
     order.remainingSize = Number.isFinite(Number(response.remaining_count))
       ? Number(response.remaining_count)
@@ -682,6 +706,12 @@ export class KalshiTrader implements OrderExecutor {
         : amendedFillCount > 0 || alreadyFilled > 0
           ? "partial"
           : "open";
+    order.pairId = opportunity.pairId;
+    order.pairLockRole = opportunity.pairLockRole;
+    order.referenceTokenId = opportunity.referenceTokenId;
+    order.referenceAllInPrice = opportunity.referenceAllInPrice;
+    order.plannedAllInPairCost = opportunity.plannedAllInPairCost;
+    order.plannedNetEdgePerPair = opportunity.plannedNetEdgePerPair;
     this.unconfirmedOrderReservations.set(
       order.id,
       opportunity.price * opportunity.size,
@@ -745,6 +775,7 @@ export class KalshiTrader implements OrderExecutor {
       openCommitted: round(openCommitted),
       capitalCommitted: round(capitalUsed + openCommitted),
       availableCash: this.availableCashForOrders(),
+      capitalConstraint: true,
       totalFees: round(fills.reduce((sum, fill) => sum + fill.fee, 0)),
       estimatedMakerRebate: 0,
       takerFeeRate:
@@ -770,7 +801,8 @@ export class KalshiTrader implements OrderExecutor {
       market: marketSlug,
       series: context?.event.market.seriesTicker,
       capitalCommitted: snapshot.capitalCommitted,
-      remainingMarketCapacity: this.config.strategyMode === "ladder_v13"
+      remainingMarketCapacity: this.config.strategyMode === "ladder_v13" ||
+        this.config.strategyMode === "ladder_v14"
         ? snapshot.availableCash
         : round(
             Math.max(0, this.config.ladderMaxUsdcPerMarket - snapshot.capitalCommitted),

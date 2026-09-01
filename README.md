@@ -269,6 +269,55 @@ Implementation:
 - `src/ladder-v13-history.ts`
 - `.env.ladder-v13-paper.example`
 
+### `ladder_v14`
+
+V14 is a Kalshi 15-minute crypto marginal-EV inventory engine. It can run BTC,
+ETH, SOL, or any other configured `KX<ASSET>15M` series. It does not launch
+fixed equal-size pair cycles. For every passive price and economically distinct
+quantity breakpoint it estimates the conditional lifecycle value
+
+```text
+P(fill) * [P(pair) * (1 - entry - E[opposite cost | pair])
+           + (1 - P(pair)) * (E[net exit | failed pair] - entry)]
+```
+
+Only positive posterior-mean marginal segments are selected. Deeper layers are
+evaluated as if all more-aggressive layers filled in one sweep. The planner
+maintains at most one aggregate order at each market/outcome/price and amends
+that order when its optimal quantity changes. Quantity comes from actual book,
+queue, flow, fee, completion, recovery, and inventory breakpoints; there is no
+fixed 20-share size or strategy-level contract cap.
+
+When a one-sided fill exists, V14 stops ordinary opening accumulation and
+compares marginal `hedge`, `sell`, and `wait` value on every update. A hedge may
+deliberately make the accounting pair cost exceed $1 when it preserves more
+value than selling or waiting. Residual selling starts immediately when it has
+higher value; 30 seconds is the final no-wait cleanup backstop, not the start of
+sell eligibility.
+
+The learner stores indexed conditional sufficient statistics, so the trading
+hot path performs no history scan or disk read. Completion prices are learned
+only from successful completions, while exit recovery is learned only from
+failed-completion residual sales. Series and paper/live observations remain
+separate; live mode can use paper data only as a weak prior capped at five
+equivalent observations. Cold start otherwise uses general queue/flow and
+current-book analytical formulas rather than copying V13's unconditional BTC
+or ETH pairing rates.
+
+Paper mode sets `capitalConstraint=false`: normal cash never becomes negative,
+while theoretical cash, gross deployment, marked inventory, and realized and
+unrealized P&L remain explicit metrics. Live mode uses one global allocator,
+ranks positive opening segments by marginal EV per committed dollar, executes
+one acknowledged mutation, and then replans every market against current cash.
+
+Implementation:
+
+- `src/ladder-v14.ts`
+- `src/ladder-v14-model.ts`
+- `src/ladder-v14-history.ts`
+- `src/ladder-v14-inventory.ts`
+- `.env.ladder-v14-paper.example`
+
 ## Paper trading engine
 
 `src/paper-trader.ts` is a full execution backend rather than a simple log-only mock.
@@ -300,6 +349,9 @@ The bot does not rely only on slow polling.
 The market stream classes maintain live order-book information, while execution backends can wake a strategy when an important event occurs. A fill or book update can therefore cause the relevant market to be reevaluated immediately.
 
 Per-market promise queues in `ReverseBot` serialize those updates so multiple events for the same market cannot execute strategy logic simultaneously.
+
+V14 uses a single global acknowledgement-driven queue instead, because live
+cash allocation and marginal order ranking span every active configured market.
 
 This is especially important for ladder strategies where the next order depends on the exact quantity and price of previous fills.
 
@@ -351,6 +403,7 @@ There are also strategy-specific examples such as:
 .env.ladder-v10-paper.example
 .env.ladder-v11-paper.example
 .env.ladder-v12-paper.example
+.env.ladder-v14-paper.example
 .env.kalshi-paper.example
 ```
 

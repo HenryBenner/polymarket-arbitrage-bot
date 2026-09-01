@@ -31,6 +31,13 @@ import {
   planLadderV13,
 } from "./ladder-v13.js";
 import { LadderV13HistoryStore } from "./ladder-v13-history.js";
+import { LadderV14HistoryStore } from "./ladder-v14-history.js";
+import {
+  planLadderV14,
+  type LadderV14PlacementContext,
+  type LadderV14Plan,
+} from "./ladder-v14.js";
+import { exactKalshiOrderFee } from "./kalshi-fees.js";
 import {
   LADDER_V12_MAX_STORED_DECISION_AGE_MS,
   LadderV12RegimeEngine,
@@ -77,6 +84,7 @@ export class ReverseBot {
   private readonly ladderV11Events = new Map<string, UpDownEvent>();
   private readonly ladderV12Events = new Map<string, UpDownEvent>();
   private readonly ladderV13Events = new Map<string, UpDownEvent>();
+  private readonly ladderV14Events = new Map<string, UpDownEvent>();
   private readonly ladderV55Events = new Map<string, UpDownEvent>();
   private readonly ladderV55Queues = new Map<string, Promise<void>>();
   private readonly ladderV6Queues = new Map<string, Promise<void>>();
@@ -92,6 +100,9 @@ export class ReverseBot {
   private readonly ladderV13Queues = new Map<string, Promise<void>>();
   private readonly ladderV13WakePending = new Set<string>();
   private ladderV13History: LadderV13HistoryStore | null = null;
+  private ladderV14History: LadderV14HistoryStore | null = null;
+  private ladderV14Queue: Promise<void> | null = null;
+  private ladderV14WakePending = false;
   private readonly marketQueues = new Map<string, Promise<void>>();
   private ladderTickRunning = false;
   private readonly ladderV10Regime: LadderV10RegimeEngine | null;
@@ -142,6 +153,8 @@ export class ReverseBot {
                         ? "ladder-v12-state.json"
                         : config.strategyMode === "ladder_v13"
                           ? "ladder-v13-state.json"
+                        : config.strategyMode === "ladder_v14"
+                          ? "ladder-v14-state.json"
                         : "ladder-state.json",
     );
     this.trader.setExecutionWakeHandler?.((marketSlug) =>
@@ -161,6 +174,8 @@ export class ReverseBot {
                   ? this.enqueueLadderV12Market(marketSlug)
                   : this.config.strategyMode === "ladder_v13"
                     ? this.enqueueLadderV13Market(marketSlug)
+                  : this.config.strategyMode === "ladder_v14"
+                    ? this.enqueueLadderV14Global()
                   : this.enqueueLadderV8Market(marketSlug),
     );
     if (this.ladderV10Regime) {
@@ -207,6 +222,21 @@ export class ReverseBot {
         this.ladderV13WakePending.delete(settlement.marketSlug);
       });
     }
+    if (this.config.strategyMode === "ladder_v14") {
+      this.trader.setMarketTelemetryHandler?.((telemetry) =>
+        this.ladderV14History?.ingestTelemetry(telemetry),
+      );
+      this.trader.setSettlementHandler?.(async (settlement) => {
+        const snapshot = this.trader.getMarketExecutionSnapshot?.(
+          settlement.marketSlug,
+        );
+        if (snapshot) this.ladderV14History?.finalize(snapshot);
+        await this.ladderV14History?.flush();
+        this.ladderV14Events.delete(settlement.marketSlug);
+        this.ladderV14WakePending = true;
+        void this.enqueueLadderV14Global();
+      });
+    }
   }
 
   async init(): Promise<void> {
@@ -223,7 +253,8 @@ export class ReverseBot {
       this.config.strategyMode === "ladder_v10" ||
       this.config.strategyMode === "ladder_v11" ||
       this.config.strategyMode === "ladder_v12" ||
-      this.config.strategyMode === "ladder_v13"
+      this.config.strategyMode === "ladder_v13" ||
+      this.config.strategyMode === "ladder_v14"
     ) {
       await this.ladderTracker.init();
     }
@@ -233,6 +264,12 @@ export class ReverseBot {
     if (this.config.strategyMode === "ladder_v13") {
       this.ladderV13History = await LadderV13HistoryStore.load(
         this.config.paperStatePath,
+      );
+    }
+    if (this.config.strategyMode === "ladder_v14") {
+      this.ladderV14History = await LadderV14HistoryStore.load(
+        this.config.paperStatePath,
+        this.config,
       );
     }
   }
@@ -267,6 +304,8 @@ export class ReverseBot {
                            ? "BRTI-scored 0/20/40 cheap-first fill-driven ladder"
                            : this.config.strategyMode === "ladder_v13"
                              ? "dynamic microprice pair-arbitrage market maker"
+                           : this.config.strategyMode === "ladder_v14"
+                             ? "conditional marginal-EV multi-market inventory engine"
                            : "early two-sided static maker ladder",
       strategyMode: this.config.strategyMode,
       executionMode: this.config.executionMode,
@@ -280,7 +319,8 @@ export class ReverseBot {
           : this.config.marketSlugPrefixes,
       ladderMaxUsdcPerMarket:
         this.config.strategyMode === "reverse" ||
-        this.config.strategyMode === "odahoa_static_maker"
+        this.config.strategyMode === "odahoa_static_maker" ||
+        this.config.strategyMode === "ladder_v14"
           ? undefined
           : this.config.ladderMaxUsdcPerMarket,
       kalshiFeeOverrides:
@@ -395,6 +435,18 @@ export class ReverseBot {
               btcDirectionSignals: false,
               quotePolicy: "sticky_post_only_batch",
               completionPolicy: "any_positive_edge_fok_then_maker",
+            }
+          : undefined,
+      ladderV14Parameters:
+        this.config.strategyMode === "ladder_v14"
+          ? {
+              priorEquivalentObservations: this.config.ladderV14PriorStrength,
+              capitalConstraint: this.config.executionMode === "live",
+              quotePolicy: "positive_conditional_marginal_ev",
+              quantityPolicy: "all_economic_breakpoints_with_sweep_conditioning",
+              residualPolicy: "marginal_max_of_hedge_sell_wait",
+              finalCleanupSeconds: this.config.ladderV14FinalCleanupSeconds,
+              series: this.config.kalshiSeriesTickers,
             }
           : undefined,
       staticMakerShares:
@@ -591,6 +643,11 @@ export class ReverseBot {
       await this.enqueueLadderV13Market(event.slug);
       return;
     }
+    if (this.config.strategyMode === "ladder_v14") {
+      this.ladderV14Events.set(event.slug, event);
+      await this.enqueueLadderV14Global();
+      return;
+    }
 
     const opportunities =
       this.config.strategyMode === "reverse"
@@ -678,7 +735,8 @@ export class ReverseBot {
       this.config.strategyMode === "ladder_v10" ||
       this.config.strategyMode === "ladder_v11" ||
       this.config.strategyMode === "ladder_v12" ||
-      this.config.strategyMode === "ladder_v13"
+      this.config.strategyMode === "ladder_v13" ||
+      this.config.strategyMode === "ladder_v14"
     ) {
       await this.ladderTracker.mark(opportunity.tradeKey);
     } else {
@@ -1492,6 +1550,281 @@ export class ReverseBot {
     return accepted;
   }
 
+  /**
+   * V14 has one global acknowledgement-driven queue. That makes live cash a
+   * portfolio resource instead of letting each market independently reserve it.
+   */
+  private enqueueLadderV14Global(): Promise<void> {
+    if (this.config.strategyMode !== "ladder_v14") return Promise.resolve();
+    this.ladderV14WakePending = true;
+    if (this.ladderV14Queue) return this.ladderV14Queue;
+    const queued = (async () => {
+      while (this.ladderV14WakePending) {
+        this.ladderV14WakePending = false;
+        const mutated = await this.processLadderV14GlobalOnce();
+        if (mutated) this.ladderV14WakePending = true;
+        // Let WebSocket acknowledgements and other markets enter between orders.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    })();
+    this.ladderV14Queue = queued;
+    const cleanup = () => {
+      if (this.ladderV14Queue === queued) this.ladderV14Queue = null;
+      if (this.ladderV14WakePending) void this.enqueueLadderV14Global();
+    };
+    void queued.then(cleanup, cleanup);
+    return queued;
+  }
+
+  private async processLadderV14GlobalOnce(): Promise<boolean> {
+    if (!this.ladderV14History) return false;
+    const planned: Array<{
+      event: UpDownEvent;
+      snapshot: NonNullable<ReturnType<NonNullable<OrderExecutor["getMarketExecutionSnapshot"]>>>;
+      plan: LadderV14Plan;
+    }> = [];
+    const nowSeconds = Date.now() / 1_000;
+    for (const event of this.ladderV14Events.values()) {
+      if (event.windowEnd <= nowSeconds) continue;
+      const snapshot = this.trader.getMarketExecutionSnapshot?.(event.slug);
+      if (!snapshot || snapshot.marketDataValid === false) continue;
+      const plan = planLadderV14(
+        this.config,
+        event,
+        snapshot,
+        this.ladderV14History.model,
+        this.ladderV14History.marketFeatures(event, snapshot),
+        nowSeconds,
+      );
+      // Observe existing orders now. Save a proposed placement context only
+      // when that exact mutation wins the global allocator below.
+      this.ladderV14History.observe(
+        event,
+        snapshot,
+        { ...plan, placementContexts: {} },
+      );
+      planned.push({ event, snapshot, plan });
+    }
+
+    const cancellation = planned.find(({ plan }) => plan.cancelOrderIds.length > 0);
+    if (cancellation) {
+      if (!this.trader.cancelOrders) {
+        throw new Error("ladder_v14 requires executor order cancellation");
+      }
+      await this.trader.cancelOrders([cancellation.plan.cancelOrderIds[0]!]);
+      return true;
+    }
+
+    const sale = planned.find(({ plan }) => plan.flattenOpportunities.length > 0);
+    if (sale) {
+      const opportunity = sale.plan.flattenOpportunities[0]!;
+      this.rememberLadderV14Placement(sale, opportunity.tradeKey);
+      return this.executeSellOpportunity(opportunity);
+    }
+
+    const residualBuy = planned.find(({ plan }) =>
+      plan.opportunities.some((opportunity) =>
+        !opportunity.pairId?.startsWith("ladder-v14:opening"),
+      ),
+    );
+    if (residualBuy) {
+      const opportunity = residualBuy.plan.opportunities.find((candidate) =>
+        !candidate.pairId?.startsWith("ladder-v14:opening"),
+      )!;
+      if (!this.ladderV14Affordable(residualBuy.snapshot, opportunity)) return false;
+      this.rememberLadderV14Placement(residualBuy, opportunity.tradeKey);
+      return this.executeOpportunity(opportunity);
+    }
+
+    const amendments = planned.flatMap((entry) =>
+      entry.plan.amendments.flatMap((amendment) => {
+        const candidate = entry.plan.candidates.find((item) =>
+          item.tokenId === amendment.opportunity.token.tokenId &&
+          Math.abs(item.price - amendment.opportunity.price) <= 1e-8,
+        );
+        const currentOrder = entry.snapshot.openOrders.find(
+          (order) => order.id === amendment.orderId,
+        );
+        if (
+          this.config.executionMode === "live" &&
+          candidate &&
+          currentOrder
+        ) {
+          if (amendment.opportunity.size < currentOrder.remainingSize - 1e-8) {
+            return [{
+              entry,
+              amendment,
+              placement: entry.plan.placementContexts[amendment.opportunity.tradeKey],
+              releasedCash: currentOrder.limitPrice * currentOrder.remainingSize,
+              score: Number.POSITIVE_INFINITY,
+            }];
+          }
+          const priorOption = [...candidate.quantityOptions]
+            .reverse()
+            .find((option) => option.size <= currentOrder.remainingSize + 1e-8);
+          const priorValue = priorOption?.expectedValue ?? 0;
+          const priorSize = currentOrder.remainingSize;
+          return candidate.quantityOptions
+            .filter((option) => option.size > priorSize + 1e-8)
+            .map((option) => {
+              const incrementalValue = option.expectedValue - priorValue;
+              const incrementalCash = amendment.opportunity.price *
+                (option.size - priorSize);
+              return {
+                entry,
+                amendment: {
+                  ...amendment,
+                  opportunity: {
+                    ...amendment.opportunity,
+                    size: option.size,
+                    tradeKey: `${amendment.opportunity.tradeKey}:q${option.size}`,
+                  },
+                },
+                placement: {
+                  kind: "fill" as const,
+                  context: option.context,
+                },
+                releasedCash: currentOrder.limitPrice * currentOrder.remainingSize,
+                score: incrementalValue / Math.max(1e-8, incrementalCash),
+              };
+            })
+            .filter((item) => item.score > 0);
+        }
+        return [{
+          entry,
+          amendment,
+          placement: amendment.opportunity.tradeKey in entry.plan.placementContexts
+            ? entry.plan.placementContexts[amendment.opportunity.tradeKey]
+            : undefined,
+          releasedCash: 0,
+          score: candidate
+            ? candidate.expectedValue / Math.max(1e-8, amendment.opportunity.price * amendment.opportunity.size)
+            : 0,
+        }];
+      }),
+    ).sort((left, right) => right.score - left.score);
+    const amend = amendments.find((item) =>
+      this.ladderV14Affordable(
+        item.entry.snapshot,
+        item.amendment.opportunity,
+        item.releasedCash,
+      ),
+    );
+    if (amend) {
+      if (!this.trader.amendOrder) {
+        throw new Error("ladder_v14 requires executor order amendments");
+      }
+      this.rememberLadderV14Placement(
+        amend.entry,
+        amend.amendment.opportunity.tradeKey,
+        amend.placement,
+      );
+      const result = await this.trader.amendOrder(
+        amend.amendment.orderId,
+        amend.amendment.opportunity,
+      );
+      return result.accepted !== false;
+    }
+
+    const openings = planned.flatMap((entry) =>
+      entry.plan.opportunities
+        .filter((opportunity) => opportunity.pairId?.startsWith("ladder-v14:opening"))
+        .flatMap((opportunity) => {
+          const candidate = entry.plan.candidates.find((item) =>
+            item.tokenId === opportunity.token.tokenId &&
+            Math.abs(item.price - opportunity.price) <= 1e-8,
+          );
+          const options = this.config.executionMode === "live" && candidate
+            ? candidate.quantityOptions
+            : [{
+                size: opportunity.size,
+                expectedValue: candidate?.expectedValue ?? 0,
+                context: candidate?.context,
+              }];
+          return options.map((option) => {
+            const allocated = option.size === opportunity.size
+              ? opportunity
+              : {
+                  ...opportunity,
+                  size: option.size,
+                  tradeKey: `${opportunity.tradeKey}:q${option.size}`,
+                };
+            const committed = Math.max(1e-8, allocated.price * allocated.size);
+            return {
+              entry,
+              opportunity: allocated,
+              placement: option.context
+                ? { kind: "fill" as const, context: option.context }
+                : undefined,
+              score: option.expectedValue / committed,
+            };
+          });
+        }),
+    ).filter((item) => item.score > 0)
+      .sort((left, right) => right.score - left.score);
+    for (const opening of openings) {
+      if (!this.ladderV14Affordable(opening.entry.snapshot, opening.opportunity)) {
+        continue;
+      }
+      this.rememberLadderV14Placement(
+        opening.entry,
+        opening.opportunity.tradeKey,
+        opening.placement,
+      );
+      return this.executeOpportunity(opening.opportunity);
+    }
+
+    for (const { event, plan } of planned) {
+      logThrottled("Watching ladder_v14 market", event.slug, {
+        market: event.title,
+        series: event.market.seriesTicker,
+        stage: plan.managementStage,
+        pairedShares: plan.pairedShares,
+        unpairedShares: plan.unpairedShares,
+        lockedPnl: plan.lockedPnl,
+        positiveEvLevels: plan.candidates.length,
+        expectedPortfolioValue: plan.expectedPortfolioValue,
+      }, 60_000);
+      this.trader.reportMarket?.(event.slug);
+    }
+    return false;
+  }
+
+  private rememberLadderV14Placement(
+    entry: {
+      event: UpDownEvent;
+      snapshot: NonNullable<ReturnType<NonNullable<OrderExecutor["getMarketExecutionSnapshot"]>>>;
+      plan: LadderV14Plan;
+    },
+    tradeKey: string,
+    placementOverride?: LadderV14PlacementContext,
+  ): void {
+    const placement = placementOverride ?? entry.plan.placementContexts[tradeKey];
+    if (!placement) return;
+    this.ladderV14History?.observe(entry.event, entry.snapshot, {
+      ...entry.plan,
+      placementContexts: { [tradeKey]: placement },
+    });
+  }
+
+  private ladderV14Affordable(
+    snapshot: NonNullable<ReturnType<NonNullable<OrderExecutor["getMarketExecutionSnapshot"]>>>,
+    opportunity: TradeOpportunity,
+    releasedCash = 0,
+  ): boolean {
+    if (snapshot.capitalConstraint === false) return true;
+    const rate = opportunity.orderPolicy === "post_only"
+      ? (snapshot.makerFeeRate ?? 0)
+      : snapshot.takerFeeRate;
+    const required = opportunity.price * opportunity.size + exactKalshiOrderFee({
+      price: opportunity.price,
+      size: opportunity.size,
+      rate,
+      exponent: snapshot.takerFeeExponent,
+    });
+    return required <= snapshot.availableCash + releasedCash + 1e-8;
+  }
+
   private enqueueLadderV13Market(marketSlug: string): Promise<void> {
     if (this.config.strategyMode !== "ladder_v13") return Promise.resolve();
     const active = this.ladderV13Queues.get(marketSlug);
@@ -1882,6 +2215,7 @@ export class ReverseBot {
     prune(this.ladderV11Events);
     prune(this.ladderV12Events);
     prune(this.ladderV13Events);
+    prune(this.ladderV14Events);
     for (const [slug, context] of this.ladderV6Events) {
       if (context.event.windowEnd <= now) this.ladderV6Events.delete(slug);
     }

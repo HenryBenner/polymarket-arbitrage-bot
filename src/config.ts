@@ -177,6 +177,10 @@ export interface BotConfig {
   ladderV10SourceStaleMs: number;
   ladderV10CoinbaseWsHost: string;
   ladderV10CoinbaseProduct: string;
+  ladderV14PriorStrength: number;
+  ladderV14FlowWindowSeconds: number;
+  ladderV14VolatilityWindowSeconds: number;
+  ladderV14FinalCleanupSeconds: number;
   paperStartingUsdc: number;
   paperStatePath: string;
 }
@@ -213,10 +217,11 @@ export function loadConfig(): BotConfig {
     strategyRaw !== "ladder_v10" &&
     strategyRaw !== "ladder_v11" &&
     strategyRaw !== "ladder_v12" &&
-    strategyRaw !== "ladder_v13"
+    strategyRaw !== "ladder_v13" &&
+    strategyRaw !== "ladder_v14"
   ) {
     throw new Error(
-      "STRATEGY_MODE must be reverse, odahoa_ladder, odahoa_ladder_2, odahoa_static_maker, ladder_v5, ladder_v5.5, ladder_v6, ladder_v7, ladder_v8, ladder_v9, ladder_v10, ladder_v11, ladder_v12, or ladder_v13",
+      "STRATEGY_MODE must be reverse, odahoa_ladder, odahoa_ladder_2, odahoa_static_maker, ladder_v5, ladder_v5.5, ladder_v6, ladder_v7, ladder_v8, ladder_v9, ladder_v10, ladder_v11, ladder_v12, ladder_v13, or ladder_v14",
     );
   }
 
@@ -377,6 +382,16 @@ export function loadConfig(): BotConfig {
     ladderV10CoinbaseProduct: envString(
       "LADDER_V10_COINBASE_PRODUCT",
       "BTC-USD",
+    ),
+    ladderV14PriorStrength: envNumber("LADDER_V14_PRIOR_STRENGTH", 5),
+    ladderV14FlowWindowSeconds: envNumber("LADDER_V14_FLOW_WINDOW_SECONDS", 60),
+    ladderV14VolatilityWindowSeconds: envNumber(
+      "LADDER_V14_VOLATILITY_WINDOW_SECONDS",
+      60,
+    ),
+    ladderV14FinalCleanupSeconds: envNumber(
+      "LADDER_V14_FINAL_CLEANUP_SECONDS",
+      30,
     ),
     paperStartingUsdc: envNumber("PAPER_STARTING_USDC", 100),
     paperStatePath: envString("PAPER_STATE_PATH", "./data/paper"),
@@ -814,6 +829,29 @@ export function validateTradingConfig(config: BotConfig): void {
       "ladder_v13 is BTC-only Kalshi paper/live mode and requires the full 15-minute market window",
     );
   }
+  if (
+    config.strategyMode === "ladder_v14" &&
+    (config.exchange !== "kalshi" ||
+      (config.executionMode !== "paper" && config.executionMode !== "live") ||
+      config.minutesBeforeCloseMax < 15 ||
+      config.kalshiSeriesTickers.some((series) => !/^KX[A-Z0-9]+15M$/.test(series)))
+  ) {
+    throw new Error(
+      "ladder_v14 supports Kalshi 15-minute crypto series in paper/live mode and requires the full market window",
+    );
+  }
+  if (
+    !Number.isFinite(config.ladderV14PriorStrength) ||
+    config.ladderV14PriorStrength <= 0 ||
+    !Number.isFinite(config.ladderV14FlowWindowSeconds) ||
+    config.ladderV14FlowWindowSeconds <= 0 ||
+    !Number.isFinite(config.ladderV14VolatilityWindowSeconds) ||
+    config.ladderV14VolatilityWindowSeconds <= 0 ||
+    !Number.isFinite(config.ladderV14FinalCleanupSeconds) ||
+    config.ladderV14FinalCleanupSeconds < 0
+  ) {
+    throw new Error("LADDER_V14 model and window settings must be finite and positive");
+  }
   if (!Number.isInteger(config.signatureType) || config.signatureType < 0 || config.signatureType > 3) {
     throw new Error("SIGNATURE_TYPE must be one of 0, 1, 2, or 3");
   }
@@ -942,7 +980,8 @@ export function validateTradingConfig(config: BotConfig): void {
     config.strategyMode === "ladder_v5.5" ||
     config.strategyMode === "ladder_v11" ||
     config.strategyMode === "ladder_v12" ||
-    config.strategyMode === "ladder_v13"
+    config.strategyMode === "ladder_v13" ||
+    config.strategyMode === "ladder_v14"
   ) {
     if (
       config.ladderLiveAck !==

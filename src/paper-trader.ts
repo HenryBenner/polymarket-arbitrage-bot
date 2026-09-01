@@ -6,6 +6,7 @@ import { KalshiClient, kalshiTokenId } from "./kalshi-api.js";
 import { KalshiMarketStream } from "./kalshi-market-stream.js";
 import { exactKalshiDepthCost, exactKalshiFee, exactKalshiOrderFee } from "./kalshi-fees.js";
 import { ladderV13SellGuard } from "./ladder-v13-inventory.js";
+import { ladderV14SellGuard } from "./ladder-v14-inventory.js";
 import { log, logThrottled } from "./logger.js";
 import { MarketStream, type MarketStreamEvent } from "./market-stream.js";
 import {
@@ -38,6 +39,9 @@ interface PaperState {
   settlements: PaperSettlement[];
   seenEventKeys: string[];
   feeAccumulators?: Record<string, number>;
+  /** Accounting-only metrics used when V14 paper capital constraints are off. */
+  theoreticalCash?: number;
+  grossCapitalDeployed?: number;
 }
 
 interface MarketContext {
@@ -127,6 +131,8 @@ function emptyState(startingBalance: number): PaperState {
     settlements: [],
     seenEventKeys: [],
     feeAccumulators: {},
+    theoreticalCash: startingBalance,
+    grossCapitalDeployed: 0,
   };
 }
 
@@ -205,6 +211,8 @@ export class PaperTrader implements OrderExecutor {
       this.state = parsed;
       this.state.positions ??= this.derivePositions(parsed.fills);
       this.state.feeAccumulators ??= {};
+      this.state.theoreticalCash ??= this.state.startingBalance;
+      this.state.grossCapitalDeployed ??= 0;
       for (const key of parsed.seenEventKeys) this.seenEvents.add(key);
     } catch (error) {
       const code =
@@ -307,7 +315,10 @@ export class PaperTrader implements OrderExecutor {
           : opportunity.size * rate * Math.pow(opportunity.price * (1 - opportunity.price), fees.exponent);
         return sum + opportunity.price * opportunity.size + fee;
       }, 0);
-      if (required > this.availableCash() + 1e-8) {
+      const unlimitedV14 = opportunities.every(
+        (opportunity) => opportunity.strategyMode === "ladder_v14",
+      );
+      if (!unlimitedV14 && required > this.availableCash() + 1e-8) {
         throw new Error(`Paper balance too low: $${this.availableCash().toFixed(2)} available, $${required.toFixed(2)} required`);
       }
       const results: OrderResult[] = [];
@@ -395,6 +406,7 @@ export class PaperTrader implements OrderExecutor {
         : undefined;
     if (
       opportunity.strategyMode !== "ladder_v13" &&
+      opportunity.strategyMode !== "ladder_v14" &&
       ladderCapitalEffect === "increase" &&
       projectedCommitment > this.config.ladderMaxUsdcPerMarket + 1e-8
     ) {
@@ -423,8 +435,9 @@ export class PaperTrader implements OrderExecutor {
         },
       };
     }
-    const available = this.availableCash();
-    if (reserveNeeded > available + 1e-8) {
+    const unlimitedV14 = opportunity.strategyMode === "ladder_v14";
+    const available = unlimitedV14 ? Number.MAX_SAFE_INTEGER : this.availableCash();
+    if (!unlimitedV14 && reserveNeeded > available + 1e-8) {
       throw new Error(
         `Paper balance too low: $${available.toFixed(2)} available, ` +
           `$${reserveNeeded.toFixed(2)} required`,
@@ -553,6 +566,25 @@ export class PaperTrader implements OrderExecutor {
       if (reason) return { dryRun: true, accepted: false, tokenId: opportunity.token.tokenId,
         side: "SELL", price: opportunity.price, size: opportunity.size,
         response: { paper: true, status: "rejected", reason } };
+    }
+    if (opportunity.strategyMode === "ladder_v14") {
+      const snapshot = this.getMarketExecutionSnapshot(opportunity.event.slug);
+      const failure = validateOrderMinimum(opportunity);
+      const reason = failure?.reason ??
+        (opportunity.orderPolicy !== "fak"
+          ? "v14_sale_requires_ioc"
+          : snapshot
+            ? ladderV14SellGuard(snapshot, opportunity.token.tokenId, opportunity.size)
+            : "missing_market_snapshot");
+      if (reason) return {
+        dryRun: true,
+        accepted: false,
+        tokenId: opportunity.token.tokenId,
+        side: "SELL",
+        price: opportunity.price,
+        size: opportunity.size,
+        response: { paper: true, status: "rejected", reason },
+      };
     }
     const existing = this.orderByTradeKey.get(opportunity.tradeKey);
     if (existing) {
@@ -720,7 +752,10 @@ export class PaperTrader implements OrderExecutor {
     const feeConfig = this.feeConfig(opportunity.event.market);
     const oldReserve = order.limitPrice * order.remainingSize;
     const newReserve = opportunity.price * opportunity.size;
-    if (newReserve > this.availableCash() + oldReserve + 1e-8) {
+    if (
+      opportunity.strategyMode !== "ladder_v14" &&
+      newReserve > this.availableCash() + oldReserve + 1e-8
+    ) {
       return {
         dryRun: true,
         accepted: false,
@@ -731,10 +766,20 @@ export class PaperTrader implements OrderExecutor {
         response: { paper: true, status: "rejected", reason: "balance_too_low" },
       };
     }
+    const previousTradeKey = order.tradeKey;
     order.limitPrice = opportunity.price;
+    order.tradeKey = opportunity.tradeKey;
+    this.orderByTradeKey.delete(previousTradeKey);
+    this.orderByTradeKey.set(order.tradeKey, order);
     order.originalSize = round(alreadyFilled + opportunity.size);
     order.remainingSize = opportunity.size;
     order.orderPolicy = opportunity.orderPolicy ?? "gtc";
+    order.pairId = opportunity.pairId;
+    order.pairLockRole = opportunity.pairLockRole;
+    order.referenceTokenId = opportunity.referenceTokenId;
+    order.referenceAllInPrice = opportunity.referenceAllInPrice;
+    order.plannedAllInPairCost = opportunity.plannedAllInPairCost;
+    order.plannedNetEdgePerPair = opportunity.plannedNetEdgePerPair;
     order.queueAhead = (context?.books.get(order.tokenId)?.bids ?? [])
       .filter((level) => Math.abs(level.price - opportunity.price) < 1e-9)
       .reduce((sum, level) => sum + level.size, 0);
@@ -871,7 +916,9 @@ export class PaperTrader implements OrderExecutor {
       partial: orders.filter((order) => order.status === "partial").length,
       unfilled: orders.filter((order) => order.status === "open").length,
       capitalCommitted: round(committed, 4),
-      remainingMarketCapacity: this.config.strategyMode === "ladder_v13"
+      remainingMarketCapacity: this.config.strategyMode === "ladder_v14"
+        ? "unconstrained"
+        : this.config.strategyMode === "ladder_v13"
         ? round(this.availableCash(), 4)
         : round(
             Math.max(0, this.config.ladderMaxUsdcPerMarket - committed),
@@ -946,6 +993,8 @@ export class PaperTrader implements OrderExecutor {
                     ? "ladder_v12 BRTI 0/20/40 cheap-first completion ladder"
                   : this.config.strategyMode === "ladder_v13"
                     ? "ladder_v13 dynamic microprice pair-arbitrage maker"
+                  : this.config.strategyMode === "ladder_v14"
+                    ? "ladder_v14 conditional marginal-EV inventory engine"
                   : this.config.strategyMode === "ladder_v7"
                     ? "ladder_v7 fixed cheap maker / capped favorite FAK"
                     : this.config.strategyMode === "ladder_v8"
@@ -1012,6 +1061,19 @@ export class PaperTrader implements OrderExecutor {
         ...level,
       })),
     }));
+    const v14Paper = this.config.strategyMode === "ladder_v14";
+    const markedInventoryValue = positions.reduce((sum, position) => {
+      const book = books.find((candidate) => candidate.tokenId === position.tokenId);
+      return sum + position.shares * (book?.bestBid ?? 0);
+    }, 0);
+    const remainingInventoryCost = positions.reduce(
+      (sum, position) => sum + position.totalCost,
+      0,
+    );
+    const realizedPnl = this.state.settlements.reduce(
+      (sum, settlement) => sum + settlement.realizedPnl,
+      0,
+    );
     return structuredClone({
       marketSlug,
       marketDataValid: context.marketDataValid,
@@ -1023,7 +1085,14 @@ export class PaperTrader implements OrderExecutor {
       capitalUsed: round(capitalUsed),
       openCommitted: round(openCommitted),
       capitalCommitted: round(capitalUsed + openCommitted),
-      availableCash: this.availableCash(),
+      availableCash: v14Paper ? Number.MAX_SAFE_INTEGER : this.availableCash(),
+      capitalConstraint: !v14Paper,
+      hypotheticalStartingBalance: this.state.startingBalance,
+      grossCapitalDeployed: this.state.grossCapitalDeployed,
+      theoreticalCash: this.state.theoreticalCash,
+      markedInventoryValue: round(markedInventoryValue),
+      realizedPnl: round(realizedPnl),
+      unrealizedPnl: round(markedInventoryValue - remainingInventoryCost),
       totalFees: round(fills.reduce((sum, fill) => sum + fill.fee, 0)),
       estimatedMakerRebate: round(
         fills.reduce(
@@ -1045,7 +1114,10 @@ export class PaperTrader implements OrderExecutor {
       await this.handleStreamEvent(event);
       await this.marketTelemetryHandler?.(event);
     };
-    if (this.config.strategyMode === "ladder_v13") await this.serializeExecution(ingest);
+    if (
+      this.config.strategyMode === "ladder_v13" ||
+      this.config.strategyMode === "ladder_v14"
+    ) await this.serializeExecution(ingest);
     else await ingest();
   }
 
@@ -1180,7 +1252,8 @@ export class PaperTrader implements OrderExecutor {
         ? round(makerFeeEquivalent * feeConfig.rebateRate, 5)
         : 0;
     const cost = round(actualSize * price);
-    if (cost + fee > this.state.cash + 1e-8) return;
+    const unlimitedV14 = order.pairId?.startsWith("ladder-v14:") ?? false;
+    if (!unlimitedV14 && cost + fee > this.state.cash + 1e-8) return;
 
     const fill: PaperFill = {
       id: `fill-${Date.now()}-${this.state.fills.length + 1}`,
@@ -1217,7 +1290,16 @@ export class PaperTrader implements OrderExecutor {
       this.state.positions.push(nextPosition);
       this.indexPosition(nextPosition);
     }
-    this.state.cash = round(this.state.cash - cost - fee);
+    if (unlimitedV14) {
+      this.state.theoreticalCash = round(
+        (this.state.theoreticalCash ?? this.state.startingBalance) - cost - fee,
+      );
+      this.state.grossCapitalDeployed = round(
+        (this.state.grossCapitalDeployed ?? 0) + cost + fee,
+      );
+    } else {
+      this.state.cash = round(this.state.cash - cost - fee);
+    }
     order.remainingSize = round(order.remainingSize - actualSize);
     order.status =
       order.remainingSize <= 1e-8
@@ -1289,7 +1371,13 @@ export class PaperTrader implements OrderExecutor {
     position.totalCost = round(
       Math.max(0, position.totalCost - averageCost * actualSize),
     );
-    this.state.cash = round(this.state.cash + proceeds);
+    if (order.pairId?.startsWith("ladder-v14:")) {
+      this.state.theoreticalCash = round(
+        (this.state.theoreticalCash ?? this.state.startingBalance) + proceeds,
+      );
+    } else {
+      this.state.cash = round(this.state.cash + proceeds);
+    }
     order.remainingSize = round(order.remainingSize - actualSize);
     order.status = order.remainingSize <= 1e-8 ? "filled" : "partial";
     this.refreshOpenOrder(order);
@@ -1379,7 +1467,8 @@ export class PaperTrader implements OrderExecutor {
         this.config.strategyMode === "ladder_v10" ||
         this.config.strategyMode === "ladder_v11" ||
         this.config.strategyMode === "ladder_v12" ||
-        this.config.strategyMode === "ladder_v13"
+        this.config.strategyMode === "ladder_v13" ||
+        this.config.strategyMode === "ladder_v14"
       ) {
         // Do not block the WebSocket decoder on strategy work: an active book
         // can otherwise retain every incoming delta in its pending queue.
@@ -1746,7 +1835,16 @@ export class PaperTrader implements OrderExecutor {
     };
     this.state.settlements.push(settlement);
     this.settlementsByMarket.set(marketSlug, settlement);
-    this.state.cash = round(this.state.cash + payout);
+    const v14Market = (this.ordersByMarket.get(marketSlug) ?? []).some(
+      (order) => order.pairId?.startsWith("ladder-v14:"),
+    );
+    if (v14Market) {
+      this.state.theoreticalCash = round(
+        (this.state.theoreticalCash ?? this.state.startingBalance) + payout,
+      );
+    } else {
+      this.state.cash = round(this.state.cash + payout);
+    }
     for (const order of this.ordersByMarket.get(marketSlug) ?? []) {
       if (order.status === "open" || order.status === "partial") {
         order.status = "cancelled";

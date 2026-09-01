@@ -1,0 +1,781 @@
+import type { BotConfig } from "./config.js";
+import {
+  exactKalshiDepthCost,
+  exactKalshiDepthProceeds,
+  exactKalshiOrderFee,
+} from "./kalshi-fees.js";
+import { ladderV14Inventory } from "./ladder-v14-inventory.js";
+import type {
+  LadderV14ConditionalContext,
+  LadderV14ConditionalModel,
+} from "./ladder-v14-model.js";
+import type {
+  MarketExecutionSnapshot,
+  PaperOrder,
+  TokenBook,
+  TradeOpportunity,
+  UpDownEvent,
+} from "./types.js";
+import { tickSizeFromMarket } from "./utils/market.js";
+
+const EPSILON = 1e-8;
+const V14_PREFIX = "ladder-v14:";
+const round = (value: number, places = 8): number => {
+  const factor = 10 ** places;
+  return Math.round((value + Number.EPSILON) * factor) / factor;
+};
+
+export interface LadderV14MarketFeatures {
+  eligibleVolumePerSecondByToken: Record<string, number>;
+  volatilityByToken: Record<string, number>;
+  midpointByToken: Record<string, number | null>;
+}
+
+export interface LadderV14Candidate {
+  tokenId: string;
+  outcome: string;
+  price: number;
+  size: number;
+  expectedValue: number;
+  marginalValue: number;
+  expectedValuePerShare: number;
+  fillProbability: number;
+  pairProbability: number;
+  expectedCompletionCost: number;
+  expectedFailedExit: number;
+  sweepPrefixShares: number;
+  context: LadderV14ConditionalContext;
+  quantityOptions: LadderV14QuantityOption[];
+}
+
+export interface LadderV14QuantityOption {
+  size: number;
+  expectedValue: number;
+  marginalValue: number;
+  expectedValuePerShare: number;
+  context: LadderV14ConditionalContext;
+}
+
+export interface LadderV14Amendment {
+  orderId: string;
+  opportunity: TradeOpportunity;
+}
+
+export interface LadderV14ResidualDecision {
+  action: "hedge" | "sell" | "wait";
+  size: number;
+  hedgeValue: number | null;
+  sellValue: number | null;
+  waitValue: number;
+  context: LadderV14ConditionalContext;
+}
+
+export interface LadderV14PlacementContext {
+  kind: "fill" | "completion" | "failed_exit";
+  context: LadderV14ConditionalContext;
+}
+
+export interface LadderV14Plan {
+  cancelOrderIds: string[];
+  amendments: LadderV14Amendment[];
+  opportunities: TradeOpportunity[];
+  flattenOpportunities: TradeOpportunity[];
+  managementStage: string;
+  candidates: LadderV14Candidate[];
+  residualDecisions: LadderV14ResidualDecision[];
+  placementContexts: Record<string, LadderV14PlacementContext>;
+  pairedShares: number;
+  unpairedShares: number;
+  lockedPnl: number;
+  expectedPortfolioValue: number;
+}
+
+function isV14Order(order: PaperOrder): boolean {
+  return order.pairId?.startsWith(V14_PREFIX) ?? false;
+}
+
+function midpoint(book: TokenBook): number | null {
+  return book.bestBid === null || book.bestAsk === null
+    ? null
+    : (book.bestBid + book.bestAsk) / 2;
+}
+
+function series(event: UpDownEvent): string {
+  return (
+    event.market.seriesTicker ??
+    event.slug.split("-")[0] ??
+    "GLOBAL15M"
+  ).toUpperCase();
+}
+
+function queueAhead(book: TokenBook, price: number): number {
+  return book.bids
+    .filter((level) => Math.abs(level.price - price) <= EPSILON)
+    .reduce((sum, level) => sum + level.size, 0);
+}
+
+function depthAtOrBetter(book: TokenBook, price: number): number {
+  return book.bids
+    .filter((level) => level.price + EPSILON >= price)
+    .reduce((sum, level) => sum + Math.max(0, level.size), 0);
+}
+
+function contextFor(
+  config: BotConfig,
+  event: UpDownEvent,
+  book: TokenBook,
+  price: number,
+  quantity: number,
+  queue: number,
+  distanceTicks: number,
+  secondsRemaining: number,
+  features: LadderV14MarketFeatures,
+  overrides: Partial<LadderV14ConditionalContext> = {},
+): LadderV14ConditionalContext {
+  const currentMid = features.midpointByToken[book.tokenId] ?? midpoint(book);
+  return {
+    series: series(event),
+    executionMode: config.executionMode,
+    side: book.outcome,
+    entryPrice: price,
+    currentBid: book.bestBid,
+    currentMid,
+    priceMoveSinceFill: currentMid === null ? 0 : currentMid - price,
+    volatility: features.volatilityByToken[book.tokenId] ?? 0,
+    queueAhead: queue,
+    flowPerSecond:
+      features.eligibleVolumePerSecondByToken[book.tokenId] ?? 0,
+    distanceTicks,
+    quantity,
+    depth: depthAtOrBetter(book, price),
+    residualAgeSeconds: 0,
+    secondsRemaining: Math.max(0, secondsRemaining),
+    ...overrides,
+  };
+}
+
+function makerPrices(book: TokenBook, tick: number): number[] {
+  if (book.bestAsk === null) return [];
+  const result: number[] = [];
+  for (
+    let price = tick;
+    price < book.bestAsk - EPSILON && price < 1;
+    price = round(price + tick, 4)
+  ) {
+    result.push(price);
+  }
+  return result.reverse();
+}
+
+function quantityBreakpoints(
+  book: TokenBook,
+  opposite: TokenBook,
+  flowPerSecond: number,
+  secondsRemaining: number,
+): number[] {
+  const minimum = Math.max(
+    0.01,
+    Math.ceil((book.minOrderSize - EPSILON) * 100) / 100,
+  );
+  const bookBreakpoints = [
+    ...book.bids,
+    ...opposite.asks,
+    ...book.asks,
+  ].reduce<number[]>((values, level) => {
+    const next = (values.at(-1) ?? 0) + Math.max(0, level.size);
+    if (next > EPSILON) values.push(next);
+    return values;
+  }, []);
+  const physicalHorizon = Math.max(
+    minimum,
+    ...bookBreakpoints,
+    flowPerSecond * Math.max(0, secondsRemaining),
+  );
+  const result = new Set<number>([round(minimum, 2)]);
+  for (const value of bookBreakpoints) {
+    if (value + EPSILON >= minimum) result.add(round(value, 2));
+  }
+  let magnitude = 1;
+  while (magnitude <= physicalHorizon * 10 + EPSILON) {
+    for (const multiplier of [1, 2, 5]) {
+      const quantity = multiplier * magnitude;
+      if (quantity + EPSILON >= minimum && quantity <= physicalHorizon + EPSILON) {
+        result.add(round(quantity, 2));
+      }
+    }
+    magnitude *= 10;
+  }
+  result.add(round(physicalHorizon, 2));
+  return [...result]
+    .filter((value) => Number.isFinite(value) && value + EPSILON >= minimum)
+    .sort((left, right) => left - right);
+}
+
+function openingCandidate(
+  config: BotConfig,
+  event: UpDownEvent,
+  snapshot: MarketExecutionSnapshot,
+  book: TokenBook,
+  opposite: TokenBook,
+  price: number,
+  quantity: number,
+  sweepPrefixShares: number,
+  secondsRemaining: number,
+  tick: number,
+  features: LadderV14MarketFeatures,
+  model: LadderV14ConditionalModel,
+): LadderV14Candidate | null {
+  if (quantity <= EPSILON || book.bestAsk === null || price >= book.bestAsk - EPSILON) {
+    return null;
+  }
+  const conditionalQuantity = quantity + sweepPrefixShares;
+  const makerFee = exactKalshiOrderFee({
+    price,
+    size: quantity,
+    rate: snapshot.makerFeeRate ?? 0,
+    exponent: snapshot.takerFeeExponent,
+  });
+  const entryAllIn = price + makerFee / quantity;
+  const distance = Math.max(
+    0,
+    Math.round(((book.bestBid ?? price) - price) / tick),
+  );
+  const context = contextFor(
+    config,
+    event,
+    book,
+    entryAllIn,
+    conditionalQuantity,
+    queueAhead(book, price),
+    distance,
+    secondsRemaining,
+    features,
+  );
+  const fill = model.estimateFill(context, secondsRemaining);
+
+  const immediateCompletion = exactKalshiDepthCost({
+    levels: opposite.asks,
+    size: conditionalQuantity,
+    rate: snapshot.takerFeeRate,
+    exponent: snapshot.takerFeeExponent,
+  });
+  const completionMakerPrice = opposite.bestAsk === null
+    ? opposite.bestBid
+    : Math.max(tick, round(opposite.bestAsk - tick, 4));
+  if (completionMakerPrice === null) return null;
+  const completionQueue = queueAhead(opposite, completionMakerPrice);
+  const completionContext: LadderV14ConditionalContext = {
+    ...context,
+    queueAhead: completionQueue,
+    flowPerSecond:
+      features.eligibleVolumePerSecondByToken[opposite.tokenId] ?? 0,
+    distanceTicks: Math.max(
+      0,
+      Math.round(((opposite.bestBid ?? completionMakerPrice) - completionMakerPrice) / tick),
+    ),
+    depth: depthAtOrBetter(opposite, completionMakerPrice),
+  };
+  const completion = model.estimateCompletion(
+    completionContext,
+    secondsRemaining,
+  );
+  const makerCompletionFee = exactKalshiOrderFee({
+    price: completionMakerPrice,
+    size: conditionalQuantity,
+    rate: snapshot.makerFeeRate ?? 0,
+    exponent: snapshot.takerFeeExponent,
+  });
+  const fallbackCompletionCost = immediateCompletion
+    ? immediateCompletion.total / conditionalQuantity
+    : completionMakerPrice + makerCompletionFee / conditionalQuantity;
+  const expectedCompletionCost = model.expectedCompletionCost(
+    completionContext,
+    fallbackCompletionCost,
+  );
+  const exitDepth = exactKalshiDepthProceeds({
+    levels: book.bids,
+    size: conditionalQuantity,
+    rate: snapshot.takerFeeRate,
+    exponent: snapshot.takerFeeExponent,
+  });
+  // A passive bid filling is adverse information: book liquidity currently
+  // above the quote cannot be assumed to survive the event that reaches it.
+  // Real residual management switches to the actual post-fill market state.
+  const hypotheticalExitBid = exitDepth
+    ? Math.min(entryAllIn, exitDepth.total / conditionalQuantity)
+    : 0;
+  const hypotheticalMid = context.currentMid === null
+    ? entryAllIn
+    : Math.min(context.currentMid, entryAllIn + tick);
+  const exitContext = {
+    ...context,
+    currentBid: hypotheticalExitBid,
+    currentMid: hypotheticalMid,
+    priceMoveSinceFill: hypotheticalMid - entryAllIn,
+    depth: exitDepth?.size ?? 0,
+  };
+  const expectedFailedExit = model.expectedFailedExit(exitContext);
+  const pairProfit = 1 - entryAllIn - expectedCompletionCost;
+  const exitProfit = expectedFailedExit - entryAllIn;
+  const filledValuePerShare =
+    completion.probability * pairProfit +
+    (1 - completion.probability) * exitProfit;
+  // Quantity is the new marginal layer. Probabilities and recovery are
+  // conditioned on every more-aggressive layer having swept first.
+  const expectedValue = fill.probability * filledValuePerShare * quantity;
+  return {
+    tokenId: book.tokenId,
+    outcome: book.outcome,
+    price,
+    size: quantity,
+    expectedValue,
+    marginalValue: expectedValue,
+    expectedValuePerShare: expectedValue / quantity,
+    fillProbability: fill.probability,
+    pairProbability: completion.probability,
+    expectedCompletionCost,
+    expectedFailedExit,
+    sweepPrefixShares,
+    context,
+    quantityOptions: [],
+  };
+}
+
+function selectOpeningTargets(
+  config: BotConfig,
+  event: UpDownEvent,
+  snapshot: MarketExecutionSnapshot,
+  books: readonly TokenBook[],
+  secondsRemaining: number,
+  tick: number,
+  features: LadderV14MarketFeatures,
+  model: LadderV14ConditionalModel,
+): LadderV14Candidate[] {
+  const selected: LadderV14Candidate[] = [];
+  for (let sideIndex = 0; sideIndex < 2; sideIndex += 1) {
+    const book = books[sideIndex]!;
+    const opposite = books[1 - sideIndex]!;
+    let sweepPrefix = 0;
+    for (const price of makerPrices(book, tick)) {
+      const breakpoints = quantityBreakpoints(
+        book,
+        opposite,
+        features.eligibleVolumePerSecondByToken[book.tokenId] ?? 0,
+        secondsRemaining,
+      );
+      let previousValue = 0;
+      let best: LadderV14Candidate | null = null;
+      const options: LadderV14QuantityOption[] = [];
+      for (const quantity of breakpoints) {
+        const candidate = openingCandidate(
+          config,
+          event,
+          snapshot,
+          book,
+          opposite,
+          price,
+          quantity,
+          sweepPrefix,
+          secondsRemaining,
+          tick,
+          features,
+          model,
+        );
+        if (!candidate) continue;
+        candidate.marginalValue = candidate.expectedValue - previousValue;
+        previousValue = candidate.expectedValue;
+        if (candidate.expectedValue > EPSILON) {
+          options.push({
+            size: candidate.size,
+            expectedValue: candidate.expectedValue,
+            marginalValue: candidate.marginalValue,
+            expectedValuePerShare: candidate.expectedValuePerShare,
+            context: candidate.context,
+          });
+        }
+        // Evaluate every distinct breakpoint; do not assume monotonic marginal EV.
+        if (
+          candidate.expectedValue > EPSILON &&
+          (!best || candidate.expectedValue > best.expectedValue)
+        ) {
+          best = candidate;
+        }
+      }
+      if (best) {
+        best.quantityOptions = options.filter(
+          (option) => option.size <= best!.size + EPSILON,
+        );
+        selected.push(best);
+        sweepPrefix += best.size;
+      }
+    }
+  }
+  return selected;
+}
+
+function opportunity(
+  event: UpDownEvent,
+  token: TokenBook,
+  side: "BUY" | "SELL",
+  price: number,
+  size: number,
+  policy: "post_only" | "fak",
+  role: string,
+  tradeKey: string,
+): TradeOpportunity {
+  return {
+    kind: policy === "post_only" ? "maker" : "expensive",
+    event,
+    token,
+    price,
+    size,
+    tickSize: tickSizeFromMarket(event.market),
+    negRisk: event.market.negRisk,
+    tradeKey,
+    strategyMode: "ladder_v14",
+    phaseId: "15-0",
+    pairId: `${V14_PREFIX}${role}`,
+    orderPolicy: policy,
+    pairLockRole: side === "BUY"
+      ? role === "opening"
+        ? "opening"
+        : policy === "post_only" ? "completion_maker" : "completion_taker"
+      : undefined,
+    capitalEffect: role === "opening" ? "increase" : "reduce",
+  };
+}
+
+function planResidual(
+  config: BotConfig,
+  event: UpDownEvent,
+  snapshot: MarketExecutionSnapshot,
+  books: readonly TokenBook[],
+  features: LadderV14MarketFeatures,
+  model: LadderV14ConditionalModel,
+  nowSeconds: number,
+): Pick<LadderV14Plan,
+  "cancelOrderIds" | "opportunities" | "flattenOpportunities" |
+  "managementStage" | "residualDecisions" | "placementContexts"> {
+  const inventory = ladderV14Inventory(snapshot, nowSeconds);
+  const episode = inventory.episode!;
+  const surplus = books.find((book) => book.tokenId === episode.surplusTokenId)!;
+  const deficient = books.find((book) => book.tokenId !== episode.surplusTokenId)!;
+  const secondsRemaining = Math.max(0, event.windowEnd - nowSeconds);
+  const tick = Number(tickSizeFromMarket(event.market));
+  const open = snapshot.openOrders.filter(isV14Order);
+  const decisions: LadderV14ResidualDecision[] = [];
+  let waitSize = 0;
+  let remaining = inventory.unpairedShares;
+  const breakpoints = new Set<number>();
+  for (const levels of [surplus.bids, deficient.asks]) {
+    let cumulative = 0;
+    for (const level of levels) {
+      cumulative += Math.max(0, level.size);
+      if (cumulative > EPSILON) breakpoints.add(Math.min(remaining, cumulative));
+    }
+  }
+  let lotCumulative = 0;
+  for (const lot of inventory.residualLots) {
+    lotCumulative += lot.size;
+    breakpoints.add(Math.min(remaining, lotCumulative));
+  }
+  if (breakpoints.size === 0) breakpoints.add(remaining);
+  let consumed = 0;
+  for (const end of [...breakpoints].sort((left, right) => left - right)) {
+    const size = round(Math.min(remaining - consumed, end - consumed), 2);
+    if (size <= EPSILON) continue;
+    let lotOffset = 0;
+    const lot = inventory.residualLots.find((candidate) => {
+      lotOffset += candidate.size;
+      return consumed < lotOffset - EPSILON;
+    }) ?? inventory.residualLots.at(-1)!;
+    const sell = exactKalshiDepthProceeds({
+      levels: surplus.bids,
+      size: consumed + size,
+      rate: snapshot.takerFeeRate,
+      exponent: snapshot.takerFeeExponent,
+    });
+    const hedge = exactKalshiDepthCost({
+      levels: deficient.asks,
+      size: consumed + size,
+      rate: snapshot.takerFeeRate,
+      exponent: snapshot.takerFeeExponent,
+    });
+    const priorSell = consumed <= EPSILON ? { total: 0 } : exactKalshiDepthProceeds({
+      levels: surplus.bids,
+      size: consumed,
+      rate: snapshot.takerFeeRate,
+      exponent: snapshot.takerFeeExponent,
+    });
+    const priorHedge = consumed <= EPSILON ? { total: 0 } : exactKalshiDepthCost({
+      levels: deficient.asks,
+      size: consumed,
+      rate: snapshot.takerFeeRate,
+      exponent: snapshot.takerFeeExponent,
+    });
+    const sellValue = sell && priorSell && sell.size + EPSILON >= consumed + size
+      ? (sell.total - priorSell.total) / size
+      : null;
+    const hedgeValue = hedge && priorHedge
+      ? 1 - (hedge.total - priorHedge.total) / size
+      : null;
+    const makerPrice = deficient.bestAsk === null
+      ? deficient.bestBid
+      : Math.max(tick, round(deficient.bestAsk - tick, 4));
+    const currentMid = features.midpointByToken[surplus.tokenId] ?? midpoint(surplus);
+    const context = contextFor(
+      config,
+      event,
+      deficient,
+      lot.allInPrice,
+      size,
+      makerPrice === null ? 0 : queueAhead(deficient, makerPrice),
+      makerPrice === null
+        ? 99
+        : Math.max(0, Math.round(((deficient.bestBid ?? makerPrice) - makerPrice) / tick)),
+      secondsRemaining,
+      features,
+      {
+        side: surplus.outcome,
+        entryPrice: lot.allInPrice,
+        currentBid: sellValue,
+        currentMid,
+        priceMoveSinceFill: currentMid === null ? 0 : currentMid - lot.entryPrice,
+        residualAgeSeconds: Math.max(0, nowSeconds - lot.filledAtMs / 1_000),
+        depth: sell?.size ?? 0,
+      },
+    );
+    const completion = model.estimateCompletion(context, secondsRemaining);
+    const completionCost = makerPrice === null
+      ? 1
+      : model.expectedCompletionCost(context, makerPrice);
+    const failedExit = model.expectedFailedExit(context);
+    const waitValue = completion.probability * (1 - completionCost) +
+      (1 - completion.probability) * failedExit;
+    const cleanup = secondsRemaining <= config.ladderV14FinalCleanupSeconds;
+    const choices = [
+      ...(hedgeValue === null ? [] : [{ action: "hedge" as const, value: hedgeValue }]),
+      ...(sellValue === null ? [] : [{ action: "sell" as const, value: sellValue }]),
+      ...(cleanup ? [] : [{ action: "wait" as const, value: waitValue }]),
+    ].sort((left, right) => right.value - left.value);
+    const action = choices[0]?.action ?? "wait";
+    decisions.push({ action, size, hedgeValue, sellValue, waitValue, context });
+    if (action === "wait") waitSize += size;
+    consumed += size;
+    if (consumed + EPSILON >= remaining) break;
+  }
+
+  const immediate = decisions.find((decision) => decision.action !== "wait");
+  if (immediate) {
+    if (open.length > 0) {
+      return {
+        cancelOrderIds: open.map((order) => order.id),
+        opportunities: [],
+        flattenOpportunities: [],
+        managementStage: "cancel-before-residual-action",
+        residualDecisions: decisions,
+        placementContexts: {},
+      };
+    }
+    const role = immediate.action === "sell" ? "residual-sale" : "residual-hedge";
+    const token = immediate.action === "sell" ? surplus : deficient;
+    const depth = immediate.action === "sell"
+      ? exactKalshiDepthProceeds({
+          levels: surplus.bids,
+          size: immediate.size,
+          rate: snapshot.takerFeeRate,
+          exponent: snapshot.takerFeeExponent,
+        })
+      : exactKalshiDepthCost({
+          levels: deficient.asks,
+          size: immediate.size,
+          rate: snapshot.takerFeeRate,
+          exponent: snapshot.takerFeeExponent,
+        });
+    if (depth) {
+      const key = `${V14_PREFIX}${event.slug}:${role}:${episode.id}:${immediate.size}:${Math.floor(nowSeconds * 1000)}`;
+      const order = opportunity(
+        event,
+        token,
+        immediate.action === "sell" ? "SELL" : "BUY",
+        depth.limitPrice,
+        immediate.size,
+        "fak",
+        role,
+        key,
+      );
+      return {
+        cancelOrderIds: [],
+        opportunities: immediate.action === "hedge" ? [order] : [],
+        flattenOpportunities: immediate.action === "sell" ? [order] : [],
+        managementStage: immediate.action === "sell"
+          ? "marginal-residual-sale"
+          : "economic-loss-locking-hedge",
+        residualDecisions: decisions,
+        placementContexts: {
+          [key]: {
+            kind: immediate.action === "hedge" ? "completion" : "failed_exit",
+            context: immediate.context,
+          },
+        },
+      };
+    }
+  }
+
+  const makerPrice = deficient.bestAsk === null
+    ? deficient.bestBid
+    : Math.max(tick, round(deficient.bestAsk - tick, 4));
+  if (waitSize > EPSILON && makerPrice !== null && makerPrice < (deficient.bestAsk ?? 1)) {
+    const matching = open.filter((order) =>
+      order.tokenId === deficient.tokenId &&
+      Math.abs(order.limitPrice - makerPrice) <= EPSILON,
+    );
+    const desired = round(waitSize, 2);
+    if (matching.length === 1 && Math.abs(matching[0]!.remainingSize - desired) <= EPSILON) {
+      return { cancelOrderIds: [], opportunities: [], flattenOpportunities: [],
+        managementStage: "waiting-positive-ev-completion", residualDecisions: decisions,
+        placementContexts: {} };
+    }
+    if (open.length > 0) {
+      return { cancelOrderIds: open.map((order) => order.id), opportunities: [],
+        flattenOpportunities: [], managementStage: "replace-completion-maker",
+        residualDecisions: decisions, placementContexts: {} };
+    }
+    const context = decisions.find((decision) => decision.action === "wait")!.context;
+    const key = `${V14_PREFIX}${event.slug}:completion-maker:${makerPrice}:${desired}:${Math.floor(nowSeconds * 1000)}`;
+    return {
+      cancelOrderIds: [],
+      opportunities: [opportunity(event, deficient, "BUY", makerPrice, desired,
+        "post_only", "completion-maker", key)],
+      flattenOpportunities: [],
+      managementStage: "post-positive-ev-completion",
+      residualDecisions: decisions,
+      placementContexts: { [key]: { kind: "completion", context } },
+    };
+  }
+
+  return { cancelOrderIds: open.map((order) => order.id), opportunities: [],
+    flattenOpportunities: [], managementStage: "residual-no-executable-action",
+    residualDecisions: decisions, placementContexts: {} };
+}
+
+export function planLadderV14(
+  config: BotConfig,
+  event: UpDownEvent,
+  snapshot: MarketExecutionSnapshot,
+  model: LadderV14ConditionalModel,
+  features: LadderV14MarketFeatures = {
+    eligibleVolumePerSecondByToken: {},
+    volatilityByToken: {},
+    midpointByToken: {},
+  },
+  nowSeconds = Date.now() / 1_000,
+): LadderV14Plan {
+  const inventory = ladderV14Inventory(snapshot, nowSeconds);
+  const open = snapshot.openOrders.filter(isV14Order);
+  const base: LadderV14Plan = {
+    cancelOrderIds: [],
+    amendments: [],
+    opportunities: [],
+    flattenOpportunities: [],
+    managementStage: "observing",
+    candidates: [],
+    residualDecisions: [],
+    placementContexts: {},
+    pairedShares: inventory.pairedShares,
+    unpairedShares: inventory.unpairedShares,
+    lockedPnl: inventory.lockedPnl,
+    expectedPortfolioValue: 0,
+  };
+  const books = [...snapshot.books].sort(
+    (left, right) => left.outcomeIndex - right.outcomeIndex,
+  );
+  if (books.length !== 2 || snapshot.marketDataValid === false) {
+    return { ...base, cancelOrderIds: open.map((order) => order.id),
+      managementStage: "invalid-book" };
+  }
+  if (snapshot.executionPending) {
+    return { ...base, managementStage: "await-execution-reconciliation" };
+  }
+  const secondsRemaining = event.windowEnd - nowSeconds;
+  if (secondsRemaining <= 0) {
+    return { ...base, cancelOrderIds: open.map((order) => order.id),
+      managementStage: "market-expired" };
+  }
+  if (inventory.unpairedShares > EPSILON) {
+    return { ...base, ...planResidual(
+      config, event, snapshot, books, features, model, nowSeconds,
+    ) };
+  }
+
+  const tick = Number(tickSizeFromMarket(event.market));
+  const candidates = selectOpeningTargets(
+    config,
+    event,
+    snapshot,
+    books,
+    secondsRemaining,
+    tick,
+    features,
+    model,
+  );
+  base.candidates = candidates;
+  base.expectedPortfolioValue = candidates.reduce(
+    (sum, candidate) => sum + candidate.expectedValue,
+    0,
+  );
+  const desired = new Map(
+    candidates.map((candidate) => [
+      `${candidate.tokenId}|${candidate.price}`,
+      candidate,
+    ]),
+  );
+  const existingByKey = new Map<string, PaperOrder[]>();
+  for (const order of open) {
+    const key = `${order.tokenId}|${order.limitPrice}`;
+    const values = existingByKey.get(key) ?? [];
+    values.push(order);
+    existingByKey.set(key, values);
+  }
+  for (const [key, orders] of existingByKey) {
+    if (!desired.has(key)) base.cancelOrderIds.push(...orders.map((order) => order.id));
+    else if (orders.length > 1) base.cancelOrderIds.push(...orders.slice(1).map((order) => order.id));
+  }
+  if (base.cancelOrderIds.length > 0) {
+    base.managementStage = "reconcile-target-grid-cancellations";
+    return base;
+  }
+  for (const candidate of candidates) {
+    const key = `${candidate.tokenId}|${candidate.price}`;
+    const existing = existingByKey.get(key)?.[0];
+    const token = books.find((book) => book.tokenId === candidate.tokenId)!;
+    const tradeKey = `${V14_PREFIX}${event.slug}:opening:${candidate.tokenId}:${candidate.price}:${candidate.size}:${Math.floor(nowSeconds * 1000)}`;
+    const target = opportunity(
+      event,
+      token,
+      "BUY",
+      candidate.price,
+      candidate.size,
+      "post_only",
+      "opening",
+      tradeKey,
+    );
+    base.placementContexts[tradeKey] = { kind: "fill", context: candidate.context };
+    if (!existing) {
+      base.opportunities.push(target);
+    } else if (
+      Math.abs(existing.remainingSize - candidate.size) + EPSILON >=
+      Math.max(0.01, candidate.size * 0.01)
+    ) {
+      base.amendments.push({ orderId: existing.id, opportunity: target });
+    }
+  }
+  base.managementStage = base.amendments.length > 0
+    ? "amend-target-grid"
+    : base.opportunities.length > 0
+      ? "post-positive-marginal-ev-grid"
+      : candidates.length > 0
+        ? "target-grid-resting"
+        : "no-positive-marginal-ev";
+  return base;
+}

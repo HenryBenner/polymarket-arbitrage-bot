@@ -13,7 +13,8 @@ export type StrategyMode =
   | "ladder_v10"
   | "ladder_v11"
   | "ladder_v12"
-  | "ladder_v13";
+  | "ladder_v13"
+  | "ladder_v14";
 export type ExecutionMode = "dry_run" | "paper" | "live";
 export type ExchangeName = "polymarket" | "kalshi";
 export type LadderPreset = "odahoa_v1";
@@ -218,6 +219,8 @@ export interface MarketExecutionSnapshot {
   marketSlug: string;
   marketDataValid?: boolean;
   executionPending?: boolean;
+  /** False for V14 paper trading, where cash is accounting-only. */
+  capitalConstraint?: boolean;
   orders: readonly PaperOrder[];
   openOrders: readonly PaperOrder[];
   fills: readonly PaperFill[];
@@ -227,6 +230,12 @@ export interface MarketExecutionSnapshot {
   openCommitted: number;
   capitalCommitted: number;
   availableCash: number;
+  hypotheticalStartingBalance?: number;
+  grossCapitalDeployed?: number;
+  theoreticalCash?: number;
+  markedInventoryValue?: number;
+  realizedPnl?: number;
+  unrealizedPnl?: number;
   totalFees: number;
   estimatedMakerRebate: number;
   takerFeeRate: number;

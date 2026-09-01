@@ -602,6 +602,34 @@ test("ladder_v13 is full-window BTC-only Kalshi paper/live mode", () => {
   );
 });
 
+test("ladder_v14 supports multiple Kalshi 15-minute crypto series in paper/live", () => {
+  const config = testConfig({
+    exchange: "kalshi",
+    strategyMode: "ladder_v14",
+    executionMode: "paper",
+    kalshiSeriesTickers: ["KXBTC15M", "KXETH15M", "KXSOL15M"],
+    kalshiApiKeyId: "key-id",
+    kalshiPrivateKeyPem:
+      "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----",
+  });
+  assert.doesNotThrow(() => validateTradingConfig(config));
+  assert.doesNotThrow(() => validateTradingConfig({
+    ...config,
+    executionMode: "live",
+    dryRun: false,
+    ladderLiveAck: "I_UNDERSTAND_LADDER_MODE_CAN_LOSE_REAL_MONEY",
+    liveTradingAck: "I_UNDERSTAND_REAL_MONEY_IS_AT_RISK",
+  }));
+  assert.throws(
+    () => validateTradingConfig({ ...config, exchange: "polymarket" }),
+    /ladder_v14 supports Kalshi/,
+  );
+  assert.throws(
+    () => validateTradingConfig({ ...config, minutesBeforeCloseMax: 10 }),
+    /full market window/,
+  );
+});
+
 test("ladder_v8 is Polymarket paper-only with Odahoa sizing guards", () => {
   const config = testConfig({
     exchange: "polymarket",

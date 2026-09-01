@@ -271,10 +271,26 @@ Implementation:
 
 ### `ladder_v14`
 
-V14 is a Kalshi 15-minute crypto marginal-EV inventory engine. It can run BTC,
-ETH, SOL, or any other configured `KX<ASSET>15M` series. It does not launch
-fixed equal-size pair cycles. For every passive price and economically distinct
-quantity breakpoint it estimates the conditional lifecycle value
+V14 is a Kalshi 15-minute crypto pair-collection and inventory-learning engine.
+It can run BTC, ETH, SOL, or any other configured `KX<ASSET>15M` series.
+
+V14 currently defaults to bootstrap collection mode with
+`LADDER_V14_VOLUME_FIRST_MODE=true`. In this mode the statistical engine runs
+in shadow: it records fill, completion, and failed-exit behavior but does not
+gate entries. The live quote policy posts up to four paired, near-touch maker
+levels. Their default sizes are 40, 80, 160, and 320 shares, and their combined
+raw prices target 99c, 97c, 95c, and 93c. The exact split between Up and Down is
+chosen to keep both quotes as close to their respective touches as possible.
+
+One-sided fills do not stop collection. V14 continues posting both sides and
+adds the current imbalance to the most aggressive missing-side quote. Ordinary
+opening orders are cancelled during the final cleanup window, and actual
+unpaired surplus is sold into available bid depth. It does not use early
+EV-based hedging or liquidation in bootstrap mode.
+
+Set `LADDER_V14_VOLUME_FIRST_MODE=false` to enable the stricter marginal-EV
+entry and residual optimizer. For every passive price and economically distinct
+quantity breakpoint that optimizer estimates the conditional lifecycle value
 
 ```text
 P(fill) * [P(pair) * (1 - entry - E[opposite cost | pair])
@@ -298,12 +314,10 @@ a configurable quote lifetime (five seconds by default), not the entire time
 left in the market. Only selected, simultaneously resting aggressive levels
 enter deeper-layer sweep exposure.
 
-When a one-sided fill exists, V14 stops ordinary opening accumulation and
+In strict EV mode, a one-sided fill stops ordinary opening accumulation and V14
 compares marginal `hedge`, `sell`, and `wait` value on every update. A hedge may
 deliberately make the accounting pair cost exceed $1 when it preserves more
-value than selling or waiting. Residual selling starts immediately when it has
-higher value; 30 seconds is the final no-wait cleanup backstop, not the start of
-sell eligibility.
+value than selling or waiting.
 
 The learner stores indexed conditional sufficient statistics, so the trading
 hot path performs no history scan or disk read. Completion prices are learned
@@ -316,11 +330,10 @@ or ETH pairing rates.
 
 Paper mode sets `capitalConstraint=false`: normal cash never becomes negative,
 while theoretical cash, gross deployment, marked inventory, and realized and
-unrealized P&L remain explicit metrics. Live mode uses one global allocator,
-ranks positive opening segments by expected profit per capital-exposure second,
-executes one acknowledged mutation, and then replans every market against
-current cash. This favors realizable pair turnover over remote quotes with
-similar theoretical EV and negligible fill probability.
+unrealized P&L remain explicit metrics. One global acknowledgement-driven
+allocator places the most aggressive bootstrap levels first. In strict EV mode
+the allocator instead ranks positive segments by expected profit per
+capital-exposure second.
 
 Implementation:
 

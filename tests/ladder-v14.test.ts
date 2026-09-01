@@ -179,6 +179,99 @@ test("V14 permits exactly zero hazard and makes pseudo-flow quantity-aware", () 
   assert.ok(large.probability < small.probability);
 });
 
+test("V14 volume-first mode posts a profitable near-touch pair grid without EV gating", () => {
+  const books = testBooks(0.65, 0.37, 1);
+  books[0]!.bestBid = 0.63;
+  books[0]!.bids = [{ price: 0.63, size: 500 }];
+  books[1]!.bestBid = 0.35;
+  books[1]!.bids = [{ price: 0.35, size: 500 }];
+  const zeroModel = {
+    estimateFill: () => ({ probability: 0, hazard: 0 }),
+    estimateCompletion: () => ({ probability: 0, hazard: 0 }),
+    expectedCompletionCost: (_context: LadderV14ConditionalContext, fallback: number) => fallback,
+    expectedFailedExit: () => 0,
+  } as unknown as LadderV14ConditionalModel;
+  const plan = planLadderV14(
+    testConfig({
+      exchange: "kalshi",
+      strategyMode: "ladder_v14",
+      ladderV14VolumeFirstMode: true,
+      ladderV14VolumeFirstBaseShares: 40,
+      ladderV14VolumeFirstLevels: 4,
+    }),
+    event,
+    snapshot(books),
+    zeroModel,
+    features(books),
+    event.windowEnd - 600,
+  );
+  assert.equal(plan.managementStage, "volume-first-post-pair-grid");
+  assert.ok(plan.candidates.length >= 4);
+  assert.ok(plan.candidates.every((candidate) => candidate.selectionMode === "volume"));
+  const top = plan.candidates.filter((candidate) => candidate.priorityScore >= 4_000_000);
+  assert.equal(top.length, 2);
+  assert.equal(top[0]!.size, 40);
+  assert.equal(top[1]!.size, 40);
+  assert.ok(top[0]!.price + top[1]!.price <= 0.99 + 1e-8);
+  assert.ok(top.some((candidate) => candidate.expectedValue === 0));
+});
+
+test("V14 volume-first mode keeps collecting after one-sided fills and boosts the missing side", () => {
+  const books = testBooks(0.65, 0.37, 1);
+  books[0]!.bestBid = 0.63;
+  books[0]!.bids = [{ price: 0.63, size: 500 }];
+  books[1]!.bestBid = 0.35;
+  books[1]!.bids = [{ price: 0.35, size: 500 }];
+  const filledUp = v14Order("volume-up", "up-token", 0.63, 10);
+  const plan = planLadderV14(
+    testConfig({
+      exchange: "kalshi",
+      strategyMode: "ladder_v14",
+      ladderV14VolumeFirstMode: true,
+      ladderV14VolumeFirstBaseShares: 40,
+    }),
+    event,
+    snapshot(books, [filledUp], [v14Fill(filledUp)]),
+    new LadderV14ConditionalModel(parameters),
+    flowingFeatures(books, 10),
+    event.windowEnd - 300,
+  );
+  assert.equal(plan.flattenOpportunities.length, 0);
+  assert.equal(plan.managementStage, "volume-first-post-pair-grid");
+  const topUp = plan.candidates.find((candidate) =>
+    candidate.outcome === "Up" && candidate.priorityScore >= 4_000_000
+  );
+  const topDown = plan.candidates.find((candidate) =>
+    candidate.outcome === "Down" && candidate.priorityScore >= 4_000_000
+  );
+  assert.equal(topUp?.size, 40);
+  assert.equal(topDown?.size, 50);
+});
+
+test("V14 volume-first mode sells residual inventory only in final cleanup", () => {
+  const books = testBooks(0.65, 0.37, 1);
+  books[0]!.bestBid = 0.63;
+  books[0]!.bids = [{ price: 0.63, size: 500 }];
+  const filledUp = v14Order("final-up", "up-token", 0.6, 10);
+  const plan = planLadderV14(
+    testConfig({
+      exchange: "kalshi",
+      strategyMode: "ladder_v14",
+      ladderV14VolumeFirstMode: true,
+      ladderV14FinalCleanupSeconds: 30,
+    }),
+    event,
+    snapshot(books, [filledUp], [v14Fill(filledUp)]),
+    new LadderV14ConditionalModel(parameters),
+    features(books),
+    event.windowEnd - 20,
+  );
+  assert.equal(plan.managementStage, "volume-first-final-residual-sale");
+  assert.equal(plan.opportunities.length, 0);
+  assert.equal(plan.flattenOpportunities[0]?.token.tokenId, "up-token");
+  assert.equal(plan.flattenOpportunities[0]?.size, 10);
+});
+
 test("V14 requires every cumulative quantity segment to have positive marginal EV", () => {
   const books = testBooks(0.45, 0.45, 1);
   const marginalModel = {

@@ -305,7 +305,9 @@ export class ReverseBot {
                            : this.config.strategyMode === "ladder_v13"
                              ? "dynamic microprice pair-arbitrage market maker"
                            : this.config.strategyMode === "ladder_v14"
-                             ? "conditional marginal-EV multi-market inventory engine"
+                             ? this.config.ladderV14VolumeFirstMode
+                               ? "volume-first multi-market pair collector with shadow EV learning"
+                               : "conditional marginal-EV multi-market inventory engine"
                            : "early two-sided static maker ladder",
       strategyMode: this.config.strategyMode,
       executionMode: this.config.executionMode,
@@ -442,9 +444,21 @@ export class ReverseBot {
           ? {
               priorEquivalentObservations: this.config.ladderV14PriorStrength,
               capitalConstraint: this.config.executionMode === "live",
-              quotePolicy: "positive_conditional_marginal_ev",
-              quantityPolicy: "all_economic_breakpoints_with_sweep_conditioning",
-              residualPolicy: "marginal_max_of_hedge_sell_wait",
+              volumeFirstMode: this.config.ladderV14VolumeFirstMode,
+              quotePolicy: this.config.ladderV14VolumeFirstMode
+                ? "paired_near_touch_grid_without_ev_gate"
+                : "positive_conditional_marginal_ev",
+              quantityPolicy: this.config.ladderV14VolumeFirstMode
+                ? {
+                    baseShares: this.config.ladderV14VolumeFirstBaseShares,
+                    levels: this.config.ladderV14VolumeFirstLevels,
+                    pairCost: this.config.ladderV14VolumeFirstPairCost,
+                    pairStep: this.config.ladderV14VolumeFirstPairStep,
+                  }
+                : "all_economic_breakpoints_with_sweep_conditioning",
+              residualPolicy: this.config.ladderV14VolumeFirstMode
+                ? "continue_pair_collection_then_final_residual_sale"
+                : "marginal_max_of_hedge_sell_wait",
               finalCleanupSeconds: this.config.ladderV14FinalCleanupSeconds,
               series: this.config.kalshiSeriesTickers,
             }
@@ -1685,10 +1699,12 @@ export class ReverseBot {
                   context: option.context,
                 },
                 releasedCash: currentOrder.limitPrice * currentOrder.remainingSize,
-                score: incrementalValue / Math.max(
-                  1e-8,
-                  incrementalCash * option.expectedExposureSeconds,
-                ),
+                score: candidate.selectionMode === "volume"
+                  ? candidate.priorityScore
+                  : incrementalValue / Math.max(
+                      1e-8,
+                      incrementalCash * option.expectedExposureSeconds,
+                    ),
               };
             })
             .filter((item) => item.score > 0);
@@ -1701,7 +1717,9 @@ export class ReverseBot {
             : undefined,
           releasedCash: 0,
           score: candidate
-            ? candidate.expectedProfitRate
+            ? candidate.selectionMode === "volume"
+              ? candidate.priorityScore
+              : candidate.expectedProfitRate
             : 0,
         }];
       }),
@@ -1761,7 +1779,9 @@ export class ReverseBot {
               placement: option.context
                 ? { kind: "fill" as const, context: option.context }
                 : undefined,
-              score: option.expectedProfitRate,
+              score: candidate?.selectionMode === "volume"
+                ? candidate.priorityScore
+                : option.expectedProfitRate,
             };
           });
         }),
@@ -1787,7 +1807,7 @@ export class ReverseBot {
         pairedShares: plan.pairedShares,
         unpairedShares: plan.unpairedShares,
         lockedPnl: plan.lockedPnl,
-        positiveEvLevels: plan.candidates.length,
+        openingLevels: plan.candidates.length,
         expectedPortfolioValue: plan.expectedPortfolioValue,
         bestEvaluatedEv: plan.bestEvaluatedCandidate?.expectedValue ?? null,
         bestEvaluatedEvPerShare:

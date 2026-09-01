@@ -175,7 +175,7 @@ class V14Executor implements OrderExecutor {
   }
 }
 
-test("V14 global queue allocates positive-EV orders across configured series", async () => {
+test("V14 global queue allocates volume-first pair grids across configured series", async () => {
   const directory = await mkdtemp(join(tmpdir(), "ladder-v14-global-"));
   try {
     const start = Math.floor(Date.now() / 1_000) - 300;
@@ -189,6 +189,7 @@ test("V14 global queue allocates positive-EV orders across configured series", a
     const bot = new ReverseBot(testConfig({
       exchange: "kalshi",
       strategyMode: "ladder_v14",
+      ladderV14VolumeFirstMode: true,
       executionMode: "paper",
       paperStatePath: directory,
       kalshiSeriesTickers: ["KXBTC15M", "KXSOL15M"],

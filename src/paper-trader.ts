@@ -994,7 +994,9 @@ export class PaperTrader implements OrderExecutor {
                   : this.config.strategyMode === "ladder_v13"
                     ? "ladder_v13 dynamic microprice pair-arbitrage maker"
                   : this.config.strategyMode === "ladder_v14"
-                    ? "ladder_v14 conditional marginal-EV inventory engine"
+                    ? this.config.ladderV14VolumeFirstMode
+                      ? "ladder_v14 volume-first pair collector / shadow EV learner"
+                      : "ladder_v14 conditional marginal-EV inventory engine"
                   : this.config.strategyMode === "ladder_v7"
                     ? "ladder_v7 fixed cheap maker / capped favorite FAK"
                     : this.config.strategyMode === "ladder_v8"

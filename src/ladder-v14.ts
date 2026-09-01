@@ -34,6 +34,8 @@ export interface LadderV14MarketFeatures {
 }
 
 export interface LadderV14Candidate {
+  selectionMode: "ev" | "volume";
+  priorityScore: number;
   tokenId: string;
   outcome: string;
   price: number;
@@ -188,6 +190,36 @@ function makerPrices(book: TokenBook, tick: number): number[] {
     result.push(price);
   }
   return result.reverse();
+}
+
+function pairedMakerPrices(
+  books: readonly TokenBook[],
+  tick: number,
+  targetPairCost: number,
+): [number, number] | null {
+  const left = makerPrices(books[0]!, tick);
+  const right = makerPrices(books[1]!, tick);
+  const leftCeiling = left[0] ?? null;
+  const rightCeiling = right[0] ?? null;
+  if (leftCeiling === null || rightCeiling === null) return null;
+  let best: { prices: [number, number]; score: number } | null = null;
+  for (const leftPrice of left) {
+    for (const rightPrice of right) {
+      const pairCost = leftPrice + rightPrice;
+      if (pairCost > targetPairCost + EPSILON) continue;
+      const leftDistance = Math.round((leftCeiling - leftPrice) / tick);
+      const rightDistance = Math.round((rightCeiling - rightPrice) / tick);
+      // First maximize profitable pair cost (most aggressive combined quote),
+      // then balance concessions so neither side is buried far from its touch.
+      const score = pairCost * 1_000_000 -
+        Math.abs(leftDistance - rightDistance) * 100 -
+        (leftDistance + rightDistance);
+      if (!best || score > best.score) {
+        best = { prices: [leftPrice, rightPrice], score };
+      }
+    }
+  }
+  return best?.prices ?? null;
 }
 
 function quantityBreakpoints(
@@ -397,6 +429,8 @@ function openingCandidate(
   const expectedProfitRate = expectedValue /
     (committedCapital * Math.max(EPSILON, expectedExposureSeconds));
   return {
+    selectionMode: "ev",
+    priorityScore: expectedProfitRate,
     tokenId: book.tokenId,
     outcome: book.outcome,
     price,
@@ -413,6 +447,95 @@ function openingCandidate(
     sweepPrefixShares,
     context,
     quantityOptions: [],
+  };
+}
+
+function selectVolumeFirstTargets(
+  config: BotConfig,
+  event: UpDownEvent,
+  snapshot: MarketExecutionSnapshot,
+  books: readonly TokenBook[],
+  inventory: ReturnType<typeof ladderV14Inventory>,
+  secondsRemaining: number,
+  tick: number,
+  features: LadderV14MarketFeatures,
+  model: LadderV14ConditionalModel,
+): {
+  selected: LadderV14Candidate[];
+  bestEvaluated: LadderV14Candidate | null;
+} {
+  const selected: LadderV14Candidate[] = [];
+  const sweepByToken = new Map<string, number>();
+  const usedPairs = new Set<string>();
+  const deficientTokenId = inventory.episode === null
+    ? null
+    : books.find((book) => book.tokenId !== inventory.episode!.surplusTokenId)
+      ?.tokenId ?? null;
+  let bestEvaluated: LadderV14Candidate | null = null;
+  for (let level = 0; level < config.ladderV14VolumeFirstLevels; level += 1) {
+    const targetPairCost = round(
+      config.ladderV14VolumeFirstPairCost -
+        level * config.ladderV14VolumeFirstPairStep,
+      4,
+    );
+    if (targetPairCost < tick * 2 - EPSILON) break;
+    const prices = pairedMakerPrices(books, tick, targetPairCost);
+    if (!prices) continue;
+    const pairKey = `${prices[0]}|${prices[1]}`;
+    if (usedPairs.has(pairKey)) continue;
+    usedPairs.add(pairKey);
+    for (let sideIndex = 0; sideIndex < 2; sideIndex += 1) {
+      const book = books[sideIndex]!;
+      const opposite = books[1 - sideIndex]!;
+      const imbalanceRepair = level === 0 && book.tokenId === deficientTokenId
+        ? inventory.unpairedShares
+        : 0;
+      const quantity = round(
+        config.ladderV14VolumeFirstBaseShares * 2 ** level + imbalanceRepair,
+        2,
+      );
+      const sweepPrefix = sweepByToken.get(book.tokenId) ?? 0;
+      const candidate = openingCandidate(
+        config,
+        event,
+        snapshot,
+        book,
+        opposite,
+        prices[sideIndex]!,
+        quantity,
+        sweepPrefix,
+        secondsRemaining,
+        tick,
+        features,
+        model,
+      );
+      if (!candidate) continue;
+      candidate.selectionMode = "volume";
+      candidate.priorityScore =
+        (config.ladderV14VolumeFirstLevels - level) * 1_000_000 +
+        candidate.fillProbability;
+      candidate.quantityOptions = [{
+        size: candidate.size,
+        expectedValue: candidate.expectedValue,
+        marginalValue: candidate.marginalValue,
+        expectedValuePerShare: candidate.expectedValuePerShare,
+        expectedProfitRate: candidate.expectedProfitRate,
+        expectedExposureSeconds: candidate.expectedExposureSeconds,
+        context: candidate.context,
+      }];
+      selected.push(candidate);
+      sweepByToken.set(book.tokenId, sweepPrefix + candidate.size);
+      if (
+        !bestEvaluated ||
+        candidate.expectedValue > bestEvaluated.expectedValue
+      ) bestEvaluated = candidate;
+    }
+  }
+  return {
+    selected: selected.sort(
+      (left, right) => right.priorityScore - left.priorityScore,
+    ),
+    bestEvaluated,
   };
 }
 
@@ -752,6 +875,104 @@ function planResidual(
     residualDecisions: decisions, placementContexts: {} };
 }
 
+function planVolumeFirstCleanup(
+  config: BotConfig,
+  event: UpDownEvent,
+  snapshot: MarketExecutionSnapshot,
+  books: readonly TokenBook[],
+  features: LadderV14MarketFeatures,
+  nowSeconds: number,
+): Pick<LadderV14Plan,
+  "cancelOrderIds" | "opportunities" | "flattenOpportunities" |
+  "managementStage" | "residualDecisions" | "placementContexts"> {
+  const inventory = ladderV14Inventory(snapshot, nowSeconds);
+  const open = snapshot.openOrders.filter(isV14Order);
+  if (open.length > 0) {
+    return {
+      cancelOrderIds: open.map((order) => order.id),
+      opportunities: [],
+      flattenOpportunities: [],
+      managementStage: "volume-first-cancel-before-final-sale",
+      residualDecisions: [],
+      placementContexts: {},
+    };
+  }
+  if (inventory.unpairedShares <= EPSILON || inventory.episode === null) {
+    return {
+      cancelOrderIds: [],
+      opportunities: [],
+      flattenOpportunities: [],
+      managementStage: "volume-first-final-balanced",
+      residualDecisions: [],
+      placementContexts: {},
+    };
+  }
+  const surplus = books.find(
+    (book) => book.tokenId === inventory.episode!.surplusTokenId,
+  )!;
+  const sale = exactKalshiDepthProceeds({
+    levels: surplus.bids,
+    size: inventory.unpairedShares,
+    rate: snapshot.takerFeeRate,
+    exponent: snapshot.takerFeeExponent,
+  });
+  if (!sale || sale.size <= EPSILON) {
+    return {
+      cancelOrderIds: [],
+      opportunities: [],
+      flattenOpportunities: [],
+      managementStage: "volume-first-waiting-final-bid",
+      residualDecisions: [],
+      placementContexts: {},
+    };
+  }
+  const lot = inventory.residualLots[0]!;
+  const context = contextFor(
+    config,
+    event,
+    surplus,
+    lot.allInPrice,
+    sale.size,
+    0,
+    0,
+    Math.max(0, event.windowEnd - nowSeconds),
+    features,
+    {
+      entryPrice: lot.allInPrice,
+      currentBid: sale.averageNetPrice,
+      currentMid: features.midpointByToken[surplus.tokenId] ?? midpoint(surplus),
+      residualAgeSeconds: Math.max(0, nowSeconds - lot.filledAtMs / 1_000),
+      depth: sale.size,
+    },
+  );
+  const key = `${V14_PREFIX}${event.slug}:volume-first-final-sale:${inventory.episode.id}:${sale.size}:${Math.floor(nowSeconds * 1000)}`;
+  const target = opportunity(
+    event,
+    surplus,
+    "SELL",
+    sale.limitPrice,
+    sale.size,
+    "fak",
+    "volume-first-final-sale",
+    key,
+  );
+  return {
+    cancelOrderIds: [],
+    opportunities: [],
+    flattenOpportunities: [target],
+    managementStage: "volume-first-final-residual-sale",
+    residualDecisions: [{
+      action: "sell",
+      size: sale.size,
+      hedgeValue: null,
+      sellValue: sale.averageNetPrice,
+      waitValue: 0,
+      context,
+    }],
+    placementContexts: { [key]: { kind: "failed_exit", context } },
+  };
+}
+
 export function planLadderV14(
   config: BotConfig,
   event: UpDownEvent,
@@ -796,26 +1017,48 @@ export function planLadderV14(
     return { ...base, cancelOrderIds: open.map((order) => order.id),
       managementStage: "market-expired" };
   }
-  if (inventory.unpairedShares > EPSILON) {
+  if (
+    config.ladderV14VolumeFirstMode &&
+    secondsRemaining <= config.ladderV14FinalCleanupSeconds
+  ) {
+    return { ...base, ...planVolumeFirstCleanup(
+      config, event, snapshot, books, features, nowSeconds,
+    ) };
+  }
+  if (!config.ladderV14VolumeFirstMode && inventory.unpairedShares > EPSILON) {
     return { ...base, ...planResidual(
       config, event, snapshot, books, features, model, nowSeconds,
     ) };
   }
 
   const tick = Number(tickSizeFromMarket(event.market));
-  const openingSelection = selectOpeningTargets(
-    config,
-    event,
-    snapshot,
-    books,
-    secondsRemaining,
-    tick,
-    features,
-    model,
-  );
-  const candidates = openingSelection.selected.sort(
-    (left, right) => right.expectedProfitRate - left.expectedProfitRate,
-  );
+  const openingSelection = config.ladderV14VolumeFirstMode
+    ? selectVolumeFirstTargets(
+        config,
+        event,
+        snapshot,
+        books,
+        inventory,
+        secondsRemaining,
+        tick,
+        features,
+        model,
+      )
+    : selectOpeningTargets(
+        config,
+        event,
+        snapshot,
+        books,
+        secondsRemaining,
+        tick,
+        features,
+        model,
+      );
+  const candidates = config.ladderV14VolumeFirstMode
+    ? openingSelection.selected
+    : openingSelection.selected.sort(
+        (left, right) => right.expectedProfitRate - left.expectedProfitRate,
+      );
   base.candidates = candidates;
   base.bestEvaluatedCandidate = openingSelection.bestEvaluated;
   base.expectedPortfolioValue = candidates.reduce(
@@ -869,11 +1112,19 @@ export function planLadderV14(
     }
   }
   base.managementStage = base.amendments.length > 0
-    ? "amend-target-grid"
+    ? config.ladderV14VolumeFirstMode
+      ? "volume-first-amend-pair-grid"
+      : "amend-target-grid"
     : base.opportunities.length > 0
-      ? "post-positive-marginal-ev-grid"
+      ? config.ladderV14VolumeFirstMode
+        ? "volume-first-post-pair-grid"
+        : "post-positive-marginal-ev-grid"
       : candidates.length > 0
-        ? "target-grid-resting"
-        : "no-positive-marginal-ev";
+        ? config.ladderV14VolumeFirstMode
+          ? "volume-first-pair-grid-resting"
+          : "target-grid-resting"
+        : config.ladderV14VolumeFirstMode
+          ? "volume-first-no-valid-pair-grid"
+          : "no-positive-marginal-ev";
   return base;
 }

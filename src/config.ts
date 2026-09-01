@@ -185,6 +185,11 @@ export interface BotConfig {
   ladderV14PseudoFlowDepthFraction: number;
   ladderV14QuantityQueueWeight: number;
   ladderV14ReachabilityMultiplier: number;
+  ladderV14VolumeFirstMode: boolean;
+  ladderV14VolumeFirstBaseShares: number;
+  ladderV14VolumeFirstLevels: number;
+  ladderV14VolumeFirstPairCost: number;
+  ladderV14VolumeFirstPairStep: number;
   paperStartingUsdc: number;
   paperStatePath: string;
 }
@@ -412,6 +417,26 @@ export function loadConfig(): BotConfig {
     ladderV14ReachabilityMultiplier: envNumber(
       "LADDER_V14_REACHABILITY_MULTIPLIER",
       1.5,
+    ),
+    ladderV14VolumeFirstMode: envBoolean(
+      "LADDER_V14_VOLUME_FIRST_MODE",
+      true,
+    ),
+    ladderV14VolumeFirstBaseShares: envNumber(
+      "LADDER_V14_VOLUME_FIRST_BASE_SHARES",
+      40,
+    ),
+    ladderV14VolumeFirstLevels: envNumber(
+      "LADDER_V14_VOLUME_FIRST_LEVELS",
+      4,
+    ),
+    ladderV14VolumeFirstPairCost: envNumber(
+      "LADDER_V14_VOLUME_FIRST_PAIR_COST",
+      0.99,
+    ),
+    ladderV14VolumeFirstPairStep: envNumber(
+      "LADDER_V14_VOLUME_FIRST_PAIR_STEP",
+      0.02,
     ),
     paperStartingUsdc: envNumber("PAPER_STARTING_USDC", 100),
     paperStatePath: envString("PAPER_STATE_PATH", "./data/paper"),
@@ -876,7 +901,16 @@ export function validateTradingConfig(config: BotConfig): void {
     !Number.isFinite(config.ladderV14QuantityQueueWeight) ||
     config.ladderV14QuantityQueueWeight <= 0 ||
     !Number.isFinite(config.ladderV14ReachabilityMultiplier) ||
-    config.ladderV14ReachabilityMultiplier <= 0
+    config.ladderV14ReachabilityMultiplier <= 0 ||
+    !Number.isFinite(config.ladderV14VolumeFirstBaseShares) ||
+    config.ladderV14VolumeFirstBaseShares <= 0 ||
+    !Number.isInteger(config.ladderV14VolumeFirstLevels) ||
+    config.ladderV14VolumeFirstLevels <= 0 ||
+    !Number.isFinite(config.ladderV14VolumeFirstPairCost) ||
+    config.ladderV14VolumeFirstPairCost <= 0 ||
+    config.ladderV14VolumeFirstPairCost >= 1 ||
+    !Number.isFinite(config.ladderV14VolumeFirstPairStep) ||
+    config.ladderV14VolumeFirstPairStep <= 0
   ) {
     throw new Error("LADDER_V14 model and window settings must be finite and positive");
   }

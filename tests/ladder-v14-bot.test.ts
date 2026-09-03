@@ -236,9 +236,10 @@ test("V14 global queue allocates volume-first pair grids across configured serie
   }
 });
 
-test("V14 repair deadline wakes a quiet book, cancels maker, hedges, and resumes grid", async () => {
+test("V14 final cleanup wakes a quiet book, cancels maker, hedges, and stays balanced", async () => {
   const directory = await mkdtemp(join(tmpdir(), "ladder-v14-deadline-"));
   const event = market("KXETH15M", "ETH", Math.floor(Date.now() / 1000) - 300);
+  event.windowEnd = Date.now() / 1000 + 31.5;
   const executor = new V14Executor();
   let bookReads = 0;
   const bot = new ReverseBot(testConfig({
@@ -271,17 +272,14 @@ test("V14 repair deadline wakes a quiet book, cancels maker, hedges, and resumes
     assert.equal(maker.remainingSize, opening.originalSize);
     const readsBeforeDeadline = bookReads;
     // No book event or runOnce call: the bounded repair timer drives this.
-    await new Promise((resolve) => setTimeout(resolve, 1500));
+    await new Promise((resolve) => setTimeout(resolve, 2200));
     assert.equal(bookReads, readsBeforeDeadline);
     assert.equal(maker.status, "cancelled");
     const hedges = state.orders.filter((order) => order.pairId === "ladder-v14:repair-taker");
     assert.ok(hedges.length > 0);
     assert.ok(hedges.every((order) => order.status === "filled"));
     assert.equal(hedges.reduce((sum, order) => sum + order.originalSize, 0), opening.originalSize);
-    assert.ok(state.openOrders.length >= 2);
-    assert.ok(state.openOrders.every((order) => order.pairId === "ladder-v14:opening"));
-    assert.ok(state.openOrders.some((order) => order.outcome === "Up"));
-    assert.ok(state.openOrders.some((order) => order.outcome === "Down"));
+    assert.equal(state.openOrders.length, 0, "no new grid during final cleanup");
   } finally {
     // Cancel a pending timer even if an assertion fails before the deadline.
     (bot as unknown as { scheduleLadderV14RepairWake(deadline: undefined): void })
@@ -309,7 +307,7 @@ test("V14 zero-fill immediate repair waits for fresh input instead of busy-loopi
     opening.remainingSize = 0;
     state.openOrders = state.openOrders.filter((order) => order.id !== opening.id);
     state.fills = [{ id: "old-fill", orderId: opening.id, marketSlug: event.slug,
-      tokenId: opening.tokenId, outcome: opening.outcome, price: 0.6,
+      tokenId: opening.tokenId, outcome: opening.outcome, price: 0.4,
       size: opening.originalSize, fee: 0, liquidity: "maker", side: "BUY",
       timestamp: new Date(Date.now() - 10_000).toISOString() }];
     const timeout = setTimeout(() => { executor.fillImmediateOrders = true; }, 1000);
@@ -319,6 +317,7 @@ test("V14 zero-fill immediate repair waits for fresh input instead of busy-loopi
     assert.equal(repair[0]!.status, "cancelled");
     assert.equal(state.fills.length, 1);
   } finally {
+    await bot.stop();
     await new Promise((resolve) => setTimeout(resolve, 600));
     await rm(directory, { recursive: true, force: true });
   }

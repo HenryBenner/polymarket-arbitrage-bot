@@ -139,6 +139,27 @@ test("paper fills, sales, amendments, cancellations and wakes proceed while chec
   assert.ok(records.some((record) => record.type === "order_cancelled"));
 });
 
+test("fresh trades on the trade channel survive a newer book but not a pre-amend timestamp", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const f = await fixture(t);
+  await f.trader.placeBuy(f.opportunity);
+  t.mock.timers.tick(100);
+  await f.trader.ingestMarketEvent({ event_type: "book", asset_id: "up-token",
+    timestamp: Date.now(), bids: [], asks: [{price:"0.6",size:"100"}] });
+  await f.trader.ingestMarketEvent({ event_type: "last_trade_price", asset_id: "up-token",
+    timestamp: Date.now()-50, side: "SELL", price: "0.4", size: "2", transaction_hash: "fresh" });
+  assert.equal(f.trader.snapshot().fills.length, 1, "newer books must not censor fresh maker trades");
+  const order = f.trader.snapshot().orders[0]!;
+  await f.trader.amendOrder(order.id, { ...f.opportunity, size: 8, price: 0.41, tradeKey: "repriced" });
+  await f.trader.ingestMarketEvent({ event_type: "last_trade_price", asset_id: "up-token",
+    timestamp: Date.now()-10, side: "SELL", price: "0.41", size: "2", transaction_hash: "pre-amend" });
+  assert.equal(f.trader.snapshot().fills.length, 1, "new price must not fill against earlier trades");
+  t.mock.timers.tick(10);
+  await f.trader.ingestMarketEvent({ event_type: "last_trade_price", asset_id: "up-token",
+    timestamp: Date.now(), side: "SELL", price: "0.41", size: "2", transaction_hash: "post-amend" });
+  assert.equal(f.trader.snapshot().fills.length, 2);
+});
+
 test("a failed checkpoint remains dirty and the next five-second checkpoint recovers", async (t) => {
   t.mock.timers.enable({ apis: ["setInterval"] });
   const f = await fixture(t);

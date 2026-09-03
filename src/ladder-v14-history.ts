@@ -46,6 +46,8 @@ interface Exposure {
   placement: LadderV14PlacementContext;
   startedAtMs: number;
   tradeKey?: string;
+  /** Cumulative order fills required, including fills before an amendment. */
+  targetFilledSize?: number;
 }
 
 interface HistoryState {
@@ -109,6 +111,7 @@ export class LadderV14HistoryStore {
   private persistence: Promise<void> = Promise.resolve();
   private persistenceTimer: NodeJS.Timeout | null = null;
   private dirty = false;
+  private writing = false;
 
   private constructor(
     path: string,
@@ -133,6 +136,15 @@ export class LadderV14HistoryStore {
     this.active = new Map(state?.active ?? []);
     this.observedOrderIds = new Set(state?.observedOrderIds ?? []);
     this.observedFillIds = new Set(state?.observedFillIds ?? []);
+    // Old versions leaked every rejected/amended placement after settlement.
+    // Remove expired quote contexts on load, but preserve learned statistics.
+    for (const key of this.planned.keys()) {
+      const match = /^ladder-v14:[^:]+-updown-(\d+)m-(\d+):/.exec(key);
+      if (match && (Number(match[2]) + Number(match[1]) * 60) * 1000 < Date.now()) {
+        this.planned.delete(key);
+        this.dirty = true;
+      }
+    }
   }
 
   static async load(
@@ -237,8 +249,28 @@ export class LadderV14HistoryStore {
       this.planned.set(tradeKey, structuredClone(placement));
       changed = true;
     }
+    changed = this.observeOrders(snapshot, nowMs) || changed;
+
+    // Bound stale planned contexts after a market is gone without scanning history.
+    if (event.windowEnd * 1_000 < nowMs) {
+      for (const key of this.planned.keys()) {
+        if (key.startsWith(`ladder-v14:${event.slug}:`)) {
+          this.planned.delete(key);
+          changed = true;
+        }
+      }
+    }
+    if (changed) this.schedulePersist();
+  }
+
+  private observeOrders(snapshot: MarketExecutionSnapshot, nowMs: number): boolean {
+    let changed = false;
     for (const order of snapshot.orders) {
-      if (!order.pairId?.startsWith("ladder-v14:") || this.observedOrderIds.has(order.id)) {
+      if (!order.pairId?.startsWith("ladder-v14:")) continue;
+      if (this.observedOrderIds.has(order.id)) {
+        // A partially filled order's first-fill hazard was already learned;
+        // amendments must not leave another orphaned planned context behind.
+        if (this.planned.delete(order.tradeKey)) changed = true;
         continue;
       }
       const replacement = this.planned.get(order.tradeKey);
@@ -260,6 +292,7 @@ export class LadderV14HistoryStore {
           placement: replacement,
           startedAtMs: nowMs,
           tradeKey: order.tradeKey,
+          targetFilledSize: order.originalSize,
         });
         this.planned.delete(order.tradeKey);
         changed = true;
@@ -270,17 +303,19 @@ export class LadderV14HistoryStore {
           placement,
           startedAtMs: Date.parse(order.createdAt) || nowMs,
           tradeKey: order.tradeKey,
+          targetFilledSize: order.originalSize,
         });
         this.planned.delete(order.tradeKey);
         changed = true;
       }
       const exposure = this.active.get(order.id)!;
       const fills = snapshot.fills.filter((fill) => fill.orderId === order.id);
-      const relevant = fills.filter((fill) =>
+      // Duplicate delivery must not make a partial repair look fully filled.
+      const relevant = [...new Map(fills.filter((fill) =>
         exposure.placement.kind === "failed_exit"
           ? (fill.side ?? "BUY") === "SELL"
           : (fill.side ?? "BUY") === "BUY",
-      );
+      ).map((fill) => [fill.id, fill])).values()];
       for (const fill of relevant) {
         if (this.observedFillIds.has(fill.id)) continue;
         if (exposure.placement.kind === "completion") {
@@ -300,25 +335,49 @@ export class LadderV14HistoryStore {
       const firstFillMs = relevant.length === 0
         ? Number.POSITIVE_INFINITY
         : Math.min(...relevant.map((fill) => fillTimeMs(fill, nowMs)));
-      const terminal = order.status === "cancelled" || order.status === "filled";
-      if (!Number.isFinite(firstFillMs) && !terminal) continue;
+      let eventAtMs = firstFillMs;
+      if (exposure.placement.kind === "completion") {
+        // Repair completion means the entire requested quantity, not first fill.
+        // originalSize is cumulative across amendments, so old partial fills
+        // cannot by themselves satisfy a replacement's remaining quantity.
+        const target = exposure.targetFilledSize ?? order.originalSize;
+        eventAtMs = Number.POSITIVE_INFINITY;
+        let filledSize = 0;
+        for (const fill of [...relevant].sort((left, right) =>
+          fillTimeMs(left, nowMs) - fillTimeMs(right, nowMs))) {
+          if (!Number.isFinite(fill.size) || fill.size <= 0) continue;
+          filledSize += fill.size;
+          if (target > EPSILON && filledSize + EPSILON >= target) {
+            eventAtMs = fillTimeMs(fill, nowMs);
+            break;
+          }
+        }
+      }
+      const occurred = Number.isFinite(eventAtMs);
+      // A filled status is not a confirmed fill ledger. Wait for reconciliation;
+      // only a reconciled cancellation (or settlement below) censors a repair.
+      const terminal = !snapshot.executionPending && (
+        order.status === "cancelled" ||
+        (order.status === "filled" && exposure.placement.kind !== "completion")
+      );
+      if (!occurred && !terminal) continue;
       const elapsed = Math.max(
         0.01,
-        ((Number.isFinite(firstFillMs) ? firstFillMs : nowMs) - exposure.startedAtMs) / 1_000,
+        ((occurred ? eventAtMs : nowMs) - exposure.startedAtMs) / 1_000,
       );
       if (exposure.placement.kind === "fill") {
         this.model.observeHazard(
           "fill",
           exposure.placement.context,
           elapsed,
-          Number.isFinite(firstFillMs),
+          occurred,
         );
       } else if (exposure.placement.kind === "completion") {
         this.model.observeHazard(
           "completion",
           exposure.placement.context,
           elapsed,
-          Number.isFinite(firstFillMs),
+          occurred,
         );
       }
       this.observedOrderIds.add(order.id);
@@ -326,17 +385,12 @@ export class LadderV14HistoryStore {
       changed = true;
     }
 
-    if (changed) this.schedulePersist();
-
-    // Bound stale planned contexts after a market is gone without scanning history.
-    if (event.windowEnd * 1_000 < nowMs) {
-      for (const key of this.planned.keys()) {
-        if (key.startsWith(`ladder-v14:${event.slug}:`)) this.planned.delete(key);
-      }
-    }
+    return changed;
   }
 
   finalize(snapshot: MarketExecutionSnapshot, nowMs = Date.now()): void {
+    // Include final fills before censoring exposures at settlement.
+    this.observeOrders(snapshot, nowMs);
     for (const order of snapshot.orders) {
       const exposure = this.active.get(order.id);
       if (!exposure || this.observedOrderIds.has(order.id)) continue;
@@ -351,16 +405,25 @@ export class LadderV14HistoryStore {
       this.observedOrderIds.add(order.id);
       this.active.delete(order.id);
     }
+    for (const key of this.planned.keys()) {
+      if (key.startsWith(`ladder-v14:${snapshot.marketSlug}:`)) this.planned.delete(key);
+    }
+    for (const order of snapshot.orders) {
+      this.active.delete(order.id);
+      this.observedOrderIds.delete(order.id);
+    }
+    for (const fill of snapshot.fills) this.observedFillIds.delete(fill.id);
     this.schedulePersist();
   }
 
   async flush(): Promise<void> {
-    if (this.persistenceTimer) {
-      clearTimeout(this.persistenceTimer);
+    do {
+      if (this.persistenceTimer) clearTimeout(this.persistenceTimer);
       this.persistenceTimer = null;
-    }
-    if (this.dirty) await this.persist();
-    await this.persistence;
+      if (this.dirty || this.writing) await this.persist();
+    } while (this.dirty || this.writing);
+    if (this.persistenceTimer) clearTimeout(this.persistenceTimer);
+    this.persistenceTimer = null;
   }
 
   private schedulePersist(): void {
@@ -374,6 +437,8 @@ export class LadderV14HistoryStore {
   }
 
   private async persist(): Promise<void> {
+    if (this.writing) return this.persistence;
+    this.writing = true;
     this.dirty = false;
     const state: HistoryState = {
       version: 1,
@@ -399,6 +464,14 @@ export class LadderV14HistoryStore {
       }
     };
     this.persistence = this.persistence.then(operation, operation);
-    await this.persistence;
+    try {
+      await this.persistence;
+    } catch (error) {
+      this.dirty = true;
+      throw error;
+    } finally {
+      this.writing = false;
+      if (this.dirty) this.schedulePersist();
+    }
   }
 }

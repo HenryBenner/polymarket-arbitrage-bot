@@ -175,6 +175,7 @@ export interface PaperOrder {
   plannedAllInPairCost?: number;
   plannedNetEdgePerPair?: number;
   createdAt: string;
+  lastAmendedAt?: string;
   submittedMinutesLeft?: number;
 }
 

@@ -100,6 +100,12 @@ function emptyHazard(): HazardStats {
   return { events: 0, exposureSeconds: 0, observations: 0 };
 }
 
+function hazardKey(kind: "fill" | "completion", bucket: string): string {
+  // Legacy completion observations measured first fill, not full quantity.
+  // Preserve them on disk, but never mix them into full-fill estimates.
+  return `${kind === "completion" ? "completion-full" : kind}|${bucket}`;
+}
+
 function emptyMoment(): MomentStats {
   return { count: 0, sum: 0, sumSquares: 0 };
 }
@@ -170,13 +176,13 @@ export class LadderV14ConditionalModel {
       ? 0
       : effectiveFlow / queueWork *
         ladderV14DistancePenalty(context.distanceTicks);
-    const key = `${kind}|${contextBucket(context)}`;
+    const key = hazardKey(kind, contextBucket(context));
     const direct = this.hazards.get(key);
     let source: LadderV14HazardEstimate["source"] = "analytical";
     let boot = emptyHazard();
     if (context.executionMode === "live") {
       const paper = this.hazards.get(
-        `${kind}|${contextBucket(context, "paper")}`,
+        hazardKey(kind, contextBucket(context, "paper")),
       );
       if (paper && paper.exposureSeconds > EPSILON) {
         const paperHazard = paper.events / paper.exposureSeconds;
@@ -267,7 +273,7 @@ export class LadderV14ConditionalModel {
     occurred: boolean,
   ): void {
     if (!Number.isFinite(exposureSeconds) || exposureSeconds <= 0) return;
-    const key = `${kind}|${contextBucket(context)}`;
+    const key = hazardKey(kind, contextBucket(context));
     const stats = this.hazards.get(key) ?? emptyHazard();
     stats.exposureSeconds += exposureSeconds;
     stats.events += occurred ? 1 : 0;

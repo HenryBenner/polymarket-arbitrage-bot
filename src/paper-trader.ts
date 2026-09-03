@@ -56,6 +56,7 @@ interface MarketContext {
   marketDataValid: boolean;
   streamBacked: boolean;
   lastEventTimestampMs: number;
+  lastTradeTimestampMs: Map<string, number>;
 }
 
 interface PriceChange {
@@ -308,6 +309,7 @@ export class PaperTrader implements OrderExecutor {
       marketDataValid: true,
       streamBacked: false,
       lastEventTimestampMs: existingContext?.lastEventTimestampMs ?? 0,
+      lastTradeTimestampMs: existingContext?.lastTradeTimestampMs ?? new Map(),
     };
     if (
       existingContext &&
@@ -833,6 +835,7 @@ export class PaperTrader implements OrderExecutor {
       };
     }
     const previousTradeKey = order.tradeKey;
+    order.lastAmendedAt = new Date().toISOString();
     order.limitPrice = opportunity.price;
     order.tradeKey = opportunity.tradeKey;
     this.orderByTradeKey.delete(previousTradeKey);
@@ -1240,6 +1243,18 @@ export class PaperTrader implements OrderExecutor {
   private acceptMonotonicEvent(event: MarketStreamEvent): boolean {
     const atMs = marketEventTimestampMs(event);
     if (atMs === null) return true;
+    if (event.event_type === "last_trade_price") {
+      const tokenId = String(event.asset_id ?? "");
+      const slug = this.tokenToMarket.get(tokenId);
+      const context = slug ? this.contexts.get(slug) : undefined;
+      if (!context) return true;
+      const previous = context.lastTradeTimestampMs.get(tokenId) ?? 0;
+      if (atMs + 1e-6 < previous) return false;
+      context.lastTradeTimestampMs.set(tokenId, atMs);
+      // Book and trade channels have independent timestamps. A fresh trade
+      // must not disappear merely because a newer book arrived first.
+      return true;
+    }
     const tokenIds = new Set<string>();
     const direct = String(event.asset_id ?? "");
     if (direct) tokenIds.add(direct);
@@ -1672,7 +1687,7 @@ export class PaperTrader implements OrderExecutor {
           order.tokenId === tokenId &&
           (order.status === "open" || order.status === "partial") &&
           order.limitPrice + 1e-9 >= price &&
-          atMs + 1e-6 >= Date.parse(order.createdAt),
+          atMs + 1e-6 >= Date.parse(order.lastAmendedAt ?? order.createdAt),
       )
       .sort(
         (left, right) =>

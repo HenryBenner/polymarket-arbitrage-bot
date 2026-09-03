@@ -281,6 +281,9 @@ gate entries. The live quote policy posts up to four paired, near-touch maker
 levels. Their default sizes are 40, 80, 160, and 320 shares, and their combined
 raw prices target 99c, 97c, 95c, and 93c. The exact split between Up and Down is
 chosen to keep both quotes as close to their respective touches as possible.
+If several levels collapse to the same outcome/price at the tick boundary,
+their sizes are aggregated into one target order. Prices are calculated on
+integer ticks without a quadratic YES-by-NO search.
 
 Balanced inventory runs that same grid with no additional entry filters.
 As soon as `R = abs(YES - NO) > 0`, V14 cancels **all** ordinary opening orders
@@ -290,22 +293,37 @@ orders or additional grid levels during repair.
 
 If buying the missing quantity now locks a positive pair after entry and
 taker fees, V14 takes it immediately. Otherwise it posts one repair maker for
-exactly R at the most aggressive valid post-only price. The existing
-`LADDER_V14_QUOTE_LIFETIME_SECONDS` (default five seconds) is the repair deadline
-from the first unpaired fill, including cancellation time; partial fills,
-repricing, and restarts do not reset it. A timer wakes repair even on a quiet
-book. At the deadline it cancels the maker and compares executable
+exactly R at the most aggressive post-only price that leaves positive pair
+profit after both legs' fees and rounding. It does **not** chase a loss-making
+maker price or automatically cross at a loss after five seconds. Repair-only
+mode remains active until balance returns or the final cleanup window begins.
+`LADDER_V14_QUOTE_LIFETIME_SECONDS` remains the statistical quote horizon; it
+is not a forced-loss timer. The actual cleanup deadline is market close minus
+`LADDER_V14_FINAL_CLEANUP_SECONDS` (default 30 seconds). A timer wakes repair
+even on a quiet book. At cleanup it cancels the maker and compares executable
 `1 - opposite all-in ask` with `surplus net bid`, choosing the greater value
 (hedge on a tie), even if hedging locks a loss. Entry cost is sunk in this
-timeout decision. Partial depth/fills are handled by replanning the actual
+cleanup decision. Partial depth/fills are handled by replanning the actual
 remaining quantity after each acknowledgment.
 
-When R returns to zero, normal volume-first quoting resumes immediately.
+Partial repair fills never resume the opening grid: a 100-share residual still
+needs repair after 1 or 99 shares fill. Only confirmed inventory returning to
+`R = 0` allows the grid to resume, after any leftover repair orders are cancelled.
+The learner also requires the full requested order quantity before recording a
+completion, using the final fill time rather than the first partial fill. It
+preserves partial progress across restarts; cancelled or expired incomplete
+orders are censored, not successful completions. A fully filled depth-limited
+hedge order does not finish the overall repair if inventory remains unmatched.
+Old first-fill completion statistics are retained on disk but excluded from
+the new full-fill estimates.
+
 During the final cleanup window no new grids or maker waits start; remaining
 residuals use the same hedge-versus-sale comparison. These rules reduce
 intentional surplus accumulation, but cannot guarantee fills, profitability,
 or complete cleanup when executable liquidity is absent. Strict EV mode below
-is unchanged.
+is unchanged. Waiting longer preserves the chance of a profitable completion
+but can increase the eventual residual loss; these changes are not a validated
+profit guarantee. See [the supplied-run diagnosis](docs/v14-run-analysis-2026-09-03.md).
 
 Set `LADDER_V14_VOLUME_FIRST_MODE=false` to enable the stricter marginal-EV
 entry and residual optimizer. For every passive price and economically distinct

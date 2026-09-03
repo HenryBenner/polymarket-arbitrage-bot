@@ -463,10 +463,8 @@ export class ReverseBot {
                   }
                 : "all_economic_breakpoints_with_sweep_conditioning",
               residualPolicy: this.config.ladderV14VolumeFirstMode
-                ? "repair_only_then_resume_grid"
+                ? "profit_safe_repair_then_economic_final_cleanup"
                 : "marginal_max_of_hedge_sell_wait",
-              repairLifetimeSeconds: this.config.ladderV14VolumeFirstMode
-                ? this.config.ladderV14QuoteLifetimeSeconds : undefined,
               finalCleanupSeconds: this.config.ladderV14FinalCleanupSeconds,
               series: this.config.kalshiSeriesTickers,
             }

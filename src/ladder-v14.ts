@@ -193,34 +193,24 @@ function makerPrices(book: TokenBook, tick: number): number[] {
   return result.reverse();
 }
 
-function pairedMakerPrices(
+export function pairedMakerPrices(
   books: readonly TokenBook[],
   tick: number,
   targetPairCost: number,
 ): [number, number] | null {
-  const left = makerPrices(books[0]!, tick);
-  const right = makerPrices(books[1]!, tick);
-  const leftCeiling = left[0] ?? null;
-  const rightCeiling = right[0] ?? null;
-  if (leftCeiling === null || rightCeiling === null) return null;
-  let best: { prices: [number, number]; score: number } | null = null;
-  for (const leftPrice of left) {
-    for (const rightPrice of right) {
-      const pairCost = leftPrice + rightPrice;
-      if (pairCost > targetPairCost + EPSILON) continue;
-      const leftDistance = Math.round((leftCeiling - leftPrice) / tick);
-      const rightDistance = Math.round((rightCeiling - rightPrice) / tick);
-      // First maximize profitable pair cost (most aggressive combined quote),
-      // then balance concessions so neither side is buried far from its touch.
-      const score = pairCost * 1_000_000 -
-        Math.abs(leftDistance - rightDistance) * 100 -
-        (leftDistance + rightDistance);
-      if (!best || score > best.score) {
-        best = { prices: [leftPrice, rightPrice], score };
-      }
-    }
-  }
-  return best?.prices ?? null;
+  if (!Number.isFinite(tick) || tick <= 0 || books.some(book => book.bestAsk === null)) return null;
+  const ceilings = books.map(book => Math.floor((Math.min(1, book.bestAsk!) - EPSILON) / tick));
+  const [left, right] = ceilings as [number, number];
+  if (left < 1 || right < 1) return null;
+  const total = Math.min(left + right, Math.floor((targetPairCost + EPSILON) / tick));
+  if (total < 2) return null;
+  const concessions = left + right - total;
+  // Maximize combined price, split concessions equally, prefer higher YES on ties.
+  const leftConcession = Math.min(left - 1, Math.max(
+    concessions - (right - 1), Math.floor(concessions / 2),
+  ));
+  return [round((left - leftConcession) * tick, 4),
+    round((right - (concessions - leftConcession)) * tick, 4)];
 }
 
 function quantityBreakpoints(
@@ -483,11 +473,14 @@ function selectVolumeFirstTargets(
     for (let sideIndex = 0; sideIndex < 2; sideIndex += 1) {
       const book = books[sideIndex]!;
       const opposite = books[1 - sideIndex]!;
+      const existingIndex = selected.findIndex(candidate => candidate.tokenId === book.tokenId &&
+        Math.abs(candidate.price - prices[sideIndex]!) <= EPSILON);
+      const existing = selected[existingIndex];
       const quantity = round(
-        config.ladderV14VolumeFirstBaseShares * 2 ** level,
+        config.ladderV14VolumeFirstBaseShares * 2 ** level + (existing?.size ?? 0),
         2,
       );
-      const sweepPrefix = sweepByToken.get(book.tokenId) ?? 0;
+      const sweepPrefix = existing?.sweepPrefixShares ?? sweepByToken.get(book.tokenId) ?? 0;
       const candidate = openingCandidate(
         config,
         event,
@@ -505,7 +498,8 @@ function selectVolumeFirstTargets(
       if (!candidate) continue;
       candidate.selectionMode = "volume";
       candidate.priorityScore =
-        (config.ladderV14VolumeFirstLevels - level) * 1_000_000 +
+        Math.max(config.ladderV14VolumeFirstLevels - level,
+          Math.floor((existing?.priorityScore ?? 0) / 1_000_000)) * 1_000_000 +
         candidate.fillProbability;
       candidate.quantityOptions = [{
         size: candidate.size,
@@ -516,7 +510,10 @@ function selectVolumeFirstTargets(
         expectedExposureSeconds: candidate.expectedExposureSeconds,
         context: candidate.context,
       }];
-      selected.push(candidate);
+      // Tick/price boundaries can collapse levels onto one side's price.
+      // Competing target sizes at that key would amend the same order forever.
+      if (existingIndex >= 0) selected[existingIndex] = candidate;
+      else selected.push(candidate);
       sweepByToken.set(book.tokenId, sweepPrefix + candidate.size);
       if (
         !bestEvaluated ||
@@ -868,7 +865,7 @@ function planResidual(
     residualDecisions: decisions, placementContexts: {} };
 }
 
-/** A bounded repair episode, independent of the shadow EV model. */
+/** Repair-only inventory; seek profitable completion until the cleanup deadline. */
 function planVolumeFirstRepair(
   config: BotConfig,
   event: UpDownEvent,
@@ -886,10 +883,7 @@ function planVolumeFirstRepair(
   const open = snapshot.openOrders.filter(isV14Order);
   const quantity = inventory.unpairedShares;
   const entry = inventory.unpairedCost / quantity;
-  const deadline = Math.min(
-    Date.parse(episode.residualStartedAt) + config.ladderV14QuoteLifetimeSeconds * 1_000,
-    (event.windowEnd - config.ladderV14FinalCleanupSeconds) * 1_000,
-  );
+  const deadline = (event.windowEnd - config.ladderV14FinalCleanupSeconds) * 1_000;
   const waiting = nowSeconds * 1_000 < deadline;
   const result = {
     cancelOrderIds: [] as string[],
@@ -941,13 +935,21 @@ function planVolumeFirstRepair(
         1 - hedge.total / actionQuantity + EPSILON >= sale.total / actionQuantity)
         ? "hedge" : "sell";
       result.managementStage = action === "hedge"
-        ? "volume-first-repair-timeout-hedge"
-        : "volume-first-repair-timeout-sale";
+        ? "volume-first-repair-cleanup-hedge"
+        : "volume-first-repair-cleanup-sale";
     }
   }
   const tick = Number(tickSizeFromMarket(event.market));
-  const makerPrice = missing.bestAsk === null ? missing.bestBid
+  const aggressivePrice = missing.bestAsk === null ? missing.bestBid
     : round(Math.floor((missing.bestAsk - EPSILON) / tick) * tick, 4);
+  // The maker attempt must not itself lock a loss. Include the first leg's
+  // fees and the new order's exact maker fees/rounding in the price ceiling.
+  let makerPrice: number | null = null;
+  for (let price = aggressivePrice ?? 0; price >= tick - EPSILON; price = round(price - tick, 4)) {
+    const fee = exactKalshiOrderFee({price, size: quantity,
+      rate: snapshot.makerFeeRate ?? config.kalshiMakerFeeRate, exponent: snapshot.takerFeeExponent});
+    if (1 - entry - price - fee / quantity > EPSILON) { makerPrice = price; break; }
+  }
   const context = contextFor(config, event, missing, entry, quantity,
     makerPrice === null ? 0 : queueAhead(missing, makerPrice), 0,
     event.windowEnd - nowSeconds, features, {

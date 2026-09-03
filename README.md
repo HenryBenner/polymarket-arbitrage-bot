@@ -277,19 +277,20 @@ It can run BTC, ETH, SOL, or any other configured `KX<ASSET>15M` series.
 V14 currently defaults to bootstrap collection mode with
 `LADDER_V14_VOLUME_FIRST_MODE=true`. In this mode the statistical engine runs
 in shadow: it records fill, completion, and failed-exit behavior but does not
-gate entries. The live quote policy posts up to four paired, near-touch maker
-levels. Their default sizes are 40, 80, 160, and 320 shares, and their combined
-raw prices target 99c, 97c, 95c, and 93c. The exact split between Up and Down is
-chosen to keep both quotes as close to their respective touches as possible.
-If several levels collapse to the same outcome/price at the tick boundary,
-their sizes are aggregated into one target order. Prices are calculated on
-integer ticks without a quadratic YES-by-NO search.
+gate entries. The live quote policy posts exactly two near-touch maker orders:
+one 10-share Up order and one 10-share Down order whose combined raw
+price targets 99c. The exact price split keeps both quotes as close to their
+respective touches as possible. Prices are calculated on integer ticks.
 
-Balanced inventory runs that same grid with no additional entry filters.
+V14 completes one cycle before starting the next. Equal partial fills remain
+on the current cycle and quote only its unfinished quantity. Once both sides
+are confirmed complete, the next full 10-share pair can start. There is never
+more than one ordinary opening price per outcome.
+
 As soon as `R = abs(YES - NO) > 0`, V14 cancels **all** ordinary opening orders
 on both sides, waits for cancellation reconciliation, and recomputes R. It
-then buys only the missing side, with no base quantity added and no surplus
-orders or additional grid levels during repair.
+then buys only the missing side, with no cycle quantity added and no surplus
+orders during repair.
 
 If buying the missing quantity now locks a positive pair after entry and
 taker fees, V14 takes it immediately. Otherwise it posts one repair maker for
@@ -306,9 +307,10 @@ even on a quiet book. At cleanup it cancels the maker and compares executable
 cleanup decision. Partial depth/fills are handled by replanning the actual
 remaining quantity after each acknowledgment.
 
-Partial repair fills never resume the opening grid: a 100-share residual still
+Partial repair fills never resume opening cycles: a 100-share residual still
 needs repair after 1 or 99 shares fill. Only confirmed inventory returning to
-`R = 0` allows the grid to resume, after any leftover repair orders are cancelled.
+`R = 0` allows the current cycle to finish or the next cycle to start, after any
+leftover repair orders are cancelled.
 The learner also requires the full requested order quantity before recording a
 completion, using the final fill time rather than the first partial fill. It
 preserves partial progress across restarts; cancelled or expired incomplete
@@ -317,7 +319,7 @@ hedge order does not finish the overall repair if inventory remains unmatched.
 Old first-fill completion statistics are retained on disk but excluded from
 the new full-fill estimates.
 
-During the final cleanup window no new grids or maker waits start; remaining
+During the final cleanup window no new cycles or maker waits start; remaining
 residuals use the same hedge-versus-sale comparison. These rules reduce
 intentional surplus accumulation, but cannot guarantee fills, profitability,
 or complete cleanup when executable liquidity is absent. Strict EV mode below
@@ -368,7 +370,7 @@ or ETH pairing rates.
 Paper mode sets `capitalConstraint=false`: normal cash never becomes negative,
 while theoretical cash, gross deployment, marked inventory, and realized and
 unrealized P&L remain explicit metrics. One global acknowledgement-driven
-allocator places the most aggressive bootstrap levels first. In strict EV mode
+allocator places the two sides of the active pair cycle. In strict EV mode
 the allocator instead ranks positive segments by expected profit per
 capital-exposure second.
 

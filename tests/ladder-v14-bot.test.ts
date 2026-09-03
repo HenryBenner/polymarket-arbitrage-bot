@@ -236,6 +236,61 @@ test("V14 global queue allocates volume-first pair grids across configured serie
   }
 });
 
+test("V14 opens the next 10-share pair only after both sides of the cycle fill", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ladder-v14-cycles-"));
+  const start = Math.floor(Date.now() / 1_000) - 300;
+  const event = market("KXBTC15M", "BTC", start);
+  const nextBooks = books(event);
+  const executor = new V14Executor();
+  const bot = new ReverseBot(testConfig({
+    exchange: "kalshi",
+    strategyMode: "ladder_v14",
+    ladderV14VolumeFirstMode: true,
+    ladderV14CycleShares: 10,
+    executionMode: "paper",
+    paperStatePath: directory,
+    kalshiSeriesTickers: ["KXBTC15M"],
+  }), executor, {
+    scan: async () => [event],
+    getTokenBooks: async () => nextBooks,
+  });
+  try {
+    await bot.init();
+    await bot.runOnce();
+    const state = executor.snapshots.get(event.slug)!;
+    const firstCycle = [...state.openOrders];
+    assert.equal(firstCycle.length, 2);
+    assert.deepEqual(firstCycle.map((order) => order.originalSize), [10, 10]);
+
+    for (const order of firstCycle) {
+      order.status = "filled";
+      order.remainingSize = 0;
+      (state.fills as PaperFill[]).push({
+        id: `${order.id}-maker-fill`,
+        orderId: order.id,
+        marketSlug: order.marketSlug,
+        tokenId: order.tokenId,
+        outcome: order.outcome,
+        price: order.limitPrice,
+        size: 10,
+        fee: 0,
+        liquidity: "maker",
+        side: "BUY",
+        timestamp: new Date().toISOString(),
+      });
+    }
+    state.openOrders = [];
+    await bot.runOnce();
+    const secondCycle = state.openOrders;
+    assert.equal(secondCycle.length, 2);
+    assert.deepEqual(secondCycle.map((order) => order.originalSize), [10, 10]);
+    assert.ok(secondCycle.every((order) => !firstCycle.includes(order)));
+  } finally {
+    await bot.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("V14 final cleanup wakes a quiet book, cancels maker, hedges, and stays balanced", async () => {
   const directory = await mkdtemp(join(tmpdir(), "ladder-v14-deadline-"));
   const event = market("KXETH15M", "ETH", Math.floor(Date.now() / 1000) - 300);

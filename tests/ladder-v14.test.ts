@@ -179,7 +179,7 @@ test("V14 permits exactly zero hazard and makes pseudo-flow quantity-aware", () 
   assert.ok(large.probability < small.probability);
 });
 
-test("V14 volume-first mode posts a profitable near-touch pair grid without EV gating", () => {
+test("V14 volume-first mode posts one 10-share near-touch pair without EV gating", () => {
   const books = testBooks(0.65, 0.37, 1);
   books[0]!.bestBid = 0.63;
   books[0]!.bids = [{ price: 0.63, size: 500 }];
@@ -196,8 +196,7 @@ test("V14 volume-first mode posts a profitable near-touch pair grid without EV g
       exchange: "kalshi",
       strategyMode: "ladder_v14",
       ladderV14VolumeFirstMode: true,
-      ladderV14VolumeFirstBaseShares: 40,
-      ladderV14VolumeFirstLevels: 4,
+      ladderV14CycleShares: 10,
     }),
     event,
     snapshot(books),
@@ -206,12 +205,11 @@ test("V14 volume-first mode posts a profitable near-touch pair grid without EV g
     event.windowEnd - 600,
   );
   assert.equal(plan.managementStage, "volume-first-post-pair-grid");
-  assert.ok(plan.candidates.length >= 4);
+  assert.equal(plan.candidates.length, 2);
   assert.ok(plan.candidates.every((candidate) => candidate.selectionMode === "volume"));
-  const top = plan.candidates.filter((candidate) => candidate.priorityScore >= 4_000_000);
-  assert.equal(top.length, 2);
-  assert.equal(top[0]!.size, 40);
-  assert.equal(top[1]!.size, 40);
+  const top = plan.candidates;
+  assert.equal(top[0]!.size, 10);
+  assert.equal(top[1]!.size, 10);
   assert.ok(top[0]!.price + top[1]!.price <= 0.99 + 1e-8);
   assert.ok(top.some((candidate) => candidate.expectedValue === 0));
 });
@@ -483,7 +481,7 @@ test("V14 does not force a losing taker hedge at five seconds or chase a losing 
   }
 });
 
-test("V14 collapsed 0.1-cent ladder levels aggregate and converge without amendment oscillation", () => {
+test("V14 keeps one small pair at the 0.1-cent boundary and converges", () => {
   const books = testBooks(0.99, 0.011, 0.01);
   const fineEvent = { ...event, market: { ...event.market, orderPriceMinTickSize: 0.001 } };
   const state = snapshot(books);
@@ -492,8 +490,11 @@ test("V14 collapsed 0.1-cent ladder levels aggregate and converge without amendm
   const plan = planLadderV14(config, fineEvent, state, model, features(books), repairNow);
   const keys = plan.candidates.map(candidate => `${candidate.tokenId}:${candidate.price}`);
   assert.equal(new Set(keys).size, keys.length);
-  assert.equal(plan.candidates.find(candidate => candidate.tokenId === "down-token" && candidate.price === 0.001)?.size, 560);
-  for (const book of books) assert.equal(plan.candidates.filter(c=>c.tokenId===book.tokenId).reduce((sum,c)=>sum+c.size,0), 600);
+  assert.equal(plan.candidates.length, 2);
+  for (const book of books) assert.equal(
+    plan.candidates.find(candidate => candidate.tokenId === book.tokenId)?.size,
+    10,
+  );
   const resting = plan.opportunities.map((target, index) => ({
     ...v14Order(`aggregate-${index}`, target.token.tokenId, target.price, target.size, "open"),
   }));
@@ -503,6 +504,62 @@ test("V14 collapsed 0.1-cent ladder levels aggregate and converge without amendm
     const next = planLadderV14(config, fineEvent, state, model, features(books), repairNow + index);
     assert.equal(next.amendments.length + next.opportunities.length + next.cancelOrderIds.length, 0);
   }
+});
+
+test("V14 finishes a balanced partial cycle before opening the next 10-share pair", () => {
+  const books = testBooks(0.65, 0.37, 1);
+  books[0]!.bestBid = 0.63;
+  books[0]!.bids = [{ price: 0.63, size: 500 }];
+  books[1]!.bestBid = 0.35;
+  books[1]!.bids = [{ price: 0.35, size: 500 }];
+  const config = testConfig({
+    exchange: "kalshi",
+    strategyMode: "ladder_v14",
+    ladderV14VolumeFirstMode: true,
+    ladderV14CycleShares: 10,
+  });
+  const model = new LadderV14ConditionalModel(parameters);
+  const initial = planLadderV14(
+    config, event, snapshot(books), model, features(books), repairNow,
+  );
+  assert.equal(initial.opportunities.length, 2);
+  const orders = initial.opportunities.map((target, index) => {
+    const order = v14Order(
+      `cycle-${index}`,
+      target.token.tokenId,
+      target.price,
+      10,
+      "partial",
+    );
+    order.remainingSize = 4;
+    return order;
+  });
+  const partialFills = orders.map((order) => ({ ...v14Fill(order, 6), id: `${order.id}-partial` }));
+  const partialState = snapshot(books, orders, partialFills);
+  const partial = planLadderV14(
+    config, event, partialState, model, features(books), repairNow + 1,
+  );
+  assert.equal(partial.pairedShares, 6);
+  assert.deepEqual(partial.candidates.map((candidate) => candidate.size), [4, 4]);
+  assert.equal(partial.opportunities.length, 0);
+  assert.equal(partial.amendments.length, 0);
+  assert.equal(partial.cancelOrderIds.length, 0);
+
+  for (const order of orders) {
+    order.status = "filled";
+    order.remainingSize = 0;
+  }
+  partialState.openOrders = [];
+  partialState.fills.push(...orders.map((order) => ({
+    ...v14Fill(order, 4),
+    id: `${order.id}-completion`,
+  })));
+  const next = planLadderV14(
+    config, event, partialState, model, features(books), repairNow + 2,
+  );
+  assert.equal(next.pairedShares, 10);
+  assert.equal(next.opportunities.length, 2);
+  assert.deepEqual(next.opportunities.map((target) => target.size), [10, 10]);
 });
 
 test("V14 constant-time pair prices match the exhaustive integer-tick objective", () => {

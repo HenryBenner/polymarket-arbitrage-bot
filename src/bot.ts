@@ -452,14 +452,12 @@ export class ReverseBot {
               capitalConstraint: this.config.executionMode === "live",
               volumeFirstMode: this.config.ladderV14VolumeFirstMode,
               quotePolicy: this.config.ladderV14VolumeFirstMode
-                ? "paired_near_touch_grid_without_ev_gate"
+                ? "one_small_pair_cycle_without_ev_gate"
                 : "positive_conditional_marginal_ev",
               quantityPolicy: this.config.ladderV14VolumeFirstMode
                 ? {
-                    baseShares: this.config.ladderV14VolumeFirstBaseShares,
-                    levels: this.config.ladderV14VolumeFirstLevels,
+                    cycleShares: this.config.ladderV14CycleShares,
                     pairCost: this.config.ladderV14VolumeFirstPairCost,
-                    pairStep: this.config.ladderV14VolumeFirstPairStep,
                   }
                 : "all_economic_breakpoints_with_sweep_conditioning",
               residualPolicy: this.config.ladderV14VolumeFirstMode

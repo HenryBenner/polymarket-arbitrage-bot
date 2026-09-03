@@ -450,76 +450,53 @@ function selectVolumeFirstTargets(
   tick: number,
   features: LadderV14MarketFeatures,
   model: LadderV14ConditionalModel,
+  quantity: number,
 ): {
   selected: LadderV14Candidate[];
   bestEvaluated: LadderV14Candidate | null;
 } {
   const selected: LadderV14Candidate[] = [];
-  const sweepByToken = new Map<string, number>();
-  const usedPairs = new Set<string>();
   let bestEvaluated: LadderV14Candidate | null = null;
-  for (let level = 0; level < config.ladderV14VolumeFirstLevels; level += 1) {
-    const targetPairCost = round(
-      config.ladderV14VolumeFirstPairCost -
-        level * config.ladderV14VolumeFirstPairStep,
-      4,
+  const prices = pairedMakerPrices(
+    books,
+    tick,
+    config.ladderV14VolumeFirstPairCost,
+  );
+  if (!prices) return { selected, bestEvaluated };
+  for (let sideIndex = 0; sideIndex < 2; sideIndex += 1) {
+    const book = books[sideIndex]!;
+    const opposite = books[1 - sideIndex]!;
+    const candidate = openingCandidate(
+      config,
+      event,
+      snapshot,
+      book,
+      opposite,
+      prices[sideIndex]!,
+      quantity,
+      0,
+      secondsRemaining,
+      tick,
+      features,
+      model,
     );
-    if (targetPairCost < tick * 2 - EPSILON) break;
-    const prices = pairedMakerPrices(books, tick, targetPairCost);
-    if (!prices) continue;
-    const pairKey = `${prices[0]}|${prices[1]}`;
-    if (usedPairs.has(pairKey)) continue;
-    usedPairs.add(pairKey);
-    for (let sideIndex = 0; sideIndex < 2; sideIndex += 1) {
-      const book = books[sideIndex]!;
-      const opposite = books[1 - sideIndex]!;
-      const existingIndex = selected.findIndex(candidate => candidate.tokenId === book.tokenId &&
-        Math.abs(candidate.price - prices[sideIndex]!) <= EPSILON);
-      const existing = selected[existingIndex];
-      const quantity = round(
-        config.ladderV14VolumeFirstBaseShares * 2 ** level + (existing?.size ?? 0),
-        2,
-      );
-      const sweepPrefix = existing?.sweepPrefixShares ?? sweepByToken.get(book.tokenId) ?? 0;
-      const candidate = openingCandidate(
-        config,
-        event,
-        snapshot,
-        book,
-        opposite,
-        prices[sideIndex]!,
-        quantity,
-        sweepPrefix,
-        secondsRemaining,
-        tick,
-        features,
-        model,
-      );
-      if (!candidate) continue;
-      candidate.selectionMode = "volume";
-      candidate.priorityScore =
-        Math.max(config.ladderV14VolumeFirstLevels - level,
-          Math.floor((existing?.priorityScore ?? 0) / 1_000_000)) * 1_000_000 +
-        candidate.fillProbability;
-      candidate.quantityOptions = [{
-        size: candidate.size,
-        expectedValue: candidate.expectedValue,
-        marginalValue: candidate.marginalValue,
-        expectedValuePerShare: candidate.expectedValuePerShare,
-        expectedProfitRate: candidate.expectedProfitRate,
-        expectedExposureSeconds: candidate.expectedExposureSeconds,
-        context: candidate.context,
-      }];
-      // Tick/price boundaries can collapse levels onto one side's price.
-      // Competing target sizes at that key would amend the same order forever.
-      if (existingIndex >= 0) selected[existingIndex] = candidate;
-      else selected.push(candidate);
-      sweepByToken.set(book.tokenId, sweepPrefix + candidate.size);
-      if (
-        !bestEvaluated ||
-        candidate.expectedValue > bestEvaluated.expectedValue
-      ) bestEvaluated = candidate;
-    }
+    if (!candidate) continue;
+    candidate.selectionMode = "volume";
+    candidate.priorityScore = 1_000_000 + candidate.fillProbability;
+    candidate.quantityOptions = [{
+      size: candidate.size,
+      expectedValue: candidate.expectedValue,
+      marginalValue: candidate.marginalValue,
+      expectedValuePerShare: candidate.expectedValuePerShare,
+      expectedProfitRate: candidate.expectedProfitRate,
+      expectedExposureSeconds: candidate.expectedExposureSeconds,
+      context: candidate.context,
+    }];
+    selected.push(candidate);
+    if (
+      !bestEvaluated ||
+      candidate.expectedValue > bestEvaluated.expectedValue
+    ) bestEvaluated = candidate;
   }
   return {
     selected: selected.sort(
@@ -895,7 +872,7 @@ function planVolumeFirstRepair(
     nextWakeAtMs: waiting ? deadline : undefined,
   };
   const makerRole = `repair-maker:${episode.id}`;
-  // Old opening grids on EITHER side can flip/increase the imbalance. Wait
+  // Old opening orders on EITHER side can flip/increase the imbalance. Wait
   // for cancellation reconciliation and then re-read R before submitting.
   if (open.some((order) => order.pairId !== `${V14_PREFIX}${makerRole}`)) {
     return { ...result, cancelOrderIds: open.map((order) => order.id),
@@ -1061,7 +1038,7 @@ export function planLadderV14(
   }
 
   // A completed repair may still have a cancellation/in-flight remainder.
-  // Do not treat it as a normal grid order merely because its price matches.
+  // Do not treat it as a normal cycle order merely because its price matches.
   if (config.ladderV14VolumeFirstMode &&
     open.some((order) => order.pairId !== `${V14_PREFIX}opening`)) {
     return { ...base,
@@ -1071,6 +1048,22 @@ export function planLadderV14(
   }
 
   const tick = Number(tickSizeFromMarket(event.market));
+  const cycleProgress = round(
+    inventory.pairedShares % config.ladderV14CycleShares,
+    2,
+  );
+  const unfinishedCycleShares = round(
+    config.ladderV14CycleShares - cycleProgress,
+    2,
+  );
+  const minimumCycleOrder = Math.max(...books.map((book) => book.minOrderSize));
+  // Equal partial fills are balanced, but they have not completed the current
+  // cycle. Quote only its remainder; never enlarge a partial order into the
+  // next cycle. A sub-minimum remainder is treated as a completed short cycle.
+  const openingQuantity = cycleProgress > EPSILON &&
+    unfinishedCycleShares + EPSILON >= minimumCycleOrder
+    ? unfinishedCycleShares
+    : config.ladderV14CycleShares;
   const openingSelection = config.ladderV14VolumeFirstMode
     ? selectVolumeFirstTargets(
         config,
@@ -1081,6 +1074,7 @@ export function planLadderV14(
         tick,
         features,
         model,
+        openingQuantity,
       )
     : selectOpeningTargets(
         config,

@@ -1,19 +1,20 @@
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { readFile, rename, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { ClobClient } from "@polymarket/clob-client-v2";
 import type { BotConfig } from "./config.js";
 import { KalshiClient, kalshiTokenId } from "./kalshi-api.js";
 import { KalshiMarketStream } from "./kalshi-market-stream.js";
 import { exactKalshiDepthCost, exactKalshiFee, exactKalshiOrderFee } from "./kalshi-fees.js";
 import { ladderV13SellGuard } from "./ladder-v13-inventory.js";
-import { ladderV14SellGuard } from "./ladder-v14-inventory.js";
+import { ladderV14BuyGuard, ladderV14SellGuard } from "./ladder-v14-inventory.js";
 import { log, logThrottled } from "./logger.js";
 import { MarketStream, type MarketStreamEvent } from "./market-stream.js";
 import {
   minimumOrderRejection,
   validateOrderMinimum,
 } from "./utils/order-validation.js";
-import { appendRotatingJsonLine } from "./utils/rotating-jsonl.js";
+import { AppendOnlyJsonl } from "./utils/append-only-jsonl.js";
 import type {
   GammaMarket,
   MarketExecutionSnapshot,
@@ -28,6 +29,10 @@ import type {
   TradeOpportunity,
   UpDownEvent,
 } from "./types.js";
+
+export const PAPER_CHECKPOINT_INTERVAL_MS = 5_000;
+export const PAPER_HEALTH_INTERVAL_MS = 30_000;
+export const PAPER_MAX_MAKER_EVENT_AGE_MS = 1_000;
 
 interface PaperState {
   version: 1;
@@ -176,6 +181,23 @@ export class PaperTrader implements OrderExecutor {
     | undefined;
   private persistenceQueue: Promise<void> = Promise.resolve();
   private executionQueue: Promise<void> = Promise.resolve();
+  private eventLog: AppendOnlyJsonl | undefined;
+  private checkpointTimer: NodeJS.Timeout | undefined;
+  private healthTimer: NodeJS.Timeout | undefined;
+  private stateDirty = false;
+  private stateReady = false;
+  private stateRevision = 0;
+  private checkpointsPending = 0;
+  private closing = false;
+  private closePromise: Promise<void> | undefined;
+  private readonly pendingSettlements = new Set<Promise<void>>();
+  private processingLagMs = 0;
+  private lagTotal = 0;
+  private lagCount = 0;
+  private lagMax = 0;
+  private eventsProcessed = 0;
+  private fillsProcessed = 0;
+  private staleEventsSkipped = 0;
 
   constructor(
     private readonly config: BotConfig,
@@ -203,6 +225,7 @@ export class PaperTrader implements OrderExecutor {
   }
 
   async init(): Promise<void> {
+    let needsCheckpoint = false;
     try {
       const parsed = JSON.parse(await readFile(this.statePath, "utf8")) as PaperState;
       if (parsed.version !== 1) {
@@ -220,15 +243,34 @@ export class PaperTrader implements OrderExecutor {
           ? String(error.code)
           : "";
       if (code !== "ENOENT") throw error;
-      await this.persist();
+      needsCheckpoint = true;
     }
+    this.stateReady = true;
+    if (this.closing) return;
+    this.eventLog = await AppendOnlyJsonl.open(this.eventLogPath, (error) => {
+      log("Paper event log failed", { error: error.message });
+    });
+    if (this.closing) {
+      await this.eventLog.close();
+      return;
+    }
+    // Compact checkpoints created by older versions as well as new settlements.
+    if (this.pruneSettledState()) needsCheckpoint = true;
     this.rebuildStateIndexes();
+    if (needsCheckpoint) await this.persist();
+    if (this.closing) return;
+    this.checkpointTimer = setInterval(() => {
+      if (!this.stateDirty || this.checkpointsPending > 0) return;
+      void this.persist().catch((error) => this.recordError("checkpoint", error));
+    }, PAPER_CHECKPOINT_INTERVAL_MS);
+    this.checkpointTimer.unref();
+    this.healthTimer = setInterval(() => this.recordHealth(), PAPER_HEALTH_INTERVAL_MS);
+    this.healthTimer.unref();
 
     log("Paper account loaded", {
       startingUsdc: this.state.startingBalance,
       cashUsdc: round(this.state.cash, 4),
-      openOrders: this.state.orders.filter((order) => order.status !== "filled")
-        .length,
+      openOrders: this.openOrders.size,
       fills: this.state.fills.length,
     });
   }
@@ -252,6 +294,7 @@ export class PaperTrader implements OrderExecutor {
   }
 
   async observeMarket(event: UpDownEvent, books: TokenBook[]): Promise<void> {
+    if (this.closing || this.settlementsByMarket.has(event.slug)) return;
     const existingContext = this.contexts.get(event.slug);
     const nextContext: MarketContext = {
       event,
@@ -300,7 +343,7 @@ export class PaperTrader implements OrderExecutor {
   }
 
   async placeBuys(opportunities: readonly TradeOpportunity[]): Promise<OrderResult[]> {
-    return this.serializeExecution(async () => {
+    return this.serializeExecution(() => {
       if (opportunities.length === 0) return [];
       const slug = opportunities[0]!.event.slug;
       if (opportunities.some((opportunity) => opportunity.event.slug !== slug)) {
@@ -322,7 +365,7 @@ export class PaperTrader implements OrderExecutor {
         throw new Error(`Paper balance too low: $${this.availableCash().toFixed(2)} available, $${required.toFixed(2)} required`);
       }
       const results: OrderResult[] = [];
-      for (const opportunity of opportunities) results.push(await this.placeBuyLocked(opportunity));
+      for (const opportunity of opportunities) results.push(this.placeBuyLocked(opportunity));
       return results;
     });
   }
@@ -331,9 +374,14 @@ export class PaperTrader implements OrderExecutor {
     return this.serializeExecution(() => this.placeSellLocked(opportunity));
   }
 
-  private async placeBuyLocked(
+  private placeBuyLocked(
     opportunity: TradeOpportunity,
-  ): Promise<OrderResult> {
+  ): OrderResult {
+    if (this.settlementsByMarket.has(opportunity.event.slug)) {
+      return { dryRun: true, accepted: false, tokenId: opportunity.token.tokenId,
+        side: "BUY", price: opportunity.price, size: opportunity.size,
+        response: { paper: true, reason: "market_settled" } };
+    }
     const existing = this.orderByTradeKey.get(opportunity.tradeKey);
     if (existing) {
       return {
@@ -347,6 +395,12 @@ export class PaperTrader implements OrderExecutor {
       };
     }
 
+    if (this.config.ladderV14VolumeFirstMode && opportunity.strategyMode === "ladder_v14") {
+      const reason = ladderV14BuyGuard(this.getMarketExecutionSnapshot(opportunity.event.slug), opportunity);
+      if (reason) return { dryRun: true, accepted: false, tokenId: opportunity.token.tokenId,
+        side: "BUY", price: opportunity.price, size: opportunity.size,
+        response: { paper: true, status: "rejected", reason } };
+    }
     const minimumFailure = validateOrderMinimum(opportunity);
     if (minimumFailure) {
       return minimumOrderRejection(opportunity, minimumFailure, true);
@@ -474,7 +528,7 @@ export class PaperTrader implements OrderExecutor {
       .reduce((sum, level) => sum + level.size, 0);
     const now = new Date().toISOString();
     const order: PaperOrder = {
-      id: `paper-${Date.now()}-${this.state.orders.length + 1}`,
+      id: `paper-${randomUUID()}`,
       tradeKey: opportunity.tradeKey,
       marketSlug: opportunity.event.slug,
       marketTitle: opportunity.event.title,
@@ -503,7 +557,7 @@ export class PaperTrader implements OrderExecutor {
     };
     this.state.orders.push(order);
     this.indexOrder(order);
-    await this.record("order_submitted", order);
+    this.record("order_submitted", order);
 
     if (opportunity.orderPolicy !== "post_only" && fokCanFill) {
       for (const level of asks) {
@@ -515,7 +569,7 @@ export class PaperTrader implements OrderExecutor {
         }
         const fillSize = Math.min(order.remainingSize, level.size);
         if (fillSize <= 1e-8) continue;
-        await this.applyFill(
+        this.applyFill(
           order,
           level.price,
           fillSize,
@@ -534,9 +588,9 @@ export class PaperTrader implements OrderExecutor {
     ) {
       order.status = "cancelled";
       this.refreshOpenOrder(order);
+      this.record("order_cancelled", order);
     }
-    await this.persist();
-    this.reportMarket(order.marketSlug);
+    this.schedulePersist();
 
     return {
       dryRun: true,
@@ -555,9 +609,14 @@ export class PaperTrader implements OrderExecutor {
     };
   }
 
-  private async placeSellLocked(
+  private placeSellLocked(
     opportunity: TradeOpportunity,
-  ): Promise<OrderResult> {
+  ): OrderResult {
+    if (this.settlementsByMarket.has(opportunity.event.slug)) {
+      return { dryRun: true, accepted: false, tokenId: opportunity.token.tokenId,
+        side: "SELL", price: opportunity.price, size: opportunity.size,
+        response: { paper: true, reason: "market_settled" } };
+    }
     if (opportunity.strategyMode === "ladder_v13") {
       const snapshot = this.getMarketExecutionSnapshot(opportunity.event.slug);
       const failure = validateOrderMinimum(opportunity);
@@ -623,7 +682,7 @@ export class PaperTrader implements OrderExecutor {
     const feeConfig = this.feeConfig(opportunity.event.market);
     const now = new Date().toISOString();
     const order: PaperOrder = {
-      id: `paper-${Date.now()}-${this.state.orders.length + 1}`,
+      id: `paper-${randomUUID()}`,
       tradeKey: opportunity.tradeKey,
       marketSlug: opportunity.event.slug,
       marketTitle: opportunity.event.title,
@@ -645,7 +704,7 @@ export class PaperTrader implements OrderExecutor {
     };
     this.state.orders.push(order);
     this.indexOrder(order);
-    await this.record("order_submitted", order);
+    this.record("order_submitted", order);
     for (const level of bids) {
       if (
         order.remainingSize <= 1e-8 ||
@@ -655,7 +714,7 @@ export class PaperTrader implements OrderExecutor {
       }
       const fillSize = Math.min(order.remainingSize, level.size);
       if (fillSize <= 1e-8) continue;
-      await this.applySellFill(order, level.price, fillSize, feeConfig, now);
+      this.applySellFill(order, level.price, fillSize, feeConfig, now);
       level.size = round(level.size - fillSize);
     }
     book.bids = bids.filter((level) => level.size > 1e-8);
@@ -663,9 +722,9 @@ export class PaperTrader implements OrderExecutor {
     if (order.remainingSize > 1e-8) {
       order.status = "cancelled";
       this.refreshOpenOrder(order);
+      this.record("order_cancelled", order);
     }
-    await this.persist();
-    this.reportMarket(order.marketSlug);
+    this.schedulePersist();
     return {
       dryRun: true,
       accepted: true,
@@ -683,8 +742,9 @@ export class PaperTrader implements OrderExecutor {
   }
 
   private serializeExecution<T>(
-    operation: () => Promise<T>,
+    operation: () => T,
   ): Promise<T> {
+    if (this.closing) return Promise.reject(new Error("Paper trader is closed"));
     const result = this.executionQueue.then(operation, operation);
     this.executionQueue = result.then(
       () => undefined,
@@ -699,7 +759,7 @@ export class PaperTrader implements OrderExecutor {
     );
   }
 
-  private async cancelOrdersLocked(orderIds: string[]): Promise<void> {
+  private cancelOrdersLocked(orderIds: string[]): void {
     if (orderIds.length === 0) return;
     for (const orderId of orderIds) {
       const order = this.orderById.get(orderId);
@@ -709,10 +769,10 @@ export class PaperTrader implements OrderExecutor {
       ) {
         order.status = "cancelled";
         this.refreshOpenOrder(order);
-        await this.record("order_cancelled", order);
+        this.record("order_cancelled", order);
       }
     }
-    await this.persist();
+    this.schedulePersist();
   }
 
   async amendOrder(
@@ -724,10 +784,10 @@ export class PaperTrader implements OrderExecutor {
     );
   }
 
-  private async amendOrderLocked(
+  private amendOrderLocked(
     orderId: string,
     opportunity: TradeOpportunity,
-  ): Promise<OrderResult> {
+  ): OrderResult {
     const order = this.orderById.get(orderId);
     if (
       !order ||
@@ -743,6 +803,12 @@ export class PaperTrader implements OrderExecutor {
         size: opportunity.size,
         response: { paper: true, status: "rejected", reason: "order_not_open" },
       };
+    }
+    if (this.config.ladderV14VolumeFirstMode && opportunity.strategyMode === "ladder_v14") {
+      const reason = ladderV14BuyGuard(this.getMarketExecutionSnapshot(opportunity.event.slug), opportunity, orderId);
+      if (reason) return { dryRun: true, accepted: false, tokenId: opportunity.token.tokenId,
+        side: "BUY", price: opportunity.price, size: opportunity.size,
+        response: { paper: true, status: "rejected", reason } };
     }
     const alreadyFilled = round(order.originalSize - order.remainingSize);
     const context = this.contexts.get(order.marketSlug);
@@ -784,7 +850,7 @@ export class PaperTrader implements OrderExecutor {
       .filter((level) => Math.abs(level.price - opportunity.price) < 1e-9)
       .reduce((sum, level) => sum + level.size, 0);
     const now = new Date().toISOString();
-    await this.record("order_amended", order);
+    this.record("order_amended", order);
     for (const level of asks) {
       if (
         order.remainingSize <= 1e-8 ||
@@ -794,11 +860,11 @@ export class PaperTrader implements OrderExecutor {
       }
       const fillSize = Math.min(order.remainingSize, level.size);
       if (fillSize <= 1e-8) continue;
-      await this.applyFill(order, level.price, fillSize, "taker", feeConfig, now);
+      this.applyFill(order, level.price, fillSize, "taker", feeConfig, now);
       level.size = round(level.size - fillSize);
     }
     if (context) context.liquidity.set(order.tokenId, asks);
-    await this.persist();
+    this.schedulePersist();
     return {
       dryRun: true,
       accepted: true,
@@ -816,6 +882,7 @@ export class PaperTrader implements OrderExecutor {
   }
 
   reportMarket(marketSlug: string): void {
+    if (this.config.strategyMode === "ladder_v14") return;
     const orders = this.ordersByMarket.get(marketSlug) ?? [];
     if (orders.length === 0) return;
     const fills = this.fillsByMarket.get(marketSlug) ?? [];
@@ -916,9 +983,7 @@ export class PaperTrader implements OrderExecutor {
       partial: orders.filter((order) => order.status === "partial").length,
       unfilled: orders.filter((order) => order.status === "open").length,
       capitalCommitted: round(committed, 4),
-      remainingMarketCapacity: this.config.strategyMode === "ladder_v14"
-        ? "unconstrained"
-        : this.config.strategyMode === "ladder_v13"
+      remainingMarketCapacity: this.config.strategyMode === "ladder_v13"
         ? round(this.availableCash(), 4)
         : round(
             Math.max(0, this.config.ladderMaxUsdcPerMarket - committed),
@@ -993,10 +1058,6 @@ export class PaperTrader implements OrderExecutor {
                     ? "ladder_v12 BRTI 0/20/40 cheap-first completion ladder"
                   : this.config.strategyMode === "ladder_v13"
                     ? "ladder_v13 dynamic microprice pair-arbitrage maker"
-                  : this.config.strategyMode === "ladder_v14"
-                    ? this.config.ladderV14VolumeFirstMode
-                      ? "ladder_v14 volume-first pair collector / shadow EV learner"
-                      : "ladder_v14 conditional marginal-EV inventory engine"
                   : this.config.strategyMode === "ladder_v7"
                     ? "ladder_v7 fixed cheap maker / capped favorite FAK"
                     : this.config.strategyMode === "ladder_v8"
@@ -1016,16 +1077,32 @@ export class PaperTrader implements OrderExecutor {
     });
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    this.closePromise ??= this.closeOnce();
+    return this.closePromise;
+  }
+
+  private async closeOnce(): Promise<void> {
+    this.closing = true;
+    if (this.checkpointTimer) clearInterval(this.checkpointTimer);
+    if (this.healthTimer) clearInterval(this.healthTimer);
     this.stream.close();
     for (const timer of this.settlementTimers.values()) clearTimeout(timer);
     this.settlementTimers.clear();
     await this.executionQueue;
-    await this.persistenceQueue;
+    const settlements = await Promise.allSettled([...this.pendingSettlements]);
+    // Attempt both outputs even if a disk error affects one of them.
+    const logResult = await Promise.allSettled([this.eventLog?.close()]);
+    // Do not overwrite an unreadable/unsupported checkpoint after init fails.
+    const checkpointResult = await Promise.allSettled([this.stateReady ? this.persist() : undefined]);
+    const failures = [...settlements, ...logResult, ...checkpointResult].filter(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    if (failures.length) throw new AggregateError(failures.map((result) => result.reason), "Paper shutdown save failed");
   }
 
   snapshot(): Readonly<PaperState> {
-    return structuredClone(this.state);
+    return structuredClone({ ...this.state, seenEventKeys: [...this.seenEvents] });
   }
 
   getMarketExecutionSnapshot(
@@ -1111,16 +1188,53 @@ export class PaperTrader implements OrderExecutor {
   }
 
   async ingestMarketEvent(event: MarketStreamEvent): Promise<void> {
-    const ingest = async (): Promise<void> => {
+    if (this.closing) return;
+    const receivedAtMs = Date.now();
+    let settlement: Promise<void> | undefined;
+    const ingest = (): void => {
+      this.processingLagMs = Math.max(0, Date.now() - receivedAtMs);
+      this.lagTotal += this.processingLagMs;
+      this.lagCount += 1;
+      this.lagMax = Math.max(this.lagMax, this.processingLagMs);
+      this.eventsProcessed += 1;
+      // Check before chronology/deduplication so stale trades are counted even
+      // when a newer book has already arrived. Never consume their queue volume.
+      if (event.event_type === "last_trade_price") {
+        const atMs = marketEventTimestampMs(event);
+        const eventAgeMs = atMs === null ? 0 : Date.now() - atMs;
+        if (eventAgeMs > PAPER_MAX_MAKER_EVENT_AGE_MS) {
+          this.staleEventsSkipped += 1;
+          this.record("stale_event_skipped", {
+            tokenId: event.asset_id, eventTimestampMs: atMs, eventAgeMs,
+          });
+          return;
+        }
+      }
       if (!this.acceptMonotonicEvent(event)) return;
-      await this.handleStreamEvent(event);
-      await this.marketTelemetryHandler?.(event);
+      if (event.event_type === "market_resolved") {
+        const tokenId = String(event.winning_asset_id ?? event.asset_id ?? "");
+        if (tokenId) settlement = this.settleWinningToken(tokenId);
+        return;
+      }
+      this.handleStreamEvent(event);
+      // The V14 telemetry callback updates RAM. Do not hold execution behind
+      // asynchronous observers, and make fresh telemetry visible before waking.
+      try {
+        const telemetry = this.marketTelemetryHandler?.(event);
+        if (telemetry) void telemetry.catch((error) => this.recordError("telemetry", error));
+      } catch (error) {
+        this.recordError("telemetry", error);
+      }
+      this.notifyExecutionWake(event);
     };
     if (
       this.config.strategyMode === "ladder_v13" ||
       this.config.strategyMode === "ladder_v14"
     ) await this.serializeExecution(ingest);
-    else await ingest();
+    else ingest();
+    // Settlement is an awaited durability boundary, outside the RAM queue so
+    // another market's book/fills can keep advancing while it writes.
+    await settlement;
   }
 
   private acceptMonotonicEvent(event: MarketStreamEvent): boolean {
@@ -1205,7 +1319,7 @@ export class PaperTrader implements OrderExecutor {
     };
   }
 
-  private async applyFill(
+  private applyFill(
     order: PaperOrder,
     price: number,
     size: number,
@@ -1217,7 +1331,7 @@ export class PaperTrader implements OrderExecutor {
       rebateRate: number;
     },
     timestamp: string,
-  ): Promise<void> {
+  ): void {
     const actualSize = round(Math.min(size, order.remainingSize));
     if (actualSize <= 0) return;
     const feeRate =
@@ -1258,7 +1372,7 @@ export class PaperTrader implements OrderExecutor {
     if (!unlimitedV14 && cost + fee > this.state.cash + 1e-8) return;
 
     const fill: PaperFill = {
-      id: `fill-${Date.now()}-${this.state.fills.length + 1}`,
+      id: `fill-${randomUUID()}`,
       orderId: order.id,
       marketSlug: order.marketSlug,
       tokenId: order.tokenId,
@@ -1310,10 +1424,12 @@ export class PaperTrader implements OrderExecutor {
           ? "partial"
           : "open";
     this.refreshOpenOrder(order);
-    await this.record("fill", fill);
+    this.fillsProcessed += 1;
+    this.schedulePersist();
+    this.record("fill", fill);
   }
 
-  private async applySellFill(
+  private applySellFill(
     order: PaperOrder,
     price: number,
     size: number,
@@ -1324,7 +1440,7 @@ export class PaperTrader implements OrderExecutor {
       rebateRate: number;
     },
     timestamp: string,
-  ): Promise<void> {
+  ): void {
     const position = (this.positionsByMarket.get(order.marketSlug) ?? []).find(
       (candidate) =>
         candidate.tokenId === order.tokenId,
@@ -1355,7 +1471,7 @@ export class PaperTrader implements OrderExecutor {
     const averageCost =
       position.shares > 0 ? position.totalCost / position.shares : 0;
     const fill: PaperFill = {
-      id: `fill-${Date.now()}-${this.state.fills.length + 1}`,
+      id: `fill-${randomUUID()}`,
       orderId: order.id,
       marketSlug: order.marketSlug,
       tokenId: order.tokenId,
@@ -1383,10 +1499,12 @@ export class PaperTrader implements OrderExecutor {
     order.remainingSize = round(order.remainingSize - actualSize);
     order.status = order.remainingSize <= 1e-8 ? "filled" : "partial";
     this.refreshOpenOrder(order);
-    await this.record("fill", fill);
+    this.fillsProcessed += 1;
+    this.schedulePersist();
+    this.record("fill", fill);
   }
 
-  private async handleStreamEvent(event: MarketStreamEvent): Promise<void> {
+  private handleStreamEvent(event: MarketStreamEvent): void {
     const eventType = String(event.event_type ?? "");
     if (eventType === "market_books") {
       const books = Array.isArray(event.books)
@@ -1402,7 +1520,6 @@ export class PaperTrader implements OrderExecutor {
           context.streamBacked = true;
         }
       }
-      await this.notifyExecutionWake(event);
       return;
     }
     if (eventType === "market_books_invalid") {
@@ -1418,30 +1535,21 @@ export class PaperTrader implements OrderExecutor {
     }
     if (eventType === "book") {
       this.handleBookEvent(event);
-      await this.notifyExecutionWake(event);
       return;
     }
     if (eventType === "price_change") {
       this.handlePriceChanges(event);
-      await this.notifyExecutionWake(event);
       return;
     }
     if (eventType === "last_trade_price") {
-      await this.handleTradeEvent(event);
-      await this.notifyExecutionWake(event);
+      this.handleTradeEvent(event);
       return;
-    }
-    if (eventType === "market_resolved") {
-      const winningTokenId = String(
-        event.winning_asset_id ?? event.asset_id ?? "",
-      );
-      if (winningTokenId) await this.settleWinningToken(winningTokenId);
     }
   }
 
-  private async notifyExecutionWake(
+  private notifyExecutionWake(
     event: MarketStreamEvent,
-  ): Promise<void> {
+  ): void {
     if (!this.executionWakeHandler) return;
     const tokenIds = new Set<string>();
     const direct = String(event.asset_id ?? "");
@@ -1465,23 +1573,12 @@ export class PaperTrader implements OrderExecutor {
     }
     for (const marketSlug of marketSlugs) {
       if (this.contexts.get(marketSlug)?.marketDataValid === false) continue;
-      if (
-        this.config.strategyMode === "ladder_v10" ||
-        this.config.strategyMode === "ladder_v11" ||
-        this.config.strategyMode === "ladder_v12" ||
-        this.config.strategyMode === "ladder_v13" ||
-        this.config.strategyMode === "ladder_v14"
-      ) {
-        // Do not block the WebSocket decoder on strategy work: an active book
-        // can otherwise retain every incoming delta in its pending queue.
-        void Promise.resolve(this.executionWakeHandler(marketSlug)).catch((error) => {
-          log("Paper execution wake failed", {
-            market: marketSlug,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        });
-      } else {
-        await this.executionWakeHandler(marketSlug);
+      if (this.closing || this.settlementsByMarket.has(marketSlug)) continue;
+      try {
+        const wake = this.executionWakeHandler(marketSlug);
+        if (wake) void wake.catch((error) => this.recordError("execution_wake", error));
+      } catch (error) {
+        this.recordError("execution_wake", error);
       }
     }
   }
@@ -1560,7 +1657,7 @@ export class PaperTrader implements OrderExecutor {
     }
   }
 
-  private async handleTradeEvent(event: MarketStreamEvent): Promise<void> {
+  private handleTradeEvent(event: MarketStreamEvent): void {
     const tokenId = String(event.asset_id ?? "");
     const side = String(event.side ?? "").toUpperCase();
     const price = parseNumber(event.price);
@@ -1600,7 +1697,6 @@ export class PaperTrader implements OrderExecutor {
       const oldest = this.seenEvents.values().next().value as string | undefined;
       if (oldest) this.seenEvents.delete(oldest);
     }
-    this.state.seenEventKeys = [...this.seenEvents];
 
     let remainingTradeSize = size;
     for (const order of orders) {
@@ -1610,7 +1706,7 @@ export class PaperTrader implements OrderExecutor {
       remainingTradeSize = round(remainingTradeSize - queueConsumed);
       if (remainingTradeSize <= 1e-8) continue;
       const fillSize = Math.min(order.remainingSize, remainingTradeSize);
-      await this.applyFill(
+      this.applyFill(
         order,
         order.limitPrice,
         fillSize,
@@ -1633,12 +1729,11 @@ export class PaperTrader implements OrderExecutor {
       );
       remainingTradeSize = round(remainingTradeSize - fillSize);
     }
-    await this.persist();
-    if (marketSlug) this.reportMarket(marketSlug);
+    this.schedulePersist();
   }
 
   private async checkSettlement(event: UpDownEvent): Promise<void> {
-    if (this.settlementsByMarket.has(event.slug)) {
+    if (this.closing || this.settlementsByMarket.has(event.slug)) {
       return;
     }
     const lastCheck = this.fallbackChecks.get(event.slug) ?? 0;
@@ -1648,7 +1743,7 @@ export class PaperTrader implements OrderExecutor {
     try {
       if (this.options.settlementLoader) {
         const result = await this.options.settlementLoader(event);
-        if (result) await this.settleWinningToken(result.winningTokenId);
+        if (result && !this.closing) await this.settleWinningToken(result.winningTokenId);
         return;
       }
       if (this.config.exchange === "kalshi" && this.kalshiClient) {
@@ -1656,6 +1751,7 @@ export class PaperTrader implements OrderExecutor {
         if (!ticker) return;
         const market = await this.kalshiClient.getMarket(ticker);
         if (
+          this.closing ||
           !market ||
           (market.status !== "finalized" && market.status !== "settled") ||
           (market.result !== "yes" && market.result !== "no")
@@ -1672,7 +1768,7 @@ export class PaperTrader implements OrderExecutor {
       const response = await fetch(url);
       if (!response.ok) return;
       const market = (await response.json()) as GammaMarket;
-      if (!market.closed || !market.outcomePrices) return;
+      if (this.closing || !market.closed || !market.outcomePrices) return;
       const prices = JSON.parse(market.outcomePrices) as string[];
       const tokenIds = JSON.parse(market.clobTokenIds) as string[];
       const winningIndex = prices.findIndex((price) => Number(price) >= 0.999);
@@ -1690,6 +1786,7 @@ export class PaperTrader implements OrderExecutor {
 
   private scheduleSettlementFallback(event: UpDownEvent): void {
     if (
+      this.closing ||
       this.settlementTimers.has(event.slug) ||
       this.settlementsByMarket.has(event.slug)
     ) {
@@ -1700,7 +1797,7 @@ export class PaperTrader implements OrderExecutor {
       const timer = setTimeout(() => {
         void this.checkSettlement(event).finally(() => {
           if (
-            !this.settlementsByMarket.has(event.slug)
+            !this.closing && !this.settlementsByMarket.has(event.slug)
           ) {
             schedule(30_000);
           } else {
@@ -1779,7 +1876,15 @@ export class PaperTrader implements OrderExecutor {
     }
   }
 
-  private async settleWinningToken(winningTokenId: string): Promise<void> {
+  private settleWinningToken(winningTokenId: string): Promise<void> {
+    const settlement = this.settleMarket(winningTokenId);
+    this.pendingSettlements.add(settlement);
+    const cleanup = () => { this.pendingSettlements.delete(settlement); };
+    void settlement.then(cleanup, cleanup);
+    return settlement;
+  }
+
+  private async settleMarket(winningTokenId: string): Promise<void> {
     const marketSlug = this.tokenToMarket.get(winningTokenId);
     if (!marketSlug) return;
     if (this.settlementsByMarket.has(marketSlug)) {
@@ -1851,23 +1956,81 @@ export class PaperTrader implements OrderExecutor {
       if (order.status === "open" || order.status === "partial") {
         order.status = "cancelled";
         this.refreshOpenOrder(order);
+        this.record("order_cancelled", order);
       }
     }
-    await this.record("settlement", settlement);
+    this.record("settlement", settlement);
+    this.schedulePersist();
+    await this.eventLog?.flush();
     await this.persist();
-    await this.settlementHandler?.(settlement);
-    this.reportMarket(marketSlug);
-    this.releaseSettledMarket(marketSlug);
+    try {
+      // History learners must see the fills before the active ledger is pruned.
+      await this.settlementHandler?.(settlement);
+    } finally {
+      this.pruneSettledState(new Set([marketSlug]));
+      this.releaseSettledMarket(marketSlug);
+      await this.persist();
+    }
   }
 
-  private async record(
+  private record(
     type: string,
-    payload: PaperOrder | PaperFill | PaperSettlement,
-  ): Promise<void> {
-    await appendRotatingJsonLine(
-      this.eventLogPath,
-      { type, timestamp: new Date().toISOString(), payload },
-    );
+    payload: PaperOrder | PaperFill | PaperSettlement | Record<string, unknown>,
+  ): void {
+    this.eventLog?.write({ type, timestamp: new Date().toISOString(), payload });
+  }
+
+  private recordError(operation: string, error: unknown): void {
+    const payload = { operation, error: error instanceof Error ? error.message : String(error) };
+    this.record("error", payload);
+    log("Paper trader error", payload);
+  }
+
+  private recordHealth(): void {
+    this.record("health", {
+      processingLagMs: this.processingLagMs,
+      averageLag: this.lagCount ? round(this.lagTotal / this.lagCount, 3) : 0,
+      maxLag: this.lagMax,
+      openOrders: this.openOrders.size,
+      fillsProcessed: this.fillsProcessed,
+      eventsProcessed: this.eventsProcessed,
+      staleEventsSkipped: this.staleEventsSkipped,
+      logQueueSize: this.eventLog?.queueSize ?? 0,
+      stateDirty: this.stateDirty,
+    });
+    this.lagTotal = 0;
+    this.lagCount = 0;
+    this.lagMax = 0;
+  }
+
+  private pruneSettledState(
+    settled = new Set(this.state.settlements.map((item) => item.marketSlug)),
+  ): boolean {
+    const removedOrders = this.state.orders.filter((order) => settled.has(order.marketSlug));
+    const removedTokens = new Set(this.state.positions
+      .filter((position) => settled.has(position.marketSlug)).map((position) => position.tokenId));
+    const oldSize = this.state.orders.length + this.state.fills.length + this.state.positions.length;
+    this.state.orders = this.state.orders.filter((order) => !settled.has(order.marketSlug));
+    this.state.fills = this.state.fills.filter((fill) => !settled.has(fill.marketSlug));
+    this.state.positions = this.state.positions.filter((position) => !settled.has(position.marketSlug));
+    for (const order of removedOrders) {
+      removedTokens.add(order.tokenId);
+      this.openOrders.delete(order);
+      this.orderById.delete(order.id);
+      this.orderByTradeKey.delete(order.tradeKey);
+      if (this.state.feeAccumulators) delete this.state.feeAccumulators[order.id];
+    }
+    for (const slug of settled) {
+      this.ordersByMarket.delete(slug);
+      this.fillsByMarket.delete(slug);
+      this.positionsByMarket.delete(slug);
+    }
+    for (const key of this.seenEvents) {
+      if ([...removedTokens].some((token) => key.startsWith(`${token}:`))) this.seenEvents.delete(key);
+    }
+    const changed = oldSize !== this.state.orders.length + this.state.fills.length + this.state.positions.length;
+    if (changed) this.schedulePersist();
+    return changed;
   }
 
   private derivePositions(fills: PaperFill[]): PaperPosition[] {
@@ -1942,24 +2105,38 @@ export class PaperTrader implements OrderExecutor {
     }
   }
 
-  private async persist(): Promise<void> {
-    this.persistenceQueue = this.persistenceQueue.then(async () => {
-      await mkdir(dirname(this.statePath), { recursive: true });
-      const temporaryPath = `${this.statePath}.${process.pid}.tmp`;
-      const serialized = JSON.stringify(this.state);
-      await writeFile(temporaryPath, serialized, "utf8");
-      try {
-        await rename(temporaryPath, this.statePath);
-      } catch (error) {
-        const code =
-          error && typeof error === "object" && "code" in error
-            ? String(error.code)
-            : "";
-        if (code !== "EEXIST" && code !== "EPERM") throw error;
-        await writeFile(this.statePath, serialized, "utf8");
-        await rm(temporaryPath, { force: true });
-      }
-    });
-    await this.persistenceQueue;
+  private schedulePersist(): void {
+    this.stateDirty = true;
+    this.stateRevision += 1;
+  }
+
+  private persist(): Promise<void> {
+    this.checkpointsPending += 1;
+    const checkpoint = this.persistenceQueue.then(async () => {
+      const revision = this.stateRevision;
+      this.state.seenEventKeys = [...this.seenEvents];
+      await this.writeCheckpoint(JSON.stringify(this.state));
+      // A fill arriving during the write belongs to the next checkpoint.
+      if (revision === this.stateRevision) this.stateDirty = false;
+    }).catch((error) => {
+      this.stateDirty = true;
+      throw error;
+    }).finally(() => { this.checkpointsPending -= 1; });
+    // A failed checkpoint must not poison every subsequent save.
+    this.persistenceQueue = checkpoint.catch(() => undefined);
+    return checkpoint;
+  }
+
+  private async writeCheckpoint(serialized: string): Promise<void> {
+    const temporaryPath = `${this.statePath}.${process.pid}.tmp`;
+    await writeFile(temporaryPath, serialized, "utf8");
+    try {
+      await rename(temporaryPath, this.statePath);
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+      if (code !== "EEXIST" && code !== "EPERM") throw error;
+      await writeFile(this.statePath, serialized, "utf8");
+      await rm(temporaryPath, { force: true });
+    }
   }
 }

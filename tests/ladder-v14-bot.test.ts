@@ -8,6 +8,7 @@ import type {
   MarketExecutionSnapshot,
   OrderExecutor,
   OrderResult,
+  PaperFill,
   PaperOrder,
   TokenBook,
   TradeOpportunity,
@@ -60,6 +61,8 @@ function books(event: UpDownEvent): TokenBook[] {
 
 class V14Executor implements OrderExecutor {
   readonly snapshots = new Map<string, MarketExecutionSnapshot>();
+  readonly cancelBatches: string[][] = [];
+  fillImmediateOrders = true;
   private telemetry?: (event: Record<string, unknown>) => void | Promise<void>;
   private orderNumber = 0;
 
@@ -131,6 +134,16 @@ class V14Executor implements OrderExecutor {
       createdAt: new Date().toISOString(),
     };
     orders.push(order);
+    if (opportunity.orderPolicy === "fak") {
+      order.status = this.fillImmediateOrders ? "filled" : "cancelled";
+      order.remainingSize = 0;
+      if (this.fillImmediateOrders) (snapshot.fills as PaperFill[]).push({
+        id: `${order.id}-fill`, orderId: order.id, marketSlug: order.marketSlug,
+        tokenId: order.tokenId, outcome: order.outcome, price: order.limitPrice,
+        size: order.originalSize, fee: 0, liquidity: "taker", side: "BUY",
+        timestamp: new Date().toISOString(),
+      });
+    }
     snapshot.openOrders = orders.filter((candidate) => candidate.status === "open");
     snapshot.openCommitted = orders.reduce(
       (sum, candidate) => sum + candidate.limitPrice * candidate.remainingSize,
@@ -148,6 +161,7 @@ class V14Executor implements OrderExecutor {
   }
 
   async cancelOrders(ids: string[]): Promise<void> {
+    this.cancelBatches.push([...ids]);
     for (const snapshot of this.snapshots.values()) {
       const orders = snapshot.orders as PaperOrder[];
       for (const order of orders) {
@@ -218,6 +232,94 @@ test("V14 global queue allocates volume-first pair grids across configured serie
     }
     await new Promise((resolve) => setTimeout(resolve, 600));
   } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("V14 repair deadline wakes a quiet book, cancels maker, hedges, and resumes grid", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ladder-v14-deadline-"));
+  const event = market("KXETH15M", "ETH", Math.floor(Date.now() / 1000) - 300);
+  const executor = new V14Executor();
+  let bookReads = 0;
+  const bot = new ReverseBot(testConfig({
+    exchange: "kalshi", strategyMode: "ladder_v14", ladderV14VolumeFirstMode: true,
+    executionMode: "paper", paperStatePath: directory, ladderV14QuoteLifetimeSeconds: 1,
+  }), executor, {
+    scan: async () => [event],
+    getTokenBooks: async () => { bookReads += 1; return books(event); },
+  });
+  try {
+    await bot.init();
+    await bot.runOnce();
+    const state = executor.snapshots.get(event.slug)!;
+    const opening = state.openOrders.find((order) => order.outcome === "Up")!;
+    opening.status = "filled";
+    opening.remainingSize = 0;
+    state.openOrders = state.openOrders.filter((order) => order.id !== opening.id);
+    state.fills = [{
+      id: "initial-fill", orderId: opening.id, marketSlug: event.slug,
+      tokenId: opening.tokenId, outcome: "Up", price: 0.6, size: opening.originalSize,
+      fee: 0, liquidity: "maker", side: "BUY", timestamp: new Date().toISOString(),
+    }];
+    const oldGridIds = state.openOrders.map((order) => order.id);
+    await bot.runOnce();
+    assert.deepEqual(executor.cancelBatches[0], oldGridIds);
+    assert.equal(state.openOrders.length, 1);
+    const maker = state.openOrders[0]!;
+    assert.ok(maker.pairId?.startsWith("ladder-v14:repair-maker:"));
+    assert.equal(maker.outcome, "Down");
+    assert.equal(maker.remainingSize, opening.originalSize);
+    const readsBeforeDeadline = bookReads;
+    // No book event or runOnce call: the bounded repair timer drives this.
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    assert.equal(bookReads, readsBeforeDeadline);
+    assert.equal(maker.status, "cancelled");
+    const hedges = state.orders.filter((order) => order.pairId === "ladder-v14:repair-taker");
+    assert.ok(hedges.length > 0);
+    assert.ok(hedges.every((order) => order.status === "filled"));
+    assert.equal(hedges.reduce((sum, order) => sum + order.originalSize, 0), opening.originalSize);
+    assert.ok(state.openOrders.length >= 2);
+    assert.ok(state.openOrders.every((order) => order.pairId === "ladder-v14:opening"));
+    assert.ok(state.openOrders.some((order) => order.outcome === "Up"));
+    assert.ok(state.openOrders.some((order) => order.outcome === "Down"));
+  } finally {
+    // Cancel a pending timer even if an assertion fails before the deadline.
+    (bot as unknown as { scheduleLadderV14RepairWake(deadline: undefined): void })
+      .scheduleLadderV14RepairWake(undefined);
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("V14 zero-fill immediate repair waits for fresh input instead of busy-looping", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ladder-v14-empty-ioc-"));
+  const event = market("KXBTC15M", "BTC", Math.floor(Date.now() / 1000) - 300);
+  const executor = new V14Executor();
+  executor.fillImmediateOrders = false;
+  const bot = new ReverseBot(testConfig({
+    exchange: "kalshi", strategyMode: "ladder_v14", ladderV14VolumeFirstMode: true,
+    executionMode: "paper", paperStatePath: directory,
+  }), executor, { scan: async () => [event], getTokenBooks: async () => books(event) });
+  try {
+    await bot.init();
+    await bot.runOnce();
+    const state = executor.snapshots.get(event.slug)!;
+    const opening = state.openOrders[0]!;
+    opening.status = "filled";
+    opening.remainingSize = 0;
+    state.openOrders = state.openOrders.filter((order) => order.id !== opening.id);
+    state.fills = [{ id: "old-fill", orderId: opening.id, marketSlug: event.slug,
+      tokenId: opening.tokenId, outcome: opening.outcome, price: 0.6,
+      size: opening.originalSize, fee: 0, liquidity: "maker", side: "BUY",
+      timestamp: new Date(Date.now() - 10_000).toISOString() }];
+    const timeout = setTimeout(() => { executor.fillImmediateOrders = true; }, 1000);
+    try { await bot.runOnce(); } finally { clearTimeout(timeout); }
+    const repair = state.orders.filter((order) => order.pairId === "ladder-v14:repair-taker");
+    assert.equal(repair.length, 1);
+    assert.equal(repair[0]!.status, "cancelled");
+    assert.equal(state.fills.length, 1);
+  } finally {
+    await new Promise((resolve) => setTimeout(resolve, 600));
     await rm(directory, { recursive: true, force: true });
   }
 });

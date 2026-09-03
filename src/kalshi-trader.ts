@@ -9,7 +9,7 @@ import {
 import { KalshiMarketStream } from "./kalshi-market-stream.js";
 import { exactKalshiOrderFee } from "./kalshi-fees.js";
 import { ladderV13SellGuard } from "./ladder-v13-inventory.js";
-import { ladderV14SellGuard } from "./ladder-v14-inventory.js";
+import { ladderV14BuyGuard, ladderV14SellGuard } from "./ladder-v14-inventory.js";
 import { log, logThrottled } from "./logger.js";
 import type { MarketStreamEvent } from "./market-stream.js";
 import {
@@ -182,6 +182,12 @@ export class KalshiTrader implements OrderExecutor {
   }
 
   private async placeBuysLocked(opportunities: readonly TradeOpportunity[]): Promise<OrderResult[]> {
+    if (this.config.ladderV14VolumeFirstMode &&
+      opportunities.some((opportunity) => opportunity.strategyMode === "ladder_v14")) {
+      const results: OrderResult[] = [];
+      for (const opportunity of opportunities) results.push(await this.placeBuyLocked(opportunity));
+      return results;
+    }
     for (const opportunity of opportunities) {
       const failure = validateOrderMinimum(opportunity);
       if (failure) return opportunities.map((candidate) => minimumOrderRejection(candidate, failure, this.config.dryRun));
@@ -403,6 +409,12 @@ export class KalshiTrader implements OrderExecutor {
   private async placeBuyLocked(
     opportunity: TradeOpportunity,
   ): Promise<OrderResult> {
+    if (this.config.ladderV14VolumeFirstMode && opportunity.strategyMode === "ladder_v14") {
+      const reason = ladderV14BuyGuard(this.getMarketExecutionSnapshot(opportunity.event.slug), opportunity);
+      if (reason) return { dryRun: this.config.dryRun, accepted: false, tokenId: opportunity.token.tokenId,
+        side: "BUY", price: opportunity.price, size: opportunity.size,
+        response: { status: "rejected", reason } };
+    }
     const minimumFailure = validateOrderMinimum(opportunity);
     if (minimumFailure) {
       return minimumOrderRejection(
@@ -666,6 +678,12 @@ export class KalshiTrader implements OrderExecutor {
         size: opportunity.size,
         response: { status: "rejected", reason: "order_not_open" },
       };
+    }
+    if (this.config.ladderV14VolumeFirstMode && opportunity.strategyMode === "ladder_v14") {
+      const reason = ladderV14BuyGuard(this.getMarketExecutionSnapshot(opportunity.event.slug), opportunity, orderId);
+      if (reason) return { dryRun: this.config.dryRun, accepted: false, tokenId: opportunity.token.tokenId,
+        side: "BUY", price: opportunity.price, size: opportunity.size,
+        response: { status: "rejected", reason } };
     }
     const parsed = parseKalshiTokenId(order.tokenId);
     if (!parsed) throw new Error(`Invalid Kalshi token ID: ${order.tokenId}`);

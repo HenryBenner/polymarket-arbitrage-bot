@@ -16,8 +16,29 @@ async function main(): Promise<void> {
         ? new KalshiTrader(config)
       : new Trader(config);
   const bot = new ReverseBot(config, executor);
-  await bot.init();
-  await bot.run();
+  let shutdown: Promise<void> | undefined;
+  const stop = (error?: unknown): Promise<void> => {
+    if (error !== undefined) logError(error);
+    shutdown ??= bot.stop();
+    return shutdown;
+  };
+  const exitAfterSave = (code: number, error?: unknown): void => {
+    void stop(error).then(
+      () => process.exit(code),
+      (saveError) => { logError(saveError); process.exit(1); },
+    );
+  };
+  process.once("SIGINT", () => exitAfterSave(0));
+  process.once("SIGTERM", () => exitAfterSave(0));
+  process.once("uncaughtException", (error) => exitAfterSave(1, error));
+  process.once("unhandledRejection", (error) => exitAfterSave(1, error));
+  try {
+    await bot.init();
+    await bot.run();
+  } catch (error) {
+    await stop(error);
+    throw error;
+  }
 }
 
 main().catch((error) => {

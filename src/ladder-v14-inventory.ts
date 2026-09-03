@@ -1,4 +1,4 @@
-import type { MarketExecutionSnapshot, PaperFill } from "./types.js";
+import type { MarketExecutionSnapshot, PaperFill, TradeOpportunity } from "./types.js";
 
 const EPSILON = 1e-8;
 const round = (value: number): number => Math.round(value * 1e8) / 1e8;
@@ -181,6 +181,40 @@ export function ladderV14Inventory(
       lotCost(lots.get(noId) ?? [], pairedShares, false),
     ),
   };
+}
+
+/** Volume-first state-machine invariant, rechecked inside the mutation lock. */
+export function ladderV14BuyGuard(
+  snapshot: MarketExecutionSnapshot | null | undefined,
+  opportunity: TradeOpportunity,
+  replacingOrderId?: string,
+): string | null {
+  if (!snapshot || snapshot.marketDataValid === false) return "invalid_market_data";
+  if (snapshot.executionPending) return "pending_execution_reconciliation";
+  if (!Number.isFinite(opportunity.size) || opportunity.size <= 0) return "invalid_size";
+  const inventory = ladderV14Inventory(snapshot);
+  const open = snapshot.openOrders.filter((order) =>
+    order.id !== replacingOrderId && order.pairId?.startsWith("ladder-v14:"));
+  if (opportunity.pairId === "ladder-v14:opening") {
+    if (inventory.unpairedShares > EPSILON) return "repair_only_while_unpaired";
+    if (open.some((order) => order.pairId !== "ladder-v14:opening")) {
+      return "cancel_finished_repair_before_opening";
+    }
+    return null;
+  }
+  if (!opportunity.pairId?.startsWith("ladder-v14:repair-") ||
+    !inventory.episode ||
+    !snapshot.books.some((book) => book.tokenId === opportunity.token.tokenId) ||
+    opportunity.token.tokenId === inventory.episode.surplusTokenId ||
+    opportunity.size > inventory.unpairedShares + EPSILON) {
+    return "buy_exceeds_v14_missing_quantity";
+  }
+  if (open.length > 0) return "cancel_v14_orders_before_repair";
+  if (opportunity.orderPolicy === "post_only" &&
+    Math.abs(opportunity.size - inventory.unpairedShares) > EPSILON) {
+    return "repair_maker_must_match_residual";
+  }
+  return null;
 }
 
 /** Rechecked inside the executor mutation lock. */

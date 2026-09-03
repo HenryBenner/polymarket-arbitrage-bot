@@ -282,11 +282,30 @@ levels. Their default sizes are 40, 80, 160, and 320 shares, and their combined
 raw prices target 99c, 97c, 95c, and 93c. The exact split between Up and Down is
 chosen to keep both quotes as close to their respective touches as possible.
 
-One-sided fills do not stop collection. V14 continues posting both sides and
-adds the current imbalance to the most aggressive missing-side quote. Ordinary
-opening orders are cancelled during the final cleanup window, and actual
-unpaired surplus is sold into available bid depth. It does not use early
-EV-based hedging or liquidation in bootstrap mode.
+Balanced inventory runs that same grid with no additional entry filters.
+As soon as `R = abs(YES - NO) > 0`, V14 cancels **all** ordinary opening orders
+on both sides, waits for cancellation reconciliation, and recomputes R. It
+then buys only the missing side, with no base quantity added and no surplus
+orders or additional grid levels during repair.
+
+If buying the missing quantity now locks a positive pair after entry and
+taker fees, V14 takes it immediately. Otherwise it posts one repair maker for
+exactly R at the most aggressive valid post-only price. The existing
+`LADDER_V14_QUOTE_LIFETIME_SECONDS` (default five seconds) is the repair deadline
+from the first unpaired fill, including cancellation time; partial fills,
+repricing, and restarts do not reset it. A timer wakes repair even on a quiet
+book. At the deadline it cancels the maker and compares executable
+`1 - opposite all-in ask` with `surplus net bid`, choosing the greater value
+(hedge on a tie), even if hedging locks a loss. Entry cost is sunk in this
+timeout decision. Partial depth/fills are handled by replanning the actual
+remaining quantity after each acknowledgment.
+
+When R returns to zero, normal volume-first quoting resumes immediately.
+During the final cleanup window no new grids or maker waits start; remaining
+residuals use the same hedge-versus-sale comparison. These rules reduce
+intentional surplus accumulation, but cannot guarantee fills, profitability,
+or complete cleanup when executable liquidity is absent. Strict EV mode below
+is unchanged.
 
 Set `LADDER_V14_VOLUME_FIRST_MODE=false` to enable the stricter marginal-EV
 entry and residual optimizer. For every passive price and economically distinct
@@ -363,7 +382,35 @@ The paper engine tracks items such as:
 - persistent state
 - execution callbacks
 
-State is written under the configured `PAPER_STATE_PATH`, allowing a bot to restart without losing its simulated portfolio.
+RAM is the active trading state. Book updates, maker fills, positions, and strategy
+wakes do not await disk writes. Dirty state is checkpointed to `paper-state.json`
+under `PAPER_STATE_PATH` every five seconds; a quiet account is not rewritten.
+Changes arriving during a checkpoint remain dirty for the next one, and a failed
+write is retried at the next interval.
+
+`paper-events.jsonl` uses one buffered, append-only stream for submitted, amended,
+and cancelled orders, fills, settlements, stale trades, and errors. V14 paper
+evaluation/candidate/status messages are suppressed. One `health` record every
+30 seconds reports `processingLagMs`, `averageLag`, `maxLag` (milliseconds),
+`openOrders`, `fillsProcessed`, `eventsProcessed`, `staleEventsSkipped`,
+`logQueueSize` (pending records), and `stateDirty`. Lag averages/maxima reset each
+report; event/fill/stale counters cover the current process lifetime.
+
+Trades more than 1,000 ms old by their exchange timestamp cannot generate maker
+fills or consume queue position. The normal operating target is processing lag
+below 100 ms, with essentially no events above one second.
+
+Settlement flushes the event log and saves immediately, lets strategy history
+consume the settled fills, then removes the market's orders, fills, positions,
+and fee accumulators and saves the compact checkpoint. Settlement summaries and
+active markets remain. Older checkpoints are compacted on startup too. Detailed
+history lives in the append-only log, which is no longer automatically rotated
+or deleted by the paper trader.
+
+Manual stop, SIGINT/SIGTERM, and fatal-error shutdown drain pending work, flush the
+log stream, and save a final checkpoint. An abrupt kill or power loss can lose
+changes since the last checkpoint; the event log is historical output and is not
+automatically replayed into the checkpoint on startup.
 
 Each concurrently running strategy should use its own state directory.
 

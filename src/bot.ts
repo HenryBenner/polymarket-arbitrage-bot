@@ -103,6 +103,8 @@ export class ReverseBot {
   private ladderV14History: LadderV14HistoryStore | null = null;
   private ladderV14Queue: Promise<void> | null = null;
   private ladderV14WakePending = false;
+  private ladderV14RepairTimer: NodeJS.Timeout | null = null;
+  private ladderV14RepairWakeAtMs: number | undefined;
   private readonly marketQueues = new Map<string, Promise<void>>();
   private ladderTickRunning = false;
   private readonly ladderV10Regime: LadderV10RegimeEngine | null;
@@ -110,6 +112,9 @@ export class ReverseBot {
   private readonly ladderV12Regime: LadderV12RegimeEngine | null;
   private ladderV10SampleTimer: NodeJS.Timeout | null = null;
   private ladderV10SampleRunning = false;
+  private stopped = false;
+  private stopPromise: Promise<void> | undefined;
+  private scanTimer: NodeJS.Timeout | undefined;
 
   constructor(
     private readonly config: BotConfig,
@@ -275,6 +280,7 @@ export class ReverseBot {
   }
 
   async run(): Promise<void> {
+    if (this.stopped) return;
     log("Reverse bot starting", {
       exchange: this.config.exchange,
       strategy:
@@ -457,8 +463,10 @@ export class ReverseBot {
                   }
                 : "all_economic_breakpoints_with_sweep_conditioning",
               residualPolicy: this.config.ladderV14VolumeFirstMode
-                ? "continue_pair_collection_then_final_residual_sale"
+                ? "repair_only_then_resume_grid"
                 : "marginal_max_of_hedge_sell_wait",
+              repairLifetimeSeconds: this.config.ladderV14VolumeFirstMode
+                ? this.config.ladderV14QuoteLifetimeSeconds : undefined,
               finalCleanupSeconds: this.config.ladderV14FinalCleanupSeconds,
               series: this.config.kalshiSeriesTickers,
             }
@@ -474,6 +482,7 @@ export class ReverseBot {
     });
 
     await this.runOnce();
+    if (this.stopped) return;
     if (
       (this.ladderV10Regime || this.ladderV11Regime || this.ladderV12Regime) &&
       !this.ladderV10SampleTimer
@@ -485,7 +494,39 @@ export class ReverseBot {
           : this.config.ladderV10SnapshotIntervalMs,
       );
     }
-    setInterval(() => void this.scheduledTick(), this.config.pollIntervalMs);
+    this.scanTimer = setInterval(() => void this.scheduledTick(), this.config.pollIntervalMs);
+  }
+
+  stop(): Promise<void> {
+    this.stopPromise ??= this.stopOnce();
+    return this.stopPromise;
+  }
+
+  private async stopOnce(): Promise<void> {
+    this.stopped = true;
+    if (this.scanTimer) clearInterval(this.scanTimer);
+    if (this.ladderV10SampleTimer) clearInterval(this.ladderV10SampleTimer);
+    if (this.ladderV14RepairTimer) clearTimeout(this.ladderV14RepairTimer);
+    this.ladderV14WakePending = false;
+    this.trader.setExecutionWakeHandler?.(() => {});
+    await Promise.allSettled([...this.marketQueues.values()]);
+    await Promise.allSettled([
+      ...this.ladderV55Queues.values(), ...this.ladderV6Queues.values(),
+      ...this.ladderV7Queues.values(), ...this.ladderV8Queues.values(),
+      ...this.ladderV9Queues.values(), ...this.ladderV10Queues.values(),
+      ...this.ladderV11Queues.values(), ...this.ladderV12Queues.values(),
+      ...this.ladderV13Queues.values(), this.ladderV14Queue,
+    ]);
+    const results = await Promise.allSettled([
+      this.trader.close?.(), this.ladderV10Regime?.close(),
+      this.ladderV11Regime?.close(), this.ladderV12Regime?.close(),
+    ]);
+    // Paper settlement callbacks can still finalize learner history on close.
+    const history = await Promise.allSettled([this.ladderV14History?.flush()]);
+    const failures = [...results, ...history].filter(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    if (failures.length) throw new AggregateError(failures.map((result) => result.reason), "Bot shutdown failed");
   }
 
   async runOnce(): Promise<void> {
@@ -493,6 +534,7 @@ export class ReverseBot {
   }
 
   private async sampleLadderV10(): Promise<void> {
+    if (this.stopped) return;
     const regime =
       this.ladderV10Regime ?? this.ladderV11Regime ?? this.ladderV12Regime;
     if (!regime || this.ladderV10SampleRunning) return;
@@ -511,6 +553,7 @@ export class ReverseBot {
   }
 
   private async scheduledTick(): Promise<void> {
+    if (this.stopped) return;
     if (this.config.strategyMode === "reverse") {
       // Preserve the original reverse-mode scheduling and lifecycle exactly.
       await this.tick();
@@ -534,6 +577,7 @@ export class ReverseBot {
   private async tick(): Promise<void> {
     try {
       const events = await this.scanner.scan();
+      if (this.stopped) return;
       await this.cleanupExpiredPairLockMarkets();
       this.cleanupExpiredEventReferences();
       if (events.length === 0) {
@@ -557,6 +601,7 @@ export class ReverseBot {
   }
 
   private enqueueMarket(event: UpDownEvent): Promise<void> {
+    if (this.stopped) return Promise.resolve();
     const previous =
       this.marketQueues.get(event.slug) ?? Promise.resolve();
     const queued = previous
@@ -582,8 +627,11 @@ export class ReverseBot {
   }
 
   private async processEvent(event: UpDownEvent): Promise<void> {
+    if (this.stopped) return;
     const books = await this.scanner.getTokenBooks(event);
+    if (this.stopped) return;
     await this.trader.observeMarket?.(event, books);
+    if (this.stopped) return;
     if (
       this.trader.getMarketExecutionSnapshot?.(event.slug)
         ?.marketDataValid === false
@@ -714,7 +762,8 @@ export class ReverseBot {
   private async executeOpportunity(
     opportunity: TradeOpportunity,
   ): Promise<boolean> {
-    log("Placing limit order", {
+    if (this.stopped) return false;
+    if (this.config.executionMode !== "paper") log("Placing limit order", {
       kind: opportunity.kind,
       market: opportunity.event.title,
       outcome: opportunity.token.outcome,
@@ -736,7 +785,7 @@ export class ReverseBot {
     }
     if (this.config.strategyMode === "odahoa_ladder_2") {
       if (opportunity.pairLockRole === "opening") {
-        await this.ladderTracker.mark(opportunity.tradeKey);
+        await this.markOpportunity(opportunity.tradeKey);
       }
     } else if (
       this.config.strategyMode === "odahoa_ladder" ||
@@ -752,7 +801,7 @@ export class ReverseBot {
       this.config.strategyMode === "ladder_v13" ||
       this.config.strategyMode === "ladder_v14"
     ) {
-      await this.ladderTracker.mark(opportunity.tradeKey);
+      await this.markOpportunity(opportunity.tradeKey);
     } else {
       this.tracker.mark(opportunity.tradeKey);
     }
@@ -763,13 +812,20 @@ export class ReverseBot {
         : this.config.dryRun
           ? "Dry-run order"
           : "Live order placed";
-    log(resultLabel, {
+    if (this.config.executionMode !== "paper") log(resultLabel, {
       tokenId: result.tokenId,
       price: result.price,
       size: result.size,
       response: result.response,
     });
     return true;
+  }
+
+  private async markOpportunity(tradeKey: string): Promise<void> {
+    // V14 plans from the executor's RAM orders/fills and already deduplicates
+    // there. Its paper checkpoint/log are the durable execution history.
+    if (this.config.executionMode === "paper" && this.config.strategyMode === "ladder_v14") return;
+    await this.ladderTracker.mark(tradeKey);
   }
 
   private withCapitalEffect(
@@ -1542,8 +1598,8 @@ export class ReverseBot {
   private async executeOpportunityBatch(
     opportunities: readonly TradeOpportunity[],
   ): Promise<number> {
-    if (opportunities.length === 0) return 0;
-    log("Placing atomic opening pair", {
+    if (this.stopped || opportunities.length === 0) return 0;
+    if (this.config.executionMode !== "paper") log("Placing atomic opening pair", {
       market: opportunities[0]!.event.title,
       orders: opportunities.map((opportunity) => ({
         outcome: opportunity.token.outcome,
@@ -1559,7 +1615,7 @@ export class ReverseBot {
     for (let index = 0; index < opportunities.length; index += 1) {
       if (results[index]?.accepted === false) continue;
       accepted += 1;
-      await this.ladderTracker.mark(opportunities[index]!.tradeKey);
+      await this.markOpportunity(opportunities[index]!.tradeKey);
     }
     return accepted;
   }
@@ -1569,11 +1625,11 @@ export class ReverseBot {
    * portfolio resource instead of letting each market independently reserve it.
    */
   private enqueueLadderV14Global(): Promise<void> {
-    if (this.config.strategyMode !== "ladder_v14") return Promise.resolve();
+    if (this.stopped || this.config.strategyMode !== "ladder_v14") return Promise.resolve();
     this.ladderV14WakePending = true;
     if (this.ladderV14Queue) return this.ladderV14Queue;
     const queued = (async () => {
-      while (this.ladderV14WakePending) {
+      while (!this.stopped && this.ladderV14WakePending) {
         this.ladderV14WakePending = false;
         const mutated = await this.processLadderV14GlobalOnce();
         if (mutated) this.ladderV14WakePending = true;
@@ -1584,14 +1640,30 @@ export class ReverseBot {
     this.ladderV14Queue = queued;
     const cleanup = () => {
       if (this.ladderV14Queue === queued) this.ladderV14Queue = null;
-      if (this.ladderV14WakePending) void this.enqueueLadderV14Global();
+      if (!this.stopped && this.ladderV14WakePending) void this.enqueueLadderV14Global();
     };
     void queued.then(cleanup, cleanup);
     return queued;
   }
 
+  private scheduleLadderV14RepairWake(deadline: number | undefined): void {
+    if (this.stopped) return;
+    if (deadline === this.ladderV14RepairWakeAtMs) return;
+    if (this.ladderV14RepairTimer) clearTimeout(this.ladderV14RepairTimer);
+    this.ladderV14RepairTimer = null;
+    this.ladderV14RepairWakeAtMs = deadline;
+    if (deadline === undefined) return;
+    this.ladderV14RepairTimer = setTimeout(() => {
+      this.ladderV14RepairTimer = null;
+      this.ladderV14RepairWakeAtMs = undefined;
+      void this.enqueueLadderV14Global().catch((error: unknown) =>
+        log("V14 repair deadline processing failed", { error: String(error) }));
+    }, Math.max(1, Math.ceil(deadline - Date.now())));
+    this.ladderV14RepairTimer.unref();
+  }
+
   private async processLadderV14GlobalOnce(): Promise<boolean> {
-    if (!this.ladderV14History) return false;
+    if (this.stopped || !this.ladderV14History) return false;
     const planned: Array<{
       event: UpDownEvent;
       snapshot: NonNullable<ReturnType<NonNullable<OrderExecutor["getMarketExecutionSnapshot"]>>>;
@@ -1601,7 +1673,7 @@ export class ReverseBot {
     for (const event of this.ladderV14Events.values()) {
       if (event.windowEnd <= nowSeconds) continue;
       const snapshot = this.trader.getMarketExecutionSnapshot?.(event.slug);
-      if (!snapshot || snapshot.marketDataValid === false) continue;
+      if (!snapshot || snapshot.marketDataValid === false || snapshot.settledPnl !== null) continue;
       const plan = planLadderV14(
         this.config,
         event,
@@ -1620,12 +1692,16 @@ export class ReverseBot {
       planned.push({ event, snapshot, plan });
     }
 
+    const deadlines = planned.flatMap(({ plan }) =>
+      plan.nextWakeAtMs === undefined ? [] : [plan.nextWakeAtMs]);
+    this.scheduleLadderV14RepairWake(deadlines.length > 0 ? Math.min(...deadlines) : undefined);
+
     const cancellation = planned.find(({ plan }) => plan.cancelOrderIds.length > 0);
     if (cancellation) {
       if (!this.trader.cancelOrders) {
         throw new Error("ladder_v14 requires executor order cancellation");
       }
-      await this.trader.cancelOrders([cancellation.plan.cancelOrderIds[0]!]);
+      await this.trader.cancelOrders(cancellation.plan.cancelOrderIds);
       return true;
     }
 
@@ -1633,7 +1709,9 @@ export class ReverseBot {
     if (sale) {
       const opportunity = sale.plan.flattenOpportunities[0]!;
       this.rememberLadderV14Placement(sale, opportunity.tradeKey);
-      return this.executeSellOpportunity(opportunity);
+      const fillsBefore = sale.snapshot.fills.length;
+      const accepted = await this.executeSellOpportunity(opportunity);
+      return accepted && this.ladderV14RepairProgress(opportunity, fillsBefore);
     }
 
     const residualBuy = planned.find(({ plan }) =>
@@ -1647,7 +1725,9 @@ export class ReverseBot {
       )!;
       if (!this.ladderV14Affordable(residualBuy.snapshot, opportunity)) return false;
       this.rememberLadderV14Placement(residualBuy, opportunity.tradeKey);
-      return this.executeOpportunity(opportunity);
+      const fillsBefore = residualBuy.snapshot.fills.length;
+      const accepted = await this.executeOpportunity(opportunity);
+      return accepted && this.ladderV14RepairProgress(opportunity, fillsBefore);
     }
 
     const amendments = planned.flatMap((entry) =>
@@ -1799,7 +1879,7 @@ export class ReverseBot {
       return this.executeOpportunity(opening.opportunity);
     }
 
-    for (const { event, plan } of planned) {
+    if (this.config.executionMode !== "paper") for (const { event, plan } of planned) {
       logThrottled("Watching ladder_v14 market", event.slug, {
         market: event.title,
         series: event.market.seriesTicker,
@@ -1832,6 +1912,14 @@ export class ReverseBot {
       this.trader.reportMarket?.(event.slug);
     }
     return false;
+  }
+
+  private ladderV14RepairProgress(opportunity: TradeOpportunity, fillsBefore: number): boolean {
+    if (!this.config.ladderV14VolumeFirstMode || opportunity.orderPolicy !== "fak") return true;
+    const latest = this.trader.getMarketExecutionSnapshot?.(opportunity.event.slug);
+    // An IOC acknowledged with zero fills must not busy-loop on the same
+    // displayed depth. Await the next market/reconciliation wake instead.
+    return Boolean(latest && (latest.executionPending || latest.fills.length > fillsBefore));
   }
 
   private rememberLadderV14Placement(
@@ -1977,10 +2065,11 @@ export class ReverseBot {
   private async executeSellOpportunity(
     opportunity: TradeOpportunity,
   ): Promise<boolean> {
+    if (this.stopped) return false;
     if (!this.trader.placeSell) {
       throw new Error(`${opportunity.strategyMode ?? "strategy"} requires executor sell support`);
     }
-    log("Flattening residual position", {
+    if (this.config.executionMode !== "paper") log("Flattening residual position", {
       market: opportunity.event.title,
       outcome: opportunity.token.outcome,
       limitPrice: opportunity.price,
@@ -1988,7 +2077,7 @@ export class ReverseBot {
     });
     const result = await this.trader.placeSell(opportunity);
     if (result.accepted === false) return false;
-    await this.ladderTracker.mark(opportunity.tradeKey);
+    await this.markOpportunity(opportunity.tradeKey);
     return true;
   }
 

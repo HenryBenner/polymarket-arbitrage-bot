@@ -84,6 +84,7 @@ export interface LadderV14PlacementContext {
 }
 
 export interface LadderV14Plan {
+  nextWakeAtMs?: number;
   cancelOrderIds: string[];
   amendments: LadderV14Amendment[];
   opportunities: TradeOpportunity[];
@@ -455,7 +456,6 @@ function selectVolumeFirstTargets(
   event: UpDownEvent,
   snapshot: MarketExecutionSnapshot,
   books: readonly TokenBook[],
-  inventory: ReturnType<typeof ladderV14Inventory>,
   secondsRemaining: number,
   tick: number,
   features: LadderV14MarketFeatures,
@@ -467,10 +467,6 @@ function selectVolumeFirstTargets(
   const selected: LadderV14Candidate[] = [];
   const sweepByToken = new Map<string, number>();
   const usedPairs = new Set<string>();
-  const deficientTokenId = inventory.episode === null
-    ? null
-    : books.find((book) => book.tokenId !== inventory.episode!.surplusTokenId)
-      ?.tokenId ?? null;
   let bestEvaluated: LadderV14Candidate | null = null;
   for (let level = 0; level < config.ladderV14VolumeFirstLevels; level += 1) {
     const targetPairCost = round(
@@ -487,11 +483,8 @@ function selectVolumeFirstTargets(
     for (let sideIndex = 0; sideIndex < 2; sideIndex += 1) {
       const book = books[sideIndex]!;
       const opposite = books[1 - sideIndex]!;
-      const imbalanceRepair = level === 0 && book.tokenId === deficientTokenId
-        ? inventory.unpairedShares
-        : 0;
       const quantity = round(
-        config.ladderV14VolumeFirstBaseShares * 2 ** level + imbalanceRepair,
+        config.ladderV14VolumeFirstBaseShares * 2 ** level,
         2,
       );
       const sweepPrefix = sweepByToken.get(book.tokenId) ?? 0;
@@ -875,7 +868,8 @@ function planResidual(
     residualDecisions: decisions, placementContexts: {} };
 }
 
-function planVolumeFirstCleanup(
+/** A bounded repair episode, independent of the shadow EV model. */
+function planVolumeFirstRepair(
   config: BotConfig,
   event: UpDownEvent,
   snapshot: MarketExecutionSnapshot,
@@ -884,93 +878,121 @@ function planVolumeFirstCleanup(
   nowSeconds: number,
 ): Pick<LadderV14Plan,
   "cancelOrderIds" | "opportunities" | "flattenOpportunities" |
-  "managementStage" | "residualDecisions" | "placementContexts"> {
+  "managementStage" | "residualDecisions" | "placementContexts" | "nextWakeAtMs"> {
   const inventory = ladderV14Inventory(snapshot, nowSeconds);
+  const episode = inventory.episode!;
+  const surplus = books.find((book) => book.tokenId === episode.surplusTokenId)!;
+  const missing = books.find((book) => book.tokenId !== surplus.tokenId)!;
   const open = snapshot.openOrders.filter(isV14Order);
-  if (open.length > 0) {
-    return {
-      cancelOrderIds: open.map((order) => order.id),
-      opportunities: [],
-      flattenOpportunities: [],
-      managementStage: "volume-first-cancel-before-final-sale",
-      residualDecisions: [],
-      placementContexts: {},
-    };
+  const quantity = inventory.unpairedShares;
+  const entry = inventory.unpairedCost / quantity;
+  const deadline = Math.min(
+    Date.parse(episode.residualStartedAt) + config.ladderV14QuoteLifetimeSeconds * 1_000,
+    (event.windowEnd - config.ladderV14FinalCleanupSeconds) * 1_000,
+  );
+  const waiting = nowSeconds * 1_000 < deadline;
+  const result = {
+    cancelOrderIds: [] as string[],
+    opportunities: [] as TradeOpportunity[],
+    flattenOpportunities: [] as TradeOpportunity[],
+    managementStage: "volume-first-repair-no-executable-depth",
+    residualDecisions: [] as LadderV14ResidualDecision[],
+    placementContexts: {} as Record<string, LadderV14PlacementContext>,
+    nextWakeAtMs: waiting ? deadline : undefined,
+  };
+  const makerRole = `repair-maker:${episode.id}`;
+  // Old opening grids on EITHER side can flip/increase the imbalance. Wait
+  // for cancellation reconciliation and then re-read R before submitting.
+  if (open.some((order) => order.pairId !== `${V14_PREFIX}${makerRole}`)) {
+    return { ...result, cancelOrderIds: open.map((order) => order.id),
+      managementStage: "volume-first-repair-cancel-opening-grid" };
   }
-  if (inventory.unpairedShares <= EPSILON || inventory.episode === null) {
-    return {
-      cancelOrderIds: [],
-      opportunities: [],
-      flattenOpportunities: [],
-      managementStage: "volume-first-final-balanced",
-      residualDecisions: [],
-      placementContexts: {},
-    };
-  }
-  const surplus = books.find(
-    (book) => book.tokenId === inventory.episode!.surplusTokenId,
-  )!;
-  const sale = exactKalshiDepthProceeds({
-    levels: surplus.bids,
-    size: inventory.unpairedShares,
+
+  const askQuantity = Math.min(quantity, missing.asks.reduce((sum, level) =>
+    sum + (Number.isFinite(level.size) && level.price > 0 && level.price < 1
+      ? Math.max(0, level.size) : 0), 0));
+  const buyDepth = (size: number) => exactKalshiDepthCost({
+    levels: missing.asks.filter((level) => Number.isFinite(level.size) &&
+      level.size > 0 && level.price > 0 && level.price < 1),
+    size,
     rate: snapshot.takerFeeRate,
     exponent: snapshot.takerFeeExponent,
   });
-  if (!sale || sale.size <= EPSILON) {
-    return {
-      cancelOrderIds: [],
-      opportunities: [],
-      flattenOpportunities: [],
-      managementStage: "volume-first-waiting-final-bid",
-      residualDecisions: [],
-      placementContexts: {},
-    };
+  const sellDepth = (size: number) => exactKalshiDepthProceeds({
+    levels: surplus.bids, size, rate: snapshot.takerFeeRate,
+    exponent: snapshot.takerFeeExponent,
+  });
+  let hedge = askQuantity > EPSILON ? buyDepth(askQuantity) : null;
+  let sale = sellDepth(quantity);
+  let action: "hedge" | "sell" | null = null;
+  let actionQuantity = askQuantity;
+  if (hedge && 1 - entry - hedge.total / askQuantity > EPSILON) {
+    action = "hedge";
+    result.managementStage = "volume-first-repair-profitable-taker";
+  } else if (!waiting) {
+    // Compare executable values for the SAME quantity, not a full hedge
+    // against a shallow partial sale. Replan any remainder after each fill.
+    actionQuantity = hedge && sale ? Math.min(askQuantity, sale.size)
+      : hedge ? askQuantity : sale?.size ?? 0;
+    hedge = hedge && actionQuantity > EPSILON ? buyDepth(actionQuantity) : null;
+    sale = sale && actionQuantity > EPSILON ? sellDepth(actionQuantity) : null;
+    if (hedge || sale) {
+      action = hedge && (!sale ||
+        1 - hedge.total / actionQuantity + EPSILON >= sale.total / actionQuantity)
+        ? "hedge" : "sell";
+      result.managementStage = action === "hedge"
+        ? "volume-first-repair-timeout-hedge"
+        : "volume-first-repair-timeout-sale";
+    }
   }
-  const lot = inventory.residualLots[0]!;
-  const context = contextFor(
-    config,
-    event,
-    surplus,
-    lot.allInPrice,
-    sale.size,
-    0,
-    0,
-    Math.max(0, event.windowEnd - nowSeconds),
-    features,
-    {
-      entryPrice: lot.allInPrice,
-      currentBid: sale.averageNetPrice,
+  const tick = Number(tickSizeFromMarket(event.market));
+  const makerPrice = missing.bestAsk === null ? missing.bestBid
+    : round(Math.floor((missing.bestAsk - EPSILON) / tick) * tick, 4);
+  const context = contextFor(config, event, missing, entry, quantity,
+    makerPrice === null ? 0 : queueAhead(missing, makerPrice), 0,
+    event.windowEnd - nowSeconds, features, {
+      side: surplus.outcome, currentBid: surplus.bestBid,
       currentMid: features.midpointByToken[surplus.tokenId] ?? midpoint(surplus),
-      residualAgeSeconds: Math.max(0, nowSeconds - lot.filledAtMs / 1_000),
-      depth: sale.size,
-    },
-  );
-  const key = `${V14_PREFIX}${event.slug}:volume-first-final-sale:${inventory.episode.id}:${sale.size}:${Math.floor(nowSeconds * 1000)}`;
-  const target = opportunity(
-    event,
-    surplus,
-    "SELL",
-    sale.limitPrice,
-    sale.size,
-    "fak",
-    "volume-first-final-sale",
-    key,
-  );
-  return {
-    cancelOrderIds: [],
-    opportunities: [],
-    flattenOpportunities: [target],
-    managementStage: "volume-first-final-residual-sale",
-    residualDecisions: [{
-      action: "sell",
-      size: sale.size,
-      hedgeValue: null,
-      sellValue: sale.averageNetPrice,
-      waitValue: 0,
-      context,
-    }],
-    placementContexts: { [key]: { kind: "failed_exit", context } },
-  };
+      residualAgeSeconds: episode.residualAgeSeconds,
+      priceMoveSinceFill: (midpoint(surplus) ?? entry) - entry,
+    });
+  if (action) {
+    if (open.length > 0) return { ...result,
+      cancelOrderIds: open.map((order) => order.id),
+      managementStage: "volume-first-repair-cancel-before-exit" };
+    const role = action === "hedge" ? "repair-taker" : "repair-sale";
+    const depth = action === "hedge" ? hedge! : sale!;
+    const key = `${V14_PREFIX}${event.slug}:${role}:${episode.id}:r${quantity}:q${actionQuantity}:${Math.floor(nowSeconds * 1000)}`;
+    const target = opportunity(event, action === "hedge" ? missing : surplus,
+      action === "hedge" ? "BUY" : "SELL", depth.limitPrice,
+      actionQuantity, "fak", role, key);
+    result.opportunities = action === "hedge" ? [target] : [];
+    result.flattenOpportunities = action === "sell" ? [target] : [];
+    result.placementContexts[key] = {
+      kind: action === "hedge" ? "completion" : "failed_exit",
+      context: { ...context, quantity: actionQuantity },
+    };
+    return result;
+  }
+  if (!waiting || makerPrice === null || makerPrice < tick || makerPrice >= 1 ||
+    makerPrice >= (missing.bestAsk ?? 1)) {
+    return { ...result, cancelOrderIds: open.map((order) => order.id) };
+  }
+  if (open.length === 1 && open[0]!.tokenId === missing.tokenId &&
+    (open[0]!.side ?? "BUY") === "BUY" && open[0]!.orderPolicy === "post_only" &&
+    Math.abs(open[0]!.limitPrice - makerPrice) <= EPSILON &&
+    Math.abs(open[0]!.remainingSize - quantity) <= EPSILON) {
+    return { ...result, managementStage: "volume-first-repair-maker-resting" };
+  }
+  if (open.length > 0) return { ...result,
+    cancelOrderIds: open.map((order) => order.id),
+    managementStage: "volume-first-repair-replace-maker" };
+  const key = `${V14_PREFIX}${event.slug}:${makerRole}:${quantity}:${Math.floor(nowSeconds * 1000)}`;
+  result.opportunities = [opportunity(event, missing, "BUY", makerPrice,
+    quantity, "post_only", makerRole, key)];
+  result.placementContexts[key] = { kind: "completion", context };
+  result.managementStage = "volume-first-repair-post-maker";
+  return result;
 }
 
 export function planLadderV14(
@@ -1017,18 +1039,33 @@ export function planLadderV14(
     return { ...base, cancelOrderIds: open.map((order) => order.id),
       managementStage: "market-expired" };
   }
+  if (config.ladderV14VolumeFirstMode && inventory.unpairedShares > EPSILON) {
+    return { ...base, ...planVolumeFirstRepair(
+      config, event, snapshot, books, features, nowSeconds,
+    ) };
+  }
   if (
     config.ladderV14VolumeFirstMode &&
     secondsRemaining <= config.ladderV14FinalCleanupSeconds
   ) {
-    return { ...base, ...planVolumeFirstCleanup(
-      config, event, snapshot, books, features, nowSeconds,
-    ) };
+    return { ...base, cancelOrderIds: open.map((order) => order.id),
+      managementStage: open.length > 0
+        ? "volume-first-cancel-final-grid" : "volume-first-final-balanced" };
   }
   if (!config.ladderV14VolumeFirstMode && inventory.unpairedShares > EPSILON) {
     return { ...base, ...planResidual(
       config, event, snapshot, books, features, model, nowSeconds,
     ) };
+  }
+
+  // A completed repair may still have a cancellation/in-flight remainder.
+  // Do not treat it as a normal grid order merely because its price matches.
+  if (config.ladderV14VolumeFirstMode &&
+    open.some((order) => order.pairId !== `${V14_PREFIX}opening`)) {
+    return { ...base,
+      cancelOrderIds: open.filter((order) => order.pairId !== `${V14_PREFIX}opening`)
+        .map((order) => order.id),
+      managementStage: "volume-first-cancel-finished-repair" };
   }
 
   const tick = Number(tickSizeFromMarket(event.market));
@@ -1038,7 +1075,6 @@ export function planLadderV14(
         event,
         snapshot,
         books,
-        inventory,
         secondsRemaining,
         tick,
         features,

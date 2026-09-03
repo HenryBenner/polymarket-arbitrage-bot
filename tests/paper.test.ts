@@ -563,13 +563,14 @@ test("paper settlement pays the winning shares and persists across restart", asy
     });
     await restarted.init();
     assert.equal(restarted.snapshot().settlements.length, 1);
+    assert.equal(restarted.snapshot().orders.length, 0);
+    assert.equal(restarted.snapshot().fills.length, 0);
+    assert.equal(restarted.snapshot().positions.length, 0);
     const duplicate = await restarted.placeBuy(
       opportunity(books[0]!, "winner", 0.45, 2.23),
     );
-    assert.equal(
-      (duplicate.response as { duplicate: boolean }).duplicate,
-      true,
-    );
+    assert.equal(duplicate.accepted, false);
+    assert.equal((duplicate.response as { reason: string }).reason, "market_settled");
     await restarted.close();
   } finally {
     await rm(directory, { recursive: true, force: true });

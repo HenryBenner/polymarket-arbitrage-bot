@@ -63,9 +63,10 @@ settlement totals above are not replaced with incomplete replay totals.
 - Continue repair-only behavior: cancel ordinary opening orders and quote only
   the missing R shares. Take immediately only when the all-in completed pair is
   profitable. Otherwise rest a fee-safe missing-side maker.
-- Remove automatic loss-taking at five seconds. At the final cleanup deadline,
-  cancel the maker and choose the better executable hedge or net sale, including
-  loss-locking hedges. No new opening grids during cleanup.
+- Remove automatic loss-taking at five seconds. After at most 240 seconds of
+  profitable-only repair (or at the earlier final cleanup deadline), cancel the
+  maker and choose the better executable hedge or net sale, including loss-locking
+  hedges. No new opening cycles during repair.
 - Separate trade/book chronology; reject trades predating an order's latest
   amendment. Preserve stale-trade rejection and deduplication.
 - Discard expired/orphaned quote contexts without deleting learned statistics;

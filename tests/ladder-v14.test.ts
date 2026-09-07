@@ -215,6 +215,7 @@ test("V14 volume-first mode posts one 10-share near-touch pair without EV gating
 });
 
 const repairNow = event.windowEnd - 300;
+const repairDeadlineNow = repairNow + 240;
 const cleanupNow = event.windowEnd - 30;
 function volumePlan(state: MarketExecutionSnapshot, now = repairNow) {
   return planLadderV14(testConfig({
@@ -288,7 +289,7 @@ test("V14 posts one aggressive missing-side maker for R with no base quantity or
   assert.equal(target.size, 40);
   assert.equal(target.price, 0.39);
   assert.equal(target.orderPolicy, "post_only");
-  assert.equal(plan.nextWakeAtMs, cleanupNow * 1000);
+  assert.equal(plan.nextWakeAtMs, repairDeadlineNow * 1000);
   assert.equal(plan.candidates.length, 0);
   assert.equal(plan.flattenOpportunities.length, 0);
 });
@@ -305,7 +306,7 @@ test("V14 keeps the same repair deadline after partial fills, repricing, and rep
   assert.equal(plan.unpairedShares, 25);
   assert.equal(plan.managementStage, "volume-first-repair-maker-resting");
   assert.equal(plan.opportunities.length, 0);
-  assert.equal(plan.nextWakeAtMs, cleanupNow * 1000);
+  assert.equal(plan.nextWakeAtMs, repairDeadlineNow * 1000);
   // Replacement and reconstruction from persisted fills do not start a new clock.
   const replayed = JSON.parse(JSON.stringify(state)) as MarketExecutionSnapshot;
   replayed.books[1]!.bestAsk = 0.39;
@@ -379,25 +380,47 @@ test("V14 recomputes R after in-flight fills during cancellation", () => {
   state.fills = [...state.fills, { ...v14Fill(late), timestamp: new Date((repairNow + 1) * 1000).toISOString() }];
   const plan = volumePlan(state, repairNow + 2);
   assert.equal(plan.opportunities[0]!.size, 50);
-  assert.equal(plan.nextWakeAtMs, cleanupNow * 1000);
+  assert.equal(plan.nextWakeAtMs, repairDeadlineNow * 1000);
 });
 
-test("V14 final cleanup locks a smaller loss rather than making a worse residual sale", () => {
-  const plan = volumePlan(residualState(0.6, 0.43, 0.25), cleanupNow);
-  assert.equal(plan.managementStage, "volume-first-repair-cleanup-hedge");
+test("V14 repair deadline locks a smaller loss rather than making a worse residual sale", () => {
+  const state = residualState(0.6, 0.43, 0.25);
+  const before = volumePlan(state, repairDeadlineNow - 0.001);
+  assert.equal(before.managementStage, "volume-first-repair-post-maker");
+  assert.equal(before.nextWakeAtMs, repairDeadlineNow * 1000);
+  const plan = volumePlan(state, repairDeadlineNow);
+  assert.equal(plan.managementStage, "volume-first-repair-deadline-hedge");
   assert.equal(plan.opportunities[0]!.price, 0.43);
   assert.equal(plan.opportunities[0]!.size, 40);
   assert.equal(plan.flattenOpportunities.length, 0);
 });
 
-test("V14 cleanup sells when net bid beats the hedge and hedges on a tie", () => {
-  const sale = volumePlan(residualState(0.6, 0.8, 0.4), cleanupNow);
-  assert.equal(sale.managementStage, "volume-first-repair-cleanup-sale");
+test("V14 repair deadline sells when net bid beats the hedge and hedges on a tie", () => {
+  const sale = volumePlan(residualState(0.6, 0.8, 0.4), repairDeadlineNow);
+  assert.equal(sale.managementStage, "volume-first-repair-deadline-sale");
   assert.equal(sale.flattenOpportunities[0]!.token.tokenId, "up-token");
   assert.equal(sale.flattenOpportunities[0]!.size, 40);
   assert.equal(sale.opportunities.length, 0);
-  const tie = volumePlan(residualState(0.6, 0.8, 0.2), cleanupNow);
-  assert.equal(tie.managementStage, "volume-first-repair-cleanup-hedge");
+  const tie = volumePlan(residualState(0.6, 0.8, 0.2), repairDeadlineNow);
+  assert.equal(tie.managementStage, "volume-first-repair-deadline-hedge");
+});
+
+test("V14 repair maximum wait is configurable from the first unpaired fill", () => {
+  const state = residualState(0.6, 0.43, 0.25);
+  const config = testConfig({
+    exchange: "kalshi", strategyMode: "ladder_v14", ladderV14VolumeFirstMode: true,
+    ladderV14RepairMaxWaitSeconds: 120,
+  });
+  const planAt = (now: number) => planLadderV14(
+    config, event, state, new LadderV14ConditionalModel(parameters),
+    features([...state.books]), now,
+  );
+  assert.equal(planAt(repairNow + 119.999).managementStage,
+    "volume-first-repair-post-maker");
+  assert.equal(planAt(repairNow + 119.999).nextWakeAtMs,
+    (repairNow + 120) * 1000);
+  assert.equal(planAt(repairNow + 120).managementStage,
+    "volume-first-repair-deadline-hedge");
 });
 
 test("V14 cancels a resting repair before taking and compares matching executable depth", () => {
@@ -405,12 +428,12 @@ test("V14 cancels a resting repair before taking and compares matching executabl
   const maker = postedRepair(state);
   state.orders = [...state.orders, maker];
   state.openOrders = [maker];
-  const cancel = volumePlan(state, cleanupNow);
+  const cancel = volumePlan(state, repairDeadlineNow);
   assert.deepEqual(cancel.cancelOrderIds, [maker.id]);
   assert.equal(cancel.opportunities.length + cancel.flattenOpportunities.length, 0);
   state.openOrders = [];
   state.books[0]!.bids = [{ price: 0.4, size: 5 }];
-  const partial = volumePlan(state, cleanupNow);
+  const partial = volumePlan(state, repairDeadlineNow);
   assert.equal(partial.flattenOpportunities[0]!.size, 5);
 });
 
@@ -428,7 +451,7 @@ test("V14 handles missing depth and final cleanup without starting another maker
     timestamp: new Date((event.windowEnd - 20) * 1000).toISOString() }));
   const final = volumePlan(finalState, event.windowEnd - 20);
   assert.equal(final.opportunities[0]!.orderPolicy, "fak");
-  assert.equal(final.managementStage, "volume-first-repair-cleanup-hedge");
+  assert.equal(final.managementStage, "volume-first-repair-deadline-hedge");
 });
 
 test("V14 resumes the unchanged grid once repair balances inventory", () => {
@@ -477,7 +500,7 @@ test("V14 does not force a losing taker hedge at five seconds or chase a losing 
     assert.ok(quote.price <= 0.39);
     assert.equal(quote.size, 40);
     assert.equal(plan.flattenOpportunities.length, 0);
-    assert.equal(plan.nextWakeAtMs, cleanupNow * 1000);
+    assert.equal(plan.nextWakeAtMs, repairDeadlineNow * 1000);
   }
 });
 

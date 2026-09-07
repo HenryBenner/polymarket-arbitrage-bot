@@ -628,6 +628,10 @@ test("ladder_v14 supports multiple Kalshi 15-minute crypto series in paper/live"
     () => validateTradingConfig({ ...config, minutesBeforeCloseMax: 10 }),
     /full market window/,
   );
+  assert.throws(
+    () => validateTradingConfig({ ...config, ladderV14RepairMaxWaitSeconds: 0 }),
+    /model and window settings/,
+  );
 });
 
 test("ladder_v8 is Polymarket paper-only with Odahoa sizing guards", () => {

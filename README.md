@@ -297,14 +297,16 @@ taker fees, V14 takes it immediately. Otherwise it posts one repair maker for
 exactly R at the most aggressive post-only price that leaves positive pair
 profit after both legs' fees and rounding. It does **not** chase a loss-making
 maker price or automatically cross at a loss after five seconds. Repair-only
-mode remains active until balance returns or the final cleanup window begins.
+mode remains active until balance returns or its repair deadline arrives.
 `LADDER_V14_QUOTE_LIFETIME_SECONDS` remains the statistical quote horizon; it
-is not a forced-loss timer. The actual cleanup deadline is market close minus
-`LADDER_V14_FINAL_CLEANUP_SECONDS` (default 30 seconds). A timer wakes repair
-even on a quiet book. At cleanup it cancels the maker and compares executable
+is not a forced-loss timer. The profitable-repair deadline is 240 seconds after
+the residual episode begins, configured by
+`LADDER_V14_REPAIR_MAX_WAIT_SECONDS`. If the market's final cleanup window
+begins sooner, that earlier deadline applies. A timer wakes repair even on a
+quiet book. At the deadline it cancels the maker and compares executable
 `1 - opposite all-in ask` with `surplus net bid`, choosing the greater value
 (hedge on a tie), even if hedging locks a loss. Entry cost is sunk in this
-cleanup decision. Partial depth/fills are handled by replanning the actual
+deadline decision. Partial depth/fills are handled by replanning the actual
 remaining quantity after each acknowledgment.
 
 Partial repair fills never resume opening cycles: a 100-share residual still

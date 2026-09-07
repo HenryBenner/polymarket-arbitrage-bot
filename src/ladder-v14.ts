@@ -842,7 +842,7 @@ function planResidual(
     residualDecisions: decisions, placementContexts: {} };
 }
 
-/** Repair-only inventory; seek profitable completion until the cleanup deadline. */
+/** Repair-only inventory; seek profitable completion until its economic deadline. */
 function planVolumeFirstRepair(
   config: BotConfig,
   event: UpDownEvent,
@@ -860,7 +860,12 @@ function planVolumeFirstRepair(
   const open = snapshot.openOrders.filter(isV14Order);
   const quantity = inventory.unpairedShares;
   const entry = inventory.unpairedCost / quantity;
-  const deadline = (event.windowEnd - config.ladderV14FinalCleanupSeconds) * 1_000;
+  const finalCleanupAtMs =
+    (event.windowEnd - config.ladderV14FinalCleanupSeconds) * 1_000;
+  const episodeStartedAtMs = Date.parse(episode.residualStartedAt);
+  const maxRepairWaitAtMs = episodeStartedAtMs +
+    config.ladderV14RepairMaxWaitSeconds * 1_000;
+  const deadline = Math.min(finalCleanupAtMs, maxRepairWaitAtMs);
   const waiting = nowSeconds * 1_000 < deadline;
   const result = {
     cancelOrderIds: [] as string[],
@@ -897,7 +902,7 @@ function planVolumeFirstRepair(
   let sale = sellDepth(quantity);
   let action: "hedge" | "sell" | null = null;
   let actionQuantity = askQuantity;
-  if (hedge && 1 - entry - hedge.total / askQuantity > EPSILON) {
+  if (waiting && hedge && 1 - entry - hedge.total / askQuantity > EPSILON) {
     action = "hedge";
     result.managementStage = "volume-first-repair-profitable-taker";
   } else if (!waiting) {
@@ -912,8 +917,8 @@ function planVolumeFirstRepair(
         1 - hedge.total / actionQuantity + EPSILON >= sale.total / actionQuantity)
         ? "hedge" : "sell";
       result.managementStage = action === "hedge"
-        ? "volume-first-repair-cleanup-hedge"
-        : "volume-first-repair-cleanup-sale";
+        ? "volume-first-repair-deadline-hedge"
+        : "volume-first-repair-deadline-sale";
     }
   }
   const tick = Number(tickSizeFromMarket(event.market));

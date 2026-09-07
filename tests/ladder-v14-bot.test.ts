@@ -291,15 +291,15 @@ test("V14 opens the next 10-share pair only after both sides of the cycle fill",
   }
 });
 
-test("V14 final cleanup wakes a quiet book, cancels maker, hedges, and stays balanced", async () => {
+test("V14 maximum repair wait wakes a quiet book, exits economically, and resumes", async () => {
   const directory = await mkdtemp(join(tmpdir(), "ladder-v14-deadline-"));
   const event = market("KXETH15M", "ETH", Math.floor(Date.now() / 1000) - 300);
-  event.windowEnd = Date.now() / 1000 + 31.5;
   const executor = new V14Executor();
   let bookReads = 0;
   const bot = new ReverseBot(testConfig({
     exchange: "kalshi", strategyMode: "ladder_v14", ladderV14VolumeFirstMode: true,
     executionMode: "paper", paperStatePath: directory, ladderV14QuoteLifetimeSeconds: 1,
+    ladderV14RepairMaxWaitSeconds: 1.5,
   }), executor, {
     scan: async () => [event],
     getTokenBooks: async () => { bookReads += 1; return books(event); },
@@ -334,7 +334,8 @@ test("V14 final cleanup wakes a quiet book, cancels maker, hedges, and stays bal
     assert.ok(hedges.length > 0);
     assert.ok(hedges.every((order) => order.status === "filled"));
     assert.equal(hedges.reduce((sum, order) => sum + order.originalSize, 0), opening.originalSize);
-    assert.equal(state.openOrders.length, 0, "no new grid during final cleanup");
+    assert.equal(state.openOrders.length, 2, "the next cycle starts only after repair balances");
+    assert.ok(state.openOrders.every((order) => order.pairId === "ladder-v14:opening"));
   } finally {
     // Cancel a pending timer even if an assertion fails before the deadline.
     (bot as unknown as { scheduleLadderV14RepairWake(deadline: undefined): void })

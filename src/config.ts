@@ -181,6 +181,7 @@ export interface BotConfig {
   ladderV14FlowWindowSeconds: number;
   ladderV14VolatilityWindowSeconds: number;
   ladderV14FinalCleanupSeconds: number;
+  ladderV14RepairMaxWaitSeconds: number;
   ladderV14QuoteLifetimeSeconds: number;
   ladderV14PseudoFlowDepthFraction: number;
   ladderV14QuantityQueueWeight: number;
@@ -399,6 +400,10 @@ export function loadConfig(): BotConfig {
     ladderV14FinalCleanupSeconds: envNumber(
       "LADDER_V14_FINAL_CLEANUP_SECONDS",
       30,
+    ),
+    ladderV14RepairMaxWaitSeconds: envNumber(
+      "LADDER_V14_REPAIR_MAX_WAIT_SECONDS",
+      240,
     ),
     ladderV14QuoteLifetimeSeconds: envNumber(
       "LADDER_V14_QUOTE_LIFETIME_SECONDS",
@@ -884,6 +889,8 @@ export function validateTradingConfig(config: BotConfig): void {
     config.ladderV14VolatilityWindowSeconds <= 0 ||
     !Number.isFinite(config.ladderV14FinalCleanupSeconds) ||
     config.ladderV14FinalCleanupSeconds < 0 ||
+    !Number.isFinite(config.ladderV14RepairMaxWaitSeconds) ||
+    config.ladderV14RepairMaxWaitSeconds <= 0 ||
     !Number.isFinite(config.ladderV14QuoteLifetimeSeconds) ||
     config.ladderV14QuoteLifetimeSeconds <= 0 ||
     !Number.isFinite(config.ladderV14PseudoFlowDepthFraction) ||

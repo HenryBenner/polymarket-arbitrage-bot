@@ -76,6 +76,7 @@ export function testConfig(overrides: Partial<BotConfig> = {}): BotConfig {
     ladderV14FlowWindowSeconds: 60,
     ladderV14VolatilityWindowSeconds: 60,
     ladderV14FinalCleanupSeconds: 30,
+    ladderV14RepairMaxWaitSeconds: 240,
     ladderV14QuoteLifetimeSeconds: 5,
     ladderV14PseudoFlowDepthFraction: 1,
     ladderV14QuantityQueueWeight: 1,

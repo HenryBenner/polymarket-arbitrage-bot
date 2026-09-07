@@ -1,3 +1,4 @@
+import { v15Exposure, v15OrderGuard, v15Inventory, v15NetPositions, v15CycleReports, type V15CycleReport } from "./ladder-v15-inventory.js";
 import { randomUUID } from "node:crypto";
 import { readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -35,6 +36,9 @@ export const PAPER_HEALTH_INTERVAL_MS = 30_000;
 export const PAPER_MAX_MAKER_EVENT_AGE_MS = 1_000;
 
 interface PaperState {
+  v15Markets?: Record<string, UpDownEvent>;
+  v15ClosedPairPayouts?: Record<string, number>;
+  v15Cycles?: V15CycleReport[];
   version: 1;
   startingBalance: number;
   cash: number;
@@ -258,6 +262,22 @@ export class PaperTrader implements OrderExecutor {
     // Compact checkpoints created by older versions as well as new settlements.
     if (this.pruneSettledState()) needsCheckpoint = true;
     this.rebuildStateIndexes();
+    if (this.config.strategyMode === "ladder_v15") {
+      for (const event of Object.values(this.state.v15Markets ?? {})) {
+        if (this.settlementsByMarket.has(event.slug)) continue;
+        const tokens = JSON.parse(event.market.clobTokenIds) as string[];
+        const outcomes = JSON.parse(event.market.outcomes) as string[];
+        const books: TokenBook[] = tokens.map((tokenId, outcomeIndex) => ({ tokenId,
+          outcome: outcomes[outcomeIndex] ?? String(outcomeIndex), outcomeIndex,
+          bestBid: null, bestAsk: null, bids: [], asks: [], minOrderSize: 0.01 }));
+        this.contexts.set(event.slug, { event, books: new Map(books.map(book => [book.tokenId, book])),
+          liquidity: new Map(), marketDataValid: false, streamBacked: false,
+          lastEventTimestampMs: 0, lastTradeTimestampMs: new Map() });
+        tokens.forEach(token => this.tokenToMarket.set(token, event.slug));
+        // Expired windows may no longer be discovered by the scanner after a restart.
+        this.scheduleSettlementFallback(event);
+      }
+    }
     if (needsCheckpoint) await this.persist();
     if (this.closing) return;
     this.checkpointTimer = setInterval(() => {
@@ -296,6 +316,11 @@ export class PaperTrader implements OrderExecutor {
 
   async observeMarket(event: UpDownEvent, books: TokenBook[]): Promise<void> {
     if (this.closing || this.settlementsByMarket.has(event.slug)) return;
+    if (this.config.strategyMode === "ladder_v15") {
+      this.state.v15Markets ??= {};
+      this.state.v15Markets[event.slug] = structuredClone(event);
+      this.schedulePersist();
+    }
     const existingContext = this.contexts.get(event.slug);
     const nextContext: MarketContext = {
       event,
@@ -361,7 +386,7 @@ export class PaperTrader implements OrderExecutor {
         return sum + opportunity.price * opportunity.size + fee;
       }, 0);
       const unlimitedV14 = opportunities.every(
-        (opportunity) => opportunity.strategyMode === "ladder_v14",
+        (opportunity) => ["ladder_v14", "ladder_v15"].includes(opportunity.strategyMode ?? ""),
       );
       if (!unlimitedV14 && required > this.availableCash() + 1e-8) {
         throw new Error(`Paper balance too low: $${this.availableCash().toFixed(2)} available, $${required.toFixed(2)} required`);
@@ -402,6 +427,16 @@ export class PaperTrader implements OrderExecutor {
       if (reason) return { dryRun: true, accepted: false, tokenId: opportunity.token.tokenId,
         side: "BUY", price: opportunity.price, size: opportunity.size,
         response: { paper: true, status: "rejected", reason } };
+    }
+    if (opportunity.strategyMode === "ladder_v15") {
+      const exposure = [...this.ordersByMarket.keys()].reduce((sum, slug) => {
+        return sum + (this.settlementsByMarket.has(slug) ? 0 : v15Exposure({
+          orders: this.ordersByMarket.get(slug) ?? [], fills: this.fillsByMarket.get(slug) ?? [],
+          openOrders: [...this.openOrders].filter(order => order.marketSlug === slug) }));
+      }, 0);
+      const reason = v15OrderGuard(this.config, this.getMarketExecutionSnapshot(opportunity.event.slug), opportunity, exposure);
+      if (reason) return { dryRun: true, accepted: false, tokenId: opportunity.token.tokenId,
+        side: "BUY", price: opportunity.price, size: opportunity.size, response: { reason } };
     }
     const minimumFailure = validateOrderMinimum(opportunity);
     if (minimumFailure) {
@@ -462,7 +497,7 @@ export class PaperTrader implements OrderExecutor {
         : undefined;
     if (
       opportunity.strategyMode !== "ladder_v13" &&
-      opportunity.strategyMode !== "ladder_v14" &&
+      opportunity.strategyMode !== "ladder_v14" && opportunity.strategyMode !== "ladder_v15" &&
       ladderCapitalEffect === "increase" &&
       projectedCommitment > this.config.ladderMaxUsdcPerMarket + 1e-8
     ) {
@@ -491,7 +526,7 @@ export class PaperTrader implements OrderExecutor {
         },
       };
     }
-    const unlimitedV14 = opportunity.strategyMode === "ladder_v14";
+    const unlimitedV14 = ["ladder_v14", "ladder_v15"].includes(opportunity.strategyMode ?? "");
     const available = unlimitedV14 ? Number.MAX_SAFE_INTEGER : this.availableCash();
     if (!unlimitedV14 && reserveNeeded > available + 1e-8) {
       throw new Error(
@@ -618,6 +653,12 @@ export class PaperTrader implements OrderExecutor {
       return { dryRun: true, accepted: false, tokenId: opportunity.token.tokenId,
         side: "SELL", price: opportunity.price, size: opportunity.size,
         response: { paper: true, reason: "market_settled" } };
+    }
+    if (opportunity.strategyMode === "ladder_v15") {
+      const reason = validateOrderMinimum(opportunity)?.reason ?? v15OrderGuard(this.config,
+        this.getMarketExecutionSnapshot(opportunity.event.slug), opportunity, 0, true);
+      if (reason) return { dryRun: true, accepted: false, tokenId: opportunity.token.tokenId,
+        side: "SELL", price: opportunity.price, size: opportunity.size, response: { reason } };
     }
     if (opportunity.strategyMode === "ladder_v13") {
       const snapshot = this.getMarketExecutionSnapshot(opportunity.event.slug);
@@ -790,6 +831,11 @@ export class PaperTrader implements OrderExecutor {
     orderId: string,
     opportunity: TradeOpportunity,
   ): OrderResult {
+    if (opportunity.strategyMode === "ladder_v15") {
+      return { dryRun: true, accepted: false, tokenId: opportunity.token.tokenId,
+        side: "BUY", price: opportunity.price, size: opportunity.size,
+        response: { reason: "v15_requires_cancel_and_replan" } };
+    }
     const order = this.orderById.get(orderId);
     if (
       !order ||
@@ -885,7 +931,7 @@ export class PaperTrader implements OrderExecutor {
   }
 
   reportMarket(marketSlug: string): void {
-    if (this.config.strategyMode === "ladder_v14") return;
+    if (["ladder_v14", "ladder_v15"].includes(this.config.strategyMode)) return;
     const orders = this.ordersByMarket.get(marketSlug) ?? [];
     if (orders.length === 0) return;
     const fills = this.fillsByMarket.get(marketSlug) ?? [];
@@ -1143,7 +1189,7 @@ export class PaperTrader implements OrderExecutor {
         ...level,
       })),
     }));
-    const v14Paper = this.config.strategyMode === "ladder_v14";
+    const v14Paper = ["ladder_v14", "ladder_v15"].includes(this.config.strategyMode);
     const markedInventoryValue = positions.reduce((sum, position) => {
       const book = books.find((candidate) => candidate.tokenId === position.tokenId);
       return sum + position.shares * (book?.bestBid ?? 0);
@@ -1173,7 +1219,7 @@ export class PaperTrader implements OrderExecutor {
       grossCapitalDeployed: this.state.grossCapitalDeployed,
       theoreticalCash: this.state.theoreticalCash,
       markedInventoryValue: round(markedInventoryValue),
-      realizedPnl: round(realizedPnl),
+      realizedPnl: round(realizedPnl + (this.config.strategyMode === "ladder_v15" ? v15Inventory({ orders, fills }).reduce((sum, c) => sum + c.realizedPnl, 0) : 0)),
       unrealizedPnl: round(markedInventoryValue - remainingInventoryCost),
       totalFees: round(fills.reduce((sum, fill) => sum + fill.fee, 0)),
       estimatedMakerRebate: round(
@@ -1232,7 +1278,7 @@ export class PaperTrader implements OrderExecutor {
     };
     if (
       this.config.strategyMode === "ladder_v13" ||
-      this.config.strategyMode === "ladder_v14"
+      ["ladder_v14", "ladder_v15"].includes(this.config.strategyMode)
     ) await this.serializeExecution(ingest);
     else ingest();
     // Settlement is an awaited durability boundary, outside the RAM queue so
@@ -1383,7 +1429,7 @@ export class PaperTrader implements OrderExecutor {
         ? round(makerFeeEquivalent * feeConfig.rebateRate, 5)
         : 0;
     const cost = round(actualSize * price);
-    const unlimitedV14 = order.pairId?.startsWith("ladder-v14:") ?? false;
+    const unlimitedV14 = /^ladder-v1[45]:/.test(order.pairId ?? "");
     if (!unlimitedV14 && cost + fee > this.state.cash + 1e-8) return;
 
     const fill: PaperFill = {
@@ -1430,6 +1476,22 @@ export class PaperTrader implements OrderExecutor {
       );
     } else {
       this.state.cash = round(this.state.cash - cost - fee);
+    }
+    if (order.pairId?.startsWith("ladder-v15:")) {
+      const positions = this.positionsByMarket.get(order.marketSlug) ?? [];
+      const current = positions.find(p => p.tokenId === order.tokenId)!;
+      for (const other of positions) {
+        if (other === current) continue;
+        const paired = Math.min(current.shares, other.shares);
+        if (paired <= 0) continue;
+        current.totalCost = round(current.totalCost * (current.shares - paired) / current.shares);
+        other.totalCost = round(other.totalCost * (other.shares - paired) / other.shares);
+        current.shares = round(current.shares - paired);
+        other.shares = round(other.shares - paired);
+        this.state.v15ClosedPairPayouts ??= {};
+        this.state.v15ClosedPairPayouts[order.marketSlug] = round((this.state.v15ClosedPairPayouts[order.marketSlug] ?? 0) + paired);
+        this.state.theoreticalCash = round((this.state.theoreticalCash ?? this.state.startingBalance) + paired);
+      }
     }
     order.remainingSize = round(order.remainingSize - actualSize);
     order.status =
@@ -1504,7 +1566,7 @@ export class PaperTrader implements OrderExecutor {
     position.totalCost = round(
       Math.max(0, position.totalCost - averageCost * actualSize),
     );
-    if (order.pairId?.startsWith("ladder-v14:")) {
+    if (/^ladder-v1[45]:/.test(order.pairId ?? "")) {
       this.state.theoreticalCash = round(
         (this.state.theoreticalCash ?? this.state.startingBalance) + proceeds,
       );
@@ -1955,14 +2017,19 @@ export class PaperTrader implements OrderExecutor {
       realizedPnl: round(payout - totalCost - totalFees),
       settledAt: new Date().toISOString(),
     };
+    if (this.config.strategyMode === "ladder_v15") {
+      this.state.v15Cycles ??= [];
+      this.state.v15Cycles.push(...v15CycleReports({ orders: this.ordersByMarket.get(marketSlug) ?? [], fills: marketFills },
+        marketSlug, this.contexts.get(marketSlug)?.event.market.seriesTicker ?? marketSlug.split("-")[0]!, settlement));
+    }
     this.state.settlements.push(settlement);
     this.settlementsByMarket.set(marketSlug, settlement);
     const v14Market = (this.ordersByMarket.get(marketSlug) ?? []).some(
-      (order) => order.pairId?.startsWith("ladder-v14:"),
+      (order) => /^ladder-v1[45]:/.test(order.pairId ?? ""),
     );
     if (v14Market) {
       this.state.theoreticalCash = round(
-        (this.state.theoreticalCash ?? this.state.startingBalance) + payout,
+        (this.state.theoreticalCash ?? this.state.startingBalance) + payout - (this.state.v15ClosedPairPayouts?.[marketSlug] ?? 0),
       );
     } else {
       this.state.cash = round(this.state.cash + payout);
@@ -2036,6 +2103,8 @@ export class PaperTrader implements OrderExecutor {
       if (this.state.feeAccumulators) delete this.state.feeAccumulators[order.id];
     }
     for (const slug of settled) {
+      if (this.state.v15Markets) delete this.state.v15Markets[slug];
+      if (this.state.v15ClosedPairPayouts) delete this.state.v15ClosedPairPayouts[slug];
       this.ordersByMarket.delete(slug);
       this.fillsByMarket.delete(slug);
       this.positionsByMarket.delete(slug);
@@ -2071,6 +2140,15 @@ export class PaperTrader implements OrderExecutor {
         position.totalCost = round(position.totalCost + fill.price * fill.size);
       }
       positions.set(key, position);
+    }
+    if (this.config.strategyMode === "ladder_v15") {
+      for (const slug of new Set(fills.map(f => f.marketSlug))) {
+        const net = v15NetPositions(fills.filter(f => f.marketSlug === slug));
+        for (const [token, value] of net) {
+          const position = positions.get(slug + ":" + token)!;
+          position.shares = value.size; position.totalCost = round(value.cost);
+        }
+      }
     }
     return [...positions.values()];
   }

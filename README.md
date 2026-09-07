@@ -384,6 +384,20 @@ Implementation:
 - `src/ladder-v14-inventory.ts`
 - `.env.ladder-v14-paper.example`
 
+### `ladder_v15`
+
+Kalshi paper-only cheap-first cycles across **15–2 minutes before close**, with
+confirmed-fill completion, fee-safe maker/FOK hedges, bounded unmatched exposure,
+and value-based residual sales near close. Complementary positions close immediately
+in paper accounting and cannot be sold or paid out twice.
+
+Use `.env.ladder-v15-paper.example`. See [V15 execution and experiment guide](docs/ladder-v15.md)
+for configuration, timing buckets, historical reconciliation, and the shared-feed
+V9/V14/V15 comparison at 40, 160, and 640 contracts per V15 cycle.
+
+Commands: `npm run report:ladder-v15 -- <paper-directory>` and
+`npm run compare:ladder-v15 -- <new-output-directory>`.
+
 ## Paper trading engine
 
 `src/paper-trader.ts` is a full execution backend rather than a simple log-only mock.

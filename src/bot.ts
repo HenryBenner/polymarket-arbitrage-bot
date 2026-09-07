@@ -1,3 +1,5 @@
+import { planLadderV15 } from "./ladder-v15.js";
+import { v15Exposure } from "./ladder-v15-inventory.js";
 import type { BotConfig } from "./config.js";
 import {
   findLadderOpportunities,
@@ -66,6 +68,10 @@ export interface MarketSource {
 }
 
 export class ReverseBot {
+  private readonly ladderV15Events = new Map<string, UpDownEvent>();
+  private ladderV15Queue: Promise<void> | null = null;
+  private ladderV15WakePending = false;
+  private ladderV15Timer: NodeJS.Timeout | null = null;
   private readonly scanner: MarketSource;
   private readonly tracker = new TradeTracker();
   private readonly ladderTracker: LadderTracker;
@@ -121,6 +127,9 @@ export class ReverseBot {
     private readonly trader: OrderExecutor,
     scanner?: MarketSource,
   ) {
+    if (config.strategyMode === "ladder_v15" && (config.exchange !== "kalshi" || config.executionMode !== "paper")) {
+      throw new Error("ladder_v15 requires Kalshi paper execution");
+    }
     this.scanner = scanner ?? new MarketScanner(config);
     this.ladderV10Regime =
       config.strategyMode === "ladder_v10"
@@ -136,7 +145,7 @@ export class ReverseBot {
         : null;
     this.ladderTracker = new LadderTracker(
       config.paperStatePath,
-      config.strategyMode === "odahoa_ladder_2"
+      config.strategyMode === "ladder_v15" ? "ladder-v15-state.json" : config.strategyMode === "odahoa_ladder_2"
         ? `pair-lock-${config.executionMode}-ladder-state.json`
         : config.strategyMode === "ladder_v5"
           ? "ladder-v5-state.json"
@@ -163,7 +172,7 @@ export class ReverseBot {
                         : "ladder-state.json",
     );
     this.trader.setExecutionWakeHandler?.((marketSlug) =>
-      this.config.strategyMode === "ladder_v5.5"
+      this.config.strategyMode === "ladder_v15" ? this.enqueueLadderV15Global() : this.config.strategyMode === "ladder_v5.5"
         ? this.enqueueLadderV55Market(marketSlug)
         : this.config.strategyMode === "ladder_v6"
           ? this.enqueueLadderV6Market(marketSlug)
@@ -283,7 +292,7 @@ export class ReverseBot {
     if (this.stopped) return;
     log("Reverse bot starting", {
       exchange: this.config.exchange,
-      strategy:
+      strategy: this.config.strategyMode === "ladder_v15" ? "15-2 minute cheap-first confirmed-fill cycles" :
         this.config.strategyMode === "reverse"
           ? "buy cheap reversal tokens on 15m BTC/ETH markets"
           : this.config.strategyMode === "odahoa_ladder"
@@ -328,7 +337,7 @@ export class ReverseBot {
       ladderMaxUsdcPerMarket:
         this.config.strategyMode === "reverse" ||
         this.config.strategyMode === "odahoa_static_maker" ||
-        this.config.strategyMode === "ladder_v14"
+        this.config.strategyMode === "ladder_v14" || this.config.strategyMode === "ladder_v15"
           ? undefined
           : this.config.ladderMaxUsdcPerMarket,
       kalshiFeeOverrides:
@@ -503,6 +512,7 @@ export class ReverseBot {
     this.stopped = true;
     if (this.scanTimer) clearInterval(this.scanTimer);
     if (this.ladderV10SampleTimer) clearInterval(this.ladderV10SampleTimer);
+    if (this.ladderV15Timer) clearTimeout(this.ladderV15Timer);
     if (this.ladderV14RepairTimer) clearTimeout(this.ladderV14RepairTimer);
     this.ladderV14WakePending = false;
     this.trader.setExecutionWakeHandler?.(() => {});
@@ -512,7 +522,7 @@ export class ReverseBot {
       ...this.ladderV7Queues.values(), ...this.ladderV8Queues.values(),
       ...this.ladderV9Queues.values(), ...this.ladderV10Queues.values(),
       ...this.ladderV11Queues.values(), ...this.ladderV12Queues.values(),
-      ...this.ladderV13Queues.values(), this.ladderV14Queue,
+      ...this.ladderV13Queues.values(), this.ladderV14Queue, this.ladderV15Queue,
     ]);
     const results = await Promise.allSettled([
       this.trader.close?.(), this.ladderV10Regime?.close(),
@@ -702,6 +712,11 @@ export class ReverseBot {
       await this.enqueueLadderV13Market(event.slug);
       return;
     }
+    if (this.config.strategyMode === "ladder_v15") {
+      this.ladderV15Events.set(event.slug, event);
+      await this.enqueueLadderV15Global();
+      return;
+    }
     if (this.config.strategyMode === "ladder_v14") {
       this.ladderV14Events.set(event.slug, event);
       await this.enqueueLadderV14Global();
@@ -796,7 +811,7 @@ export class ReverseBot {
       this.config.strategyMode === "ladder_v11" ||
       this.config.strategyMode === "ladder_v12" ||
       this.config.strategyMode === "ladder_v13" ||
-      this.config.strategyMode === "ladder_v14"
+      ["ladder_v14", "ladder_v15"].includes(this.config.strategyMode)
     ) {
       await this.markOpportunity(opportunity.tradeKey);
     } else {
@@ -821,7 +836,7 @@ export class ReverseBot {
   private async markOpportunity(tradeKey: string): Promise<void> {
     // V14 plans from the executor's RAM orders/fills and already deduplicates
     // there. Its paper checkpoint/log are the durable execution history.
-    if (this.config.executionMode === "paper" && this.config.strategyMode === "ladder_v14") return;
+    if (this.config.executionMode === "paper" && ["ladder_v14", "ladder_v15"].includes(this.config.strategyMode)) return;
     await this.ladderTracker.mark(tradeKey);
   }
 
@@ -1617,10 +1632,57 @@ export class ReverseBot {
     return accepted;
   }
 
-  /**
-   * V14 has one global acknowledgement-driven queue. That makes live cash a
-   * portfolio resource instead of letting each market independently reserve it.
-   */
+  /** Serialize V15 reservations and reconcile after each acknowledged mutation. */
+  private enqueueLadderV15Global(): Promise<void> {
+    if (this.stopped || this.config.strategyMode !== "ladder_v15") return Promise.resolve();
+    this.ladderV15WakePending = true;
+    if (this.ladderV15Queue) return this.ladderV15Queue;
+    const queue = (async () => {
+      while (!this.stopped && this.ladderV15WakePending) {
+        this.ladderV15WakePending = false;
+        if (await this.processLadderV15Once()) this.ladderV15WakePending = true;
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+    })();
+    this.ladderV15Queue = queue;
+    const done = () => { if (this.ladderV15Queue === queue) this.ladderV15Queue = null; };
+    void queue.then(done, done);
+    return queue;
+  }
+
+  private async processLadderV15Once(): Promise<boolean> {
+    const entries = [...this.ladderV15Events.values()].map(event => ({ event,
+      snapshot: this.trader.getMarketExecutionSnapshot?.(event.slug) })).filter(item => item.snapshot != null);
+    const exposure = entries.reduce((sum, item) => sum + (item.snapshot!.settledPnl === null ? v15Exposure(item.snapshot!) : 0), 0);
+    const planned = entries.map(item => ({ ...item,
+      plan: planLadderV15(this.config, item.event, item.snapshot!, exposure) }));
+    if (this.ladderV15Timer) clearTimeout(this.ladderV15Timer);
+    this.ladderV15Timer = null;
+    const deadlines = planned.flatMap(item => item.plan.nextWakeAtMs === undefined ? [] : [item.plan.nextWakeAtMs]);
+    if (deadlines.length) {
+      this.ladderV15Timer = setTimeout(() => {
+        this.ladderV15Timer = null;
+        void this.enqueueLadderV15Global().catch(error => log("V15 deadline processing failed", { error: String(error) }));
+      }, Math.max(1, Math.ceil(Math.min(...deadlines) - Date.now())));
+      this.ladderV15Timer.unref();
+    }
+    const cancellation = planned.find(item => item.plan.cancelOrderIds.length);
+    if (cancellation) {
+      if (!this.trader.cancelOrders) throw new Error("V15 requires cancellation support");
+      await this.trader.cancelOrders(cancellation.plan.cancelOrderIds);
+      return true;
+    }
+    // Reductions precede openings; replan the entire portfolio after every acknowledgement.
+    const selected = planned.find(item => item.plan.flattenOpportunities.length ||
+      item.plan.opportunities.some(order => order.capitalEffect === "reduce")) ??
+      planned.find(item => item.plan.opportunities.length);
+    if (!selected) return false;
+    const sale = selected.plan.flattenOpportunities[0];
+    const order = sale ?? selected.plan.opportunities[0]!;
+    return sale ? this.executeSellOpportunity(order) : this.executeOpportunity(order);
+  }
+
+  /** V14's allocator serializes live cash reservations across markets. */
   private enqueueLadderV14Global(): Promise<void> {
     if (this.stopped || this.config.strategyMode !== "ladder_v14") return Promise.resolve();
     this.ladderV14WakePending = true;
@@ -2346,6 +2408,9 @@ export class ReverseBot {
     prune(this.ladderV12Events);
     prune(this.ladderV13Events);
     prune(this.ladderV14Events);
+    for (const [slug, event] of this.ladderV15Events) {
+      if (event.windowEnd <= now && !this.trader.getMarketExecutionSnapshot?.(slug)) this.ladderV15Events.delete(slug);
+    }
     for (const [slug, context] of this.ladderV6Events) {
       if (context.event.windowEnd <= now) this.ladderV6Events.delete(slug);
     }

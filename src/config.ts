@@ -189,6 +189,18 @@ export interface BotConfig {
   ladderV14VolumeFirstMode: boolean;
   ladderV14CycleShares: number;
   ladderV14VolumeFirstPairCost: number;
+  ladderV15EntryMinutesMax: number;
+  ladderV15EntryMinutesMin: number;
+  ladderV15CheapPrice: number;
+  ladderV15FavoritePrice: number;
+  ladderV15MinNetEdge: number;
+  ladderV15CycleShares: number;
+  ladderV15MaxUnmatchedPerMarket: number;
+  ladderV15MaxUnmatchedPortfolio: number;
+  ladderV15RetryLimit: number;
+  ladderV15RetryCooldownMs: number;
+  ladderV15CleanupSeconds: number;
+  ladderV15EmergencyPairCost: number;
   paperStartingUsdc: number;
   paperStatePath: string;
 }
@@ -226,10 +238,11 @@ export function loadConfig(): BotConfig {
     strategyRaw !== "ladder_v11" &&
     strategyRaw !== "ladder_v12" &&
     strategyRaw !== "ladder_v13" &&
-    strategyRaw !== "ladder_v14"
+    strategyRaw !== "ladder_v14" &&
+    strategyRaw !== "ladder_v15"
   ) {
     throw new Error(
-      "STRATEGY_MODE must be reverse, odahoa_ladder, odahoa_ladder_2, odahoa_static_maker, ladder_v5, ladder_v5.5, ladder_v6, ladder_v7, ladder_v8, ladder_v9, ladder_v10, ladder_v11, ladder_v12, ladder_v13, or ladder_v14",
+      "STRATEGY_MODE must be reverse, odahoa_ladder, odahoa_ladder_2, odahoa_static_maker, ladder_v5, ladder_v5.5, ladder_v6, ladder_v7, ladder_v8, ladder_v9, ladder_v10, ladder_v11, ladder_v12, ladder_v13, ladder_v14, or ladder_v15",
     );
   }
 
@@ -291,7 +304,8 @@ export function loadConfig(): BotConfig {
     ),
     kalshiApiKeyId: process.env.KALSHI_API_KEY_ID,
     kalshiPrivateKeyPem: process.env.KALSHI_PRIVATE_KEY,
-    kalshiSeriesTickers: kalshiSeriesFromEnv(),
+    kalshiSeriesTickers: strategyRaw === "ladder_v15" && !process.env.CRYPTO_MARKETS && !process.env.KALSHI_SERIES_TICKERS
+      ? ["KXBTC15M", "KXETH15M", "KXSOL15M"] : kalshiSeriesFromEnv(),
     kalshiSubaccount: envNumber("KALSHI_SUBACCOUNT", 0),
     kalshiTakerFeeRate: envNumber("KALSHI_TAKER_FEE_RATE", 0.07),
     kalshiMakerFeeRate: envNumber("KALSHI_MAKER_FEE_RATE", 0),
@@ -433,12 +447,47 @@ export function loadConfig(): BotConfig {
       "LADDER_V14_VOLUME_FIRST_PAIR_COST",
       0.99,
     ),
+    ladderV15EntryMinutesMax: envNumber("LADDER_V15_ENTRY_MINUTES_MAX", 15),
+    ladderV15EntryMinutesMin: envNumber("LADDER_V15_ENTRY_MINUTES_MIN", 2),
+    ladderV15CheapPrice: envNumber("LADDER_V15_CHEAP_PRICE", 0.1),
+    ladderV15FavoritePrice: envNumber("LADDER_V15_FAVORITE_PRICE", 0.8),
+    ladderV15MinNetEdge: envNumber("LADDER_V15_MIN_NET_EDGE", 0.03),
+    ladderV15CycleShares: envNumber("LADDER_V15_CYCLE_SHARES", 40),
+    ladderV15MaxUnmatchedPerMarket: envNumber("LADDER_V15_MAX_UNMATCHED_PER_MARKET", 40),
+    ladderV15MaxUnmatchedPortfolio: envNumber("LADDER_V15_MAX_UNMATCHED_PORTFOLIO", 120),
+    ladderV15RetryLimit: envNumber("LADDER_V15_RETRY_LIMIT", 4),
+    ladderV15RetryCooldownMs: envNumber("LADDER_V15_RETRY_COOLDOWN_MS", 350),
+    ladderV15CleanupSeconds: envNumber("LADDER_V15_CLEANUP_SECONDS", 30),
+    ladderV15EmergencyPairCost: envNumber("LADDER_V15_EMERGENCY_PAIR_COST", 1.02),
     paperStartingUsdc: envNumber("PAPER_STARTING_USDC", 100),
-    paperStatePath: envString("PAPER_STATE_PATH", "./data/paper"),
+    paperStatePath: envString("PAPER_STATE_PATH", strategyRaw === "ladder_v15" ? "./data/paper-ladder-v15" : "./data/paper"),
   };
 }
 
 export function validateTradingConfig(config: BotConfig): void {
+  if (config.strategyMode === "ladder_v15") {
+    if (config.exchange !== "kalshi" || config.executionMode !== "paper") {
+      throw new Error("ladder_v15 requires Kalshi paper execution");
+    }
+    const positive = [config.ladderV15EntryMinutesMax, config.ladderV15EntryMinutesMin,
+      config.ladderV15CheapPrice, config.ladderV15FavoritePrice, config.ladderV15MinNetEdge,
+      config.ladderV15CycleShares, config.ladderV15MaxUnmatchedPerMarket,
+      config.ladderV15MaxUnmatchedPortfolio, config.ladderV15RetryLimit,
+      config.ladderV15RetryCooldownMs, config.ladderV15CleanupSeconds, config.ladderV15EmergencyPairCost];
+    if (positive.some(value => !Number.isFinite(value) || value <= 0) ||
+      config.ladderV15EntryMinutesMax > 15 ||
+      config.ladderV15EntryMinutesMin >= config.ladderV15EntryMinutesMax ||
+      config.ladderV15CleanupSeconds >= config.ladderV15EntryMinutesMin * 60 ||
+      config.ladderV15CheapPrice >= 0.5 || config.ladderV15FavoritePrice >= 1 ||
+      config.ladderV15MinNetEdge >= 1 || config.ladderV15EmergencyPairCost < 1 ||
+      config.ladderV15EmergencyPairCost > 2 || !Number.isInteger(config.ladderV15RetryLimit) ||
+      config.ladderV15CycleShares > config.ladderV15MaxUnmatchedPerMarket ||
+      config.ladderV15MaxUnmatchedPerMarket > config.ladderV15MaxUnmatchedPortfolio ||
+      config.minutesBeforeCloseMin !== 0 || config.minutesBeforeCloseMax < 15) {
+      throw new Error("Invalid LADDER_V15 settings: require finite positive limits, ordered entry/cleanup windows and full 15-minute discovery");
+    }
+  }
+
   if (config.exchange !== "polymarket" && config.exchange !== "kalshi") {
     throw new Error("EXCHANGE must be polymarket or kalshi");
   }

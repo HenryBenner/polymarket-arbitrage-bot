@@ -12,7 +12,10 @@
     "report:ladder-v10": "tsx src/ladder-v10-report.ts",
     "report:ladder-v11": "tsx src/ladder-v11-report.ts",
     "audit": "npm audit --audit-level=high",
-    "check": "npm run build && npm test && npm run audit"
+    "check": "npm run build && npm test && npm run audit",
+    "report:ladder-v15": "tsx src/ladder-v15-report.ts",
+    "compare:ladder-v15": "tsx src/ladder-v15-comparison.ts",
+    "analyze:ladder-v15-history": "node scripts/analyze-v15-history.mjs"
   },
   "dependencies": {
     "@polymarket/clob-client-v2": "1.0.8",

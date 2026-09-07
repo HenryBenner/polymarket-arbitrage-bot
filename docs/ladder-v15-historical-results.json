@@ -1,0 +1,340 @@
+{
+  "v9": {
+    "directory": "C:/Users/benne/Downloads/ladder-v9-logs/paper-ladder-v9-eth-btc",
+    "logFiles": [
+      "paper-events.jsonl"
+    ],
+    "logIssues": [],
+    "markets": 284,
+    "netPnl": -208.98879,
+    "fees": 63.68137,
+    "reconciledMarkets": 263,
+    "missingOrUnreconciledMarkets": 21,
+    "fillCounts": {
+      "BUY": 572,
+      "SELL": 46
+    },
+    "reconciledAttribution": {
+      "pairedPnl": 395.91787,
+      "salePnl": -142.55165544,
+      "directionalPnl": -462.35500456
+    },
+    "largestWins": [
+      {
+        "market": "btc-updown-15m-1786019400",
+        "ledgerPnl": 36.41938,
+        "reconciled": true,
+        "attribution": {
+          "pairedPnl": 36.41938,
+          "salePnl": 0,
+          "directionalPnl": 0,
+          "pairedShares": 40,
+          "netPnl": 36.41938
+        }
+      },
+      {
+        "market": "btc-updown-15m-1786007700",
+        "ledgerPnl": 34.33187,
+        "reconciled": true,
+        "attribution": {
+          "pairedPnl": 34.33187,
+          "salePnl": 0,
+          "directionalPnl": 0,
+          "pairedShares": 39.99999999999999,
+          "netPnl": 34.33187
+        }
+      },
+      {
+        "market": "btc-updown-15m-1786061700",
+        "ledgerPnl": 28.80492,
+        "reconciled": true,
+        "attribution": {
+          "pairedPnl": 28.80492,
+          "salePnl": 0,
+          "directionalPnl": 0,
+          "pairedShares": 40,
+          "netPnl": 28.80492
+        }
+      },
+      {
+        "market": "eth-updown-15m-1786086900",
+        "ledgerPnl": 8.70251,
+        "reconciled": true,
+        "attribution": {
+          "pairedPnl": 8.70251,
+          "salePnl": 0,
+          "directionalPnl": 0,
+          "pairedShares": 20,
+          "netPnl": 8.70251
+        }
+      },
+      {
+        "market": "eth-updown-15m-1786040100",
+        "ledgerPnl": 8.58092,
+        "reconciled": true,
+        "attribution": {
+          "pairedPnl": 8.58092,
+          "salePnl": 0,
+          "directionalPnl": 0,
+          "pairedShares": 40,
+          "netPnl": 8.58092
+        }
+      }
+    ],
+    "largestLosses": [
+      {
+        "market": "eth-updown-15m-1786082400",
+        "ledgerPnl": -15.06936,
+        "reconciled": true,
+        "attribution": {
+          "pairedPnl": 0,
+          "salePnl": 0,
+          "directionalPnl": -15.06936,
+          "pairedShares": 0,
+          "netPnl": -15.06936
+        }
+      },
+      {
+        "market": "btc-updown-15m-1786069800",
+        "ledgerPnl": -14.87594,
+        "reconciled": true,
+        "attribution": {
+          "pairedPnl": 0,
+          "salePnl": 0,
+          "directionalPnl": -14.87594,
+          "pairedShares": 0,
+          "netPnl": -14.87594
+        }
+      },
+      {
+        "market": "eth-updown-15m-1786085100",
+        "ledgerPnl": -14.68224,
+        "reconciled": true,
+        "attribution": {
+          "pairedPnl": 0,
+          "salePnl": 0,
+          "directionalPnl": -14.68224,
+          "pairedShares": 0,
+          "netPnl": -14.68224
+        }
+      },
+      {
+        "market": "btc-updown-15m-1786070700",
+        "ledgerPnl": -14.294,
+        "reconciled": true,
+        "attribution": {
+          "pairedPnl": 0,
+          "salePnl": 0,
+          "directionalPnl": -14.294,
+          "pairedShares": 0,
+          "netPnl": -14.294
+        }
+      },
+      {
+        "market": "btc-updown-15m-1785981600",
+        "ledgerPnl": -13.70954,
+        "reconciled": true,
+        "attribution": {
+          "pairedPnl": 0,
+          "salePnl": 0,
+          "directionalPnl": -13.70954,
+          "pairedShares": 0,
+          "netPnl": -13.70954
+        }
+      }
+    ]
+  },
+  "v14": {
+    "directory": "C:/Users/benne/Downloads/paper-ladder-v14-btc-eth/paper-ladder-v14-btc-eth",
+    "logFiles": [
+      "paper-events.jsonl",
+      "paper-events.jsonl.1",
+      "paper-events.jsonl.10.gz",
+      "paper-events.jsonl.2.gz",
+      "paper-events.jsonl.3.gz",
+      "paper-events.jsonl.4.gz",
+      "paper-events.jsonl.5.gz",
+      "paper-events.jsonl.6.gz",
+      "paper-events.jsonl.7.gz",
+      "paper-events.jsonl.8.gz",
+      "paper-events.jsonl.9.gz"
+    ],
+    "logIssues": [
+      "paper-events.jsonl.10.gz: unreadable/invalid archive skipped",
+      "paper-events.jsonl.5.gz: unreadable/invalid archive skipped",
+      "paper-events.jsonl.6.gz: unreadable/invalid archive skipped",
+      "paper-events.jsonl.7.gz: unreadable/invalid archive skipped",
+      "paper-events.jsonl.8.gz: unreadable/invalid archive skipped",
+      "paper-events.jsonl.9.gz: unreadable/invalid archive skipped"
+    ],
+    "markets": 753,
+    "netPnl": -511.7,
+    "fees": 271.303,
+    "reconciledMarkets": 708,
+    "missingOrUnreconciledMarkets": 45,
+    "fillCounts": {
+      "BUY": 5040,
+      "SELL": 0
+    },
+    "reconciledAttribution": {
+      "pairedPnl": 329.8,
+      "salePnl": 0,
+      "directionalPnl": -840.01
+    },
+    "largestWins": [
+      {
+        "market": "btc-updown-15m-1788693300",
+        "ledgerPnl": 14.16,
+        "reconciled": true,
+        "attribution": {
+          "pairedPnl": 14.16,
+          "salePnl": 0,
+          "directionalPnl": 0,
+          "pairedShares": 80,
+          "netPnl": 14.16
+        }
+      },
+      {
+        "market": "btc-updown-15m-1788523200",
+        "ledgerPnl": 12.55,
+        "reconciled": true,
+        "attribution": {
+          "pairedPnl": 12.55,
+          "salePnl": 0,
+          "directionalPnl": 0,
+          "pairedShares": 100,
+          "netPnl": 12.55
+        }
+      },
+      {
+        "market": "btc-updown-15m-1788603300",
+        "ledgerPnl": 12.17,
+        "reconciled": true,
+        "attribution": {
+          "pairedPnl": 12.17,
+          "salePnl": 0,
+          "directionalPnl": 0,
+          "pairedShares": 90,
+          "netPnl": 12.17
+        }
+      },
+      {
+        "market": "btc-updown-15m-1788543900",
+        "ledgerPnl": 11.1,
+        "reconciled": true,
+        "attribution": {
+          "pairedPnl": 11.1,
+          "salePnl": 0,
+          "directionalPnl": 0,
+          "pairedShares": 90,
+          "netPnl": 11.1
+        }
+      },
+      {
+        "market": "eth-updown-15m-1788460200",
+        "ledgerPnl": 11.03,
+        "reconciled": true,
+        "attribution": {
+          "pairedPnl": 11.03,
+          "salePnl": 0,
+          "directionalPnl": 0,
+          "pairedShares": 243.96999999999997,
+          "netPnl": 11.03
+        }
+      }
+    ],
+    "largestLosses": [
+      {
+        "market": "eth-updown-15m-1788458400",
+        "ledgerPnl": -20,
+        "reconciled": true,
+        "attribution": {
+          "pairedPnl": 0,
+          "salePnl": 0,
+          "directionalPnl": -20,
+          "pairedShares": 0,
+          "netPnl": -20
+        }
+      },
+      {
+        "market": "btc-updown-15m-1788455700",
+        "ledgerPnl": -16.35,
+        "reconciled": true,
+        "attribution": {
+          "pairedPnl": 5.65,
+          "salePnl": 0,
+          "directionalPnl": -22,
+          "pairedShares": 165.06,
+          "netPnl": -16.35
+        }
+      },
+      {
+        "market": "btc-updown-15m-1788457500",
+        "ledgerPnl": -14.66,
+        "reconciled": true,
+        "attribution": {
+          "pairedPnl": 0.94,
+          "salePnl": 0,
+          "directionalPnl": -15.6,
+          "pairedShares": 67.66,
+          "netPnl": -14.66
+        }
+      },
+      {
+        "market": "btc-updown-15m-1788458400",
+        "ledgerPnl": -12,
+        "reconciled": true,
+        "attribution": {
+          "pairedPnl": 1.2,
+          "salePnl": 0,
+          "directionalPnl": -13.2,
+          "pairedShares": 80,
+          "netPnl": -12
+        }
+      },
+      {
+        "market": "btc-updown-15m-1788456600",
+        "ledgerPnl": -10.8,
+        "reconciled": true,
+        "attribution": {
+          "pairedPnl": 0.8,
+          "salePnl": 0,
+          "directionalPnl": -11.6,
+          "pairedShares": 80,
+          "netPnl": -10.8
+        }
+      }
+    ]
+  },
+  "wallet": {
+    "path": "C:/Users/benne/Downloads/odahoa-full-audit/btc-15m-activity.json",
+    "rawRecords": 1900,
+    "deduplicatedRecords": 1900,
+    "observedMarkets": 204,
+    "marketsBuyingBothSides": 99,
+    "flowsByTypeAndSide": [
+      {
+        "group": "TRADE/BUY",
+        "count": 1753,
+        "notional": 13612.632158
+      },
+      {
+        "group": "REDEEM/",
+        "count": 145,
+        "notional": 12093.589404
+      },
+      {
+        "group": "TAKER_REBATE/",
+        "count": 1,
+        "notional": 443.8965
+      },
+      {
+        "group": "MAKER_REBATE/",
+        "count": 1,
+        "notional": 111.6921
+      }
+    ],
+    "profitability": "Not established: observed flow can omit starting inventory, fees and other activity. Rebates/redemptions are not inferred trade profits."
+  },
+  "limitations": "Only reconciled fill histories receive attribution. This is historical diagnosis, not a counterfactual backtest. Volume scaling is not assumed to preserve fills or profitability."
+}

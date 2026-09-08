@@ -182,6 +182,10 @@ export interface BotConfig {
   ladderV14VolatilityWindowSeconds: number;
   ladderV14FinalCleanupSeconds: number;
   ladderV14RepairMaxWaitSeconds: number;
+  ladderV14RepairPreserveSeconds: number;
+  ladderV14LiquiditySizing: boolean;
+  ladderV14ValueRepair: boolean;
+  ladderV14RepairExitMargin: number;
   ladderV14QuoteLifetimeSeconds: number;
   ladderV14PseudoFlowDepthFraction: number;
   ladderV14QuantityQueueWeight: number;
@@ -417,8 +421,12 @@ export function loadConfig(): BotConfig {
     ),
     ladderV14RepairMaxWaitSeconds: envNumber(
       "LADDER_V14_REPAIR_MAX_WAIT_SECONDS",
-      240,
+      60,
     ),
+    ladderV14RepairPreserveSeconds: envNumber("LADDER_V14_REPAIR_PRESERVE_SECONDS", 15),
+    ladderV14LiquiditySizing: envBoolean("LADDER_V14_LIQUIDITY_SIZING", true),
+    ladderV14ValueRepair: envBoolean("LADDER_V14_VALUE_REPAIR", true),
+    ladderV14RepairExitMargin: envNumber("LADDER_V14_REPAIR_EXIT_MARGIN", 0.005),
     ladderV14QuoteLifetimeSeconds: envNumber(
       "LADDER_V14_QUOTE_LIFETIME_SECONDS",
       5,
@@ -445,7 +453,7 @@ export function loadConfig(): BotConfig {
     ),
     ladderV14VolumeFirstPairCost: envNumber(
       "LADDER_V14_VOLUME_FIRST_PAIR_COST",
-      0.99,
+      0.98,
     ),
     ladderV15EntryMinutesMax: envNumber("LADDER_V15_ENTRY_MINUTES_MAX", 15),
     ladderV15EntryMinutesMin: envNumber("LADDER_V15_ENTRY_MINUTES_MIN", 2),
@@ -940,6 +948,11 @@ export function validateTradingConfig(config: BotConfig): void {
     config.ladderV14FinalCleanupSeconds < 0 ||
     !Number.isFinite(config.ladderV14RepairMaxWaitSeconds) ||
     config.ladderV14RepairMaxWaitSeconds <= 0 ||
+    !Number.isFinite(config.ladderV14RepairPreserveSeconds) ||
+    config.ladderV14RepairPreserveSeconds < 0 ||
+    config.ladderV14RepairPreserveSeconds >= config.ladderV14RepairMaxWaitSeconds ||
+    !Number.isFinite(config.ladderV14RepairExitMargin) ||
+    config.ladderV14RepairExitMargin < 0 || config.ladderV14RepairExitMargin >= 1 ||
     !Number.isFinite(config.ladderV14QuoteLifetimeSeconds) ||
     config.ladderV14QuoteLifetimeSeconds <= 0 ||
     !Number.isFinite(config.ladderV14PseudoFlowDepthFraction) ||

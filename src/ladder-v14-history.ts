@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { v14LifecycleReport, type V14LifecycleReport } from "./ladder-v14-report.js";
 import type { BotConfig } from "./config.js";
 import {
   LadderV14ConditionalModel,
@@ -57,6 +58,7 @@ interface HistoryState {
   active: Array<[string, Exposure]>;
   observedOrderIds: string[];
   observedFillIds: string[];
+  lifecycleReports?: V14LifecycleReport[];
 }
 
 function eventTimeMs(event: Record<string, unknown>): number | null {
@@ -112,6 +114,7 @@ export class LadderV14HistoryStore {
   private persistenceTimer: NodeJS.Timeout | null = null;
   private dirty = false;
   private writing = false;
+  private readonly lifecycleReports: Map<string, V14LifecycleReport>;
 
   private constructor(
     path: string,
@@ -136,6 +139,7 @@ export class LadderV14HistoryStore {
     this.active = new Map(state?.active ?? []);
     this.observedOrderIds = new Set(state?.observedOrderIds ?? []);
     this.observedFillIds = new Set(state?.observedFillIds ?? []);
+    this.lifecycleReports = new Map((state?.lifecycleReports ?? []).map(row => [row.marketSlug, row]));
     // Old versions leaked every rejected/amended placement after settlement.
     // Remove expired quote contexts on load, but preserve learned statistics.
     for (const key of this.planned.keys()) {
@@ -389,6 +393,11 @@ export class LadderV14HistoryStore {
   }
 
   finalize(snapshot: MarketExecutionSnapshot, nowMs = Date.now()): void {
+    if (!this.lifecycleReports.has(snapshot.marketSlug)) {
+      const match = /-updown-(\d+)m-(\d+)$/.exec(snapshot.marketSlug);
+      const endMs = match ? (Number(match[2]) + Number(match[1]) * 60) * 1000 : nowMs;
+      this.lifecycleReports.set(snapshot.marketSlug, v14LifecycleReport(snapshot, Math.min(nowMs, endMs)));
+    }
     // Include final fills before censoring exposures at settlement.
     this.observeOrders(snapshot, nowMs);
     for (const order of snapshot.orders) {
@@ -447,6 +456,7 @@ export class LadderV14HistoryStore {
       active: [...this.active],
       observedOrderIds: [...this.observedOrderIds],
       observedFillIds: [...this.observedFillIds],
+      lifecycleReports: [...this.lifecycleReports.values()],
     };
     const operation = async (): Promise<void> => {
       await mkdir(dirname(this.path), { recursive: true });

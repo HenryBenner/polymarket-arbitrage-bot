@@ -461,19 +461,23 @@ export class ReverseBot {
               capitalConstraint: this.config.executionMode === "live",
               volumeFirstMode: this.config.ladderV14VolumeFirstMode,
               quotePolicy: this.config.ladderV14VolumeFirstMode
-                ? "one_small_pair_cycle_without_ev_gate"
+                ? "one_aggregate_pair_without_ev_gate"
                 : "positive_conditional_marginal_ev",
               quantityPolicy: this.config.ladderV14VolumeFirstMode
                 ? {
                     cycleShares: this.config.ladderV14CycleShares,
+                    liquiditySizing: this.config.ladderV14LiquiditySizing,
                     pairCost: this.config.ladderV14VolumeFirstPairCost,
                   }
                 : "all_economic_breakpoints_with_sweep_conditioning",
               residualPolicy: this.config.ladderV14VolumeFirstMode
-                ? "profit_safe_repair_then_economic_deadline_exit"
+                ? this.config.ladderV14ValueRepair ? "value_based_repair_with_time_urgency"
+                  : "profit_safe_repair_then_economic_deadline_exit"
                 : "marginal_max_of_hedge_sell_wait",
               finalCleanupSeconds: this.config.ladderV14FinalCleanupSeconds,
               repairMaxWaitSeconds: this.config.ladderV14RepairMaxWaitSeconds,
+              repairPreserveSeconds: this.config.ladderV14RepairPreserveSeconds,
+              repairExitMargin: this.config.ladderV14RepairExitMargin,
               series: this.config.kalshiSeriesTickers,
             }
           : undefined,

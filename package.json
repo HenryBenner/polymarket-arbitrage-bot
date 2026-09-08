@@ -11,6 +11,7 @@
     "compare:strategies": "tsx src/strategy-comparison.ts",
     "report:ladder-v10": "tsx src/ladder-v10-report.ts",
     "report:ladder-v11": "tsx src/ladder-v11-report.ts",
+    "report:ladder-v14": "tsx src/ladder-v14-report.ts",
     "audit": "npm audit --audit-level=high",
     "check": "npm run build && npm test && npm run audit",
     "report:ladder-v15": "tsx src/ladder-v15-report.ts",

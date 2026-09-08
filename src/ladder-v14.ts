@@ -270,6 +270,7 @@ function quantityBreakpoints(
   const physicalHorizon = grossReachable <= EPSILON
     ? 0
     : grossReachable / (1 + queueBurden / grossReachable);
+  if (!Number.isFinite(physicalHorizon)) return [];
   if (physicalHorizon + EPSILON < minimum) return [];
   const result = new Set<number>([round(minimum, 2)]);
   for (const value of bookBreakpoints) {
@@ -463,6 +464,37 @@ function selectVolumeFirstTargets(
     config.ladderV14VolumeFirstPairCost,
   );
   if (!prices) return { selected, bestEvaluated };
+  if (config.ladderV14LiquiditySizing) {
+    const reachable = books.map((book, index) => quantityBreakpoints(
+      config, event, book, books[1 - index]!, prices[index]!, 0,
+      secondsRemaining, tick, features,
+    ).at(-1) ?? 0);
+    const depth = (levels: TokenBook["bids"]) => levels.reduce((sum, level) =>
+      sum + (Number.isFinite(level.size) && level.size > 0 &&
+        level.price > 0 && level.price < 1 ? level.size : 0), 0);
+    // Each potential first leg needs a reachable complement and an executable
+    // exit. Cash and statistical probability floors never increase this size.
+    quantity = Math.floor(Math.min(...reachable, ...books.map(book =>
+      Math.max(depth(book.bids), depth(books.find(other => other !== book)!.asks))
+    )) * 100) / 100;
+    const resting = snapshot.openOrders.filter(isV14Order);
+    if (resting.length) {
+      // Finish the existing aggregate quantity; acknowledgments and equal
+      // partial fills must not keep enlarging the order and losing queue.
+      quantity = Math.min(quantity, ...resting.map(order => order.remainingSize));
+    }
+    if (!Number.isFinite(quantity) || quantity <= EPSILON ||
+      books.some(book => quantity + EPSILON < book.minOrderSize)) {
+      return { selected, bestEvaluated };
+    }
+    const fees = prices.reduce((sum, price) => sum + exactKalshiOrderFee({
+      price, size: quantity, rate: snapshot.makerFeeRate ?? config.kalshiMakerFeeRate,
+      exponent: snapshot.takerFeeExponent,
+    }), 0);
+    if (prices[0] + prices[1] + fees / quantity >= 1 - EPSILON) {
+      return { selected, bestEvaluated };
+    }
+  }
   for (let sideIndex = 0; sideIndex < 2; sideIndex += 1) {
     const book = books[sideIndex]!;
     const opposite = books[1 - sideIndex]!;
@@ -865,8 +897,21 @@ function planVolumeFirstRepair(
   const episodeStartedAtMs = Date.parse(episode.residualStartedAt);
   const maxRepairWaitAtMs = episodeStartedAtMs +
     config.ladderV14RepairMaxWaitSeconds * 1_000;
-  const deadline = Math.min(finalCleanupAtMs, maxRepairWaitAtMs);
+  const deadline = config.ladderV14ValueRepair ? finalCleanupAtMs
+    : Math.min(finalCleanupAtMs, maxRepairWaitAtMs);
   const waiting = nowSeconds * 1_000 < deadline;
+  const preserveSeconds = config.ladderV14RepairPreserveSeconds;
+  const age = episode.residualAgeSeconds;
+  const normalEdge = 1 - config.ladderV14VolumeFirstPairCost;
+  const positiveEdge = preserveSeconds <= 0 ? 0 : normalEdge * Math.max(0,
+    1 - Math.max(0, age - preserveSeconds) /
+      (config.ladderV14RepairMaxWaitSeconds - preserveSeconds));
+  const requiredEdge = config.ladderV14ValueRepair && age >= config.ladderV14RepairMaxWaitSeconds
+    ? -Math.min(0.02, 0.01 * (age - config.ladderV14RepairMaxWaitSeconds) / 60)
+    : positiveEdge;
+  const nextRelaxationMs = age < preserveSeconds
+    ? episodeStartedAtMs + preserveSeconds * 1000
+    : (Math.floor(nowSeconds) + 1) * 1000;
   const result = {
     cancelOrderIds: [] as string[],
     opportunities: [] as TradeOpportunity[],
@@ -874,7 +919,8 @@ function planVolumeFirstRepair(
     managementStage: "volume-first-repair-no-executable-depth",
     residualDecisions: [] as LadderV14ResidualDecision[],
     placementContexts: {} as Record<string, LadderV14PlacementContext>,
-    nextWakeAtMs: waiting ? deadline : undefined,
+    nextWakeAtMs: waiting ? Math.min(deadline,
+      preserveSeconds > 0 ? nextRelaxationMs : deadline) : undefined,
   };
   const makerRole = `repair-maker:${episode.id}`;
   // Old opening orders on EITHER side can flip/increase the imbalance. Wait
@@ -902,7 +948,8 @@ function planVolumeFirstRepair(
   let sale = sellDepth(quantity);
   let action: "hedge" | "sell" | null = null;
   let actionQuantity = askQuantity;
-  if (waiting && hedge && 1 - entry - hedge.total / askQuantity > EPSILON) {
+  if (waiting && hedge && 1 - entry - hedge.total / askQuantity > EPSILON &&
+    (config.ladderV14ValueRepair || 1 - entry - hedge.total / askQuantity + EPSILON >= requiredEdge)) {
     action = "hedge";
     result.managementStage = "volume-first-repair-profitable-taker";
   } else if (!waiting) {
@@ -930,7 +977,9 @@ function planVolumeFirstRepair(
   for (let price = aggressivePrice ?? 0; price >= tick - EPSILON; price = round(price - tick, 4)) {
     const fee = exactKalshiOrderFee({price, size: quantity,
       rate: snapshot.makerFeeRate ?? config.kalshiMakerFeeRate, exponent: snapshot.takerFeeExponent});
-    if (1 - entry - price - fee / quantity > EPSILON) { makerPrice = price; break; }
+    const edge = 1 - entry - price - fee / quantity;
+    if ((config.ladderV14ValueRepair || edge > EPSILON) &&
+      edge + EPSILON >= requiredEdge) { makerPrice = price; break; }
   }
   const context = contextFor(config, event, missing, entry, quantity,
     makerPrice === null ? 0 : queueAhead(missing, makerPrice), 0,
@@ -940,6 +989,52 @@ function planVolumeFirstRepair(
       residualAgeSeconds: episode.residualAgeSeconds,
       priceMoveSinceFill: (midpoint(surplus) ?? entry) - entry,
     });
+  if (config.ladderV14ValueRepair) {
+    // Always compare equal executable quantities. Time changes the maker
+    // target and remaining horizon; only final cleanup removes waiting.
+    actionQuantity = hedge && sale ? Math.min(askQuantity, sale.size)
+      : hedge ? askQuantity : sale?.size ?? 0;
+    hedge = actionQuantity > EPSILON && hedge ? buyDepth(actionQuantity) : null;
+    sale = actionQuantity > EPSILON && sale ? sellDepth(actionQuantity) : null;
+    const hedgeValue = hedge ? 1 - hedge.total / actionQuantity : null;
+    const sellValue = sale ? sale.total / actionQuantity : null;
+    const bestExit = Math.max(hedgeValue ?? -Infinity, sellValue ?? -Infinity);
+    const horizon = Math.max(0, Math.min(30, (finalCleanupAtMs - nowSeconds * 1000) / 1000));
+    const repairSize = actionQuantity > EPSILON ? actionQuantity : quantity;
+    const makerCost = makerPrice === null ? null : makerPrice + exactKalshiOrderFee({
+      price: makerPrice, size: repairSize, rate: snapshot.makerFeeRate ?? config.kalshiMakerFeeRate,
+      exponent: snapshot.takerFeeExponent,
+    }) / repairSize;
+    const makerDistance = makerPrice === null ? Infinity : Math.max(0,
+      ((missing.bestBid ?? makerPrice) - makerPrice) / tick);
+    const effectiveFlow = ladderV14EffectiveFlow({ ...context,
+      flowPerSecond: features.eligibleVolumePerSecondByToken[missing.tokenId] ?? 0,
+      depth: flowReferenceDepth(missing, makerPrice ?? 0),
+    }, {
+      flowWindowSeconds: config.ladderV14FlowWindowSeconds,
+      pseudoFlowDepthFraction: config.ladderV14PseudoFlowDepthFraction,
+    });
+    const hazard = makerPrice === null ? 0 : effectiveFlow * ladderV14DistancePenalty(makerDistance) /
+      Math.max(EPSILON, queueAhead(missing, makerPrice) + repairSize);
+    const completionProbability = 1 - Math.exp(-hazard * horizon);
+    const executable = Number.isFinite(bestExit) ? bestExit : 0;
+    const downside = Math.max(0, features.volatilityByToken[surplus.tokenId] ?? 0) *
+      Math.sqrt(horizon / Math.max(1, config.ladderV14VolatilityWindowSeconds));
+    const waitValue = completionProbability * (makerCost === null ? executable : 1 - makerCost) +
+      (1 - completionProbability) * Math.max(0, executable - downside);
+    const profitableHedge = hedgeValue !== null && hedgeValue - entry > EPSILON;
+    const betterExit = bestExit > waitValue + config.ladderV14RepairExitMargin;
+    const mayExit = !waiting || profitableHedge ||
+      (age >= config.ladderV14RepairMaxWaitSeconds && betterExit);
+    action = Number.isFinite(bestExit) && mayExit
+      ? hedgeValue !== null && (sellValue === null || hedgeValue + EPSILON >= sellValue)
+        ? "hedge" : "sell"
+      : null;
+    result.residualDecisions = [{ action: action ?? "wait", size: repairSize,
+      hedgeValue, sellValue, waitValue, context: { ...context, quantity: repairSize } }];
+    result.managementStage = action
+      ? `volume-first-repair-value-${action}` : "volume-first-repair-value-wait";
+  }
   if (action) {
     if (open.length > 0) return { ...result,
       cancelOrderIds: open.map((order) => order.id),

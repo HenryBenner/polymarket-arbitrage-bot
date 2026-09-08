@@ -7,6 +7,7 @@ import { LadderV14ConditionalModel, ladderV14Parameters, type LadderV14Condition
 import { ladderV14BuyGuard, ladderV14Inventory, ladderV14SellGuard } from "../src/ladder-v14-inventory.js";
 import { pairedMakerPrices, planLadderV14, type LadderV14MarketFeatures } from "../src/ladder-v14.js";
 import { PaperTrader } from "../src/paper-trader.js";
+import { v14LifecycleReport } from "../src/ladder-v14-report.js";
 import type { MarketExecutionSnapshot, PaperFill, PaperOrder, TokenBook, TradeOpportunity } from "../src/types.js";
 import { testBooks, testConfig, testEvent } from "./helpers.js";
 
@@ -215,6 +216,134 @@ test("V14 volume-first mode posts one 10-share near-touch pair without EV gating
 });
 
 const repairNow = event.windowEnd - 300;
+
+const fastConfig = () => testConfig({
+  exchange: "kalshi", strategyMode: "ladder_v14", ladderV14VolumeFirstMode: true,
+  ladderV14LiquiditySizing: true, ladderV14RepairPreserveSeconds: 15,
+  ladderV14ValueRepair: true,
+  ladderV14RepairMaxWaitSeconds: 60, ladderV14VolumeFirstPairCost: 0.98,
+});
+
+test("V14 liquid paired quotes stay near touch, bounded by depth, and never stack", () => {
+  const books = testBooks(0.65, 0.37, 1);
+  books[0]!.bestBid = 0.63;
+  books[1]!.bestBid = 0.35;
+  for (const book of books) {
+    book.bids = [{ price: book.bestBid!, size: 500 }];
+    book.asks = [{ price: book.bestAsk!, size: 500 }];
+  }
+  const state = snapshot(books);
+  const config = fastConfig();
+  const liveFlow = flowingFeatures(books, 100);
+  const planAt = (state: MarketExecutionSnapshot, flow = liveFlow) => planLadderV14(
+    config, event, state, new LadderV14ConditionalModel(parameters), flow, repairNow,
+  );
+  const plan = planAt(state);
+  assert.equal(plan.opportunities.length, 2);
+  assert.ok(plan.opportunities.every(order => order.size > 10 && order.size <= 500));
+  assert.equal(plan.opportunities[0]!.size, plan.opportunities[1]!.size);
+  assert.ok(plan.opportunities.every(order => order.price >= 0.34));
+  const huge = planAt(state, flowingFeatures(books, 1e12));
+  assert.ok(huge.opportunities.every(order => order.size <= 500));
+  const weak = planAt(state, { ...liveFlow, eligibleVolumePerSecondByToken: {
+    "up-token": 100, "down-token": 5,
+  } });
+  assert.ok(weak.opportunities[0]!.size < plan.opportunities[0]!.size);
+  const cold = planAt(state, features(books));
+  assert.equal(cold.opportunities.length, 2, "displayed liquidity supports conservative cold start");
+  const orders = plan.opportunities.map((target, index) => ({
+    ...v14Order(`liquid-${index}`, target.token.tokenId, target.price, target.size, "open"),
+    tradeKey: target.tradeKey,
+  }));
+  const resting = snapshot(books, orders);
+  const repeated = planAt(resting, flowingFeatures(books, 1e12));
+  assert.equal(repeated.opportunities.length, 0);
+  assert.equal(repeated.amendments.length, 0, "increased flow must not continually enlarge resting quotes");
+  for (const order of orders) { order.status = "partial"; order.remainingSize -= 1; }
+  resting.fills = orders.map(order => v14Fill(order, 1));
+  const partial = planAt(resting, flowingFeatures(books, 1e12));
+  assert.equal(partial.opportunities.length, 0);
+  assert.equal(partial.amendments.length, 0);
+});
+
+test("V14 liquidity mode skips unreachable quotes without inventing probability or depth", () => {
+  const books = testBooks(0.65, 0.37, 1);
+  for (const book of books) { book.bids = []; book.asks = []; }
+  const plan = planLadderV14(fastConfig(), event, snapshot(books),
+    new LadderV14ConditionalModel(parameters), flowingFeatures(books, 1e12), repairNow);
+  assert.equal(plan.opportunities.length, 0);
+});
+
+test("V14 value repair relaxes edge without a forced exit at 60 seconds", () => {
+  const state = residualState(0.6, 0.43, 0.25, 40);
+  const planAt = (age: number) => planLadderV14(fastConfig(), event, state,
+    new LadderV14ConditionalModel(parameters), {
+      ...flowingFeatures([...state.books], 100), volatilityByToken: { "up-token": 0, "down-token": 0 },
+    }, repairNow + age);
+  assert.equal(planAt(0).opportunities[0]!.price, 0.38);
+  assert.equal(planAt(0).nextWakeAtMs, (repairNow + 15) * 1000);
+  assert.equal(planAt(15).opportunities[0]!.price, 0.38);
+  assert.equal(planAt(40).opportunities[0]!.price, 0.39);
+  assert.equal(planAt(60).opportunities[0]!.orderPolicy, "post_only");
+  assert.equal(planAt(120).opportunities[0]!.orderPolicy, "post_only");
+  assert.equal(planAt(60).residualDecisions[0]!.action, "wait");
+  // A last-second partial repair must retain the original episode deadline.
+  const repair = v14Order("fast-partial", "down-token", 0.39, 39);
+  state.orders = [...state.orders, repair];
+  state.fills = [...state.fills, { ...v14Fill(repair),
+    timestamp: new Date((repairNow + 59) * 1000).toISOString() }];
+  assert.equal(planAt(60).opportunities[0]!.size, 1);
+  assert.equal(planAt(60).opportunities[0]!.price, 0.4);
+  assert.equal(planAt(270).opportunities[0]!.orderPolicy, "fak");
+});
+
+test("V14 fast repair chooses sale after fees when sale beats a loss-locking hedge", () => {
+  const state = residualState(0.6, 0.8, 0.4, 40);
+  state.takerFeeRate = 0.07;
+  const plan = planLadderV14(fastConfig(), event, state,
+    new LadderV14ConditionalModel(parameters), { ...features([...state.books]),
+      volatilityByToken: { "up-token": 0.1 } }, repairNow + 60);
+  assert.equal(plan.managementStage, "volume-first-repair-value-sell");
+  assert.equal(plan.flattenOpportunities[0]!.size, 40);
+});
+
+test("V14 compares a profitable immediate hedge with a better executable sale", () => {
+  const state = residualState(0.6, 0.35, 0.7, 40);
+  const plan = planLadderV14(fastConfig(), event, state,
+    new LadderV14ConditionalModel(parameters), features([...state.books]), repairNow);
+  assert.equal(plan.managementStage, "volume-first-repair-value-sell");
+  assert.equal(plan.flattenOpportunities[0]!.size, 40);
+});
+
+test("V14 lifecycle report separates opening profit, repair losses, and exposure time", () => {
+  const specs = [
+    ["opening", "up-token", 0.48, 10, 0],
+    ["opening", "down-token", 0.50, 10, 1],
+    ["opening", "up-token", 0.60, 5, 10],
+    ["repair-taker", "down-token", 0.45, 5, 20],
+    ["opening", "up-token", 0.50, 5, 30],
+    ["repair-sale", "up-token", 0.20, 5, 40],
+  ] as const;
+  const orders = specs.map(([role, token, price, size], index) => ({
+    ...v14Order(`report-${index}`, token, price, size), pairId: `ladder-v14:${role}`,
+  }));
+  const fills = orders.map((order, index) => ({ ...v14Fill(order),
+    side: index === 5 ? "SELL" as const : "BUY" as const,
+    liquidity: index === 3 || index === 5 ? "taker" as const : "maker" as const,
+    timestamp: new Date((repairNow + specs[index]![4]) * 1000).toISOString(),
+  }));
+  const state = snapshot(testBooks(0.5, 0.5), orders, fills);
+  state.settledPnl = -1.55;
+  const report = v14LifecycleReport(state, (repairNow + 50) * 1000);
+  assert.ok(Math.abs(report.openingPairPnl - 0.2) < 1e-8);
+  assert.ok(Math.abs(report.takerHedgeLosses - 0.25) < 1e-8);
+  assert.ok(Math.abs(report.residualSaleLosses - 1.5) < 1e-8);
+  assert.ok(Math.abs(report.repairLosses - 1.75) < 1e-8);
+  assert.ok(Math.abs(report.settlementResidualPnl!) < 1e-8);
+  assert.equal(report.unpairedSeconds, 21);
+  assert.equal(report.unpairedShareSeconds, 110);
+  assert.equal(report.endingUnpairedShares, 0);
+});
 const repairDeadlineNow = repairNow + 240;
 const cleanupNow = event.windowEnd - 30;
 function volumePlan(state: MarketExecutionSnapshot, now = repairNow) {

@@ -278,36 +278,51 @@ V14 currently defaults to bootstrap collection mode with
 `LADDER_V14_VOLUME_FIRST_MODE=true`. In this mode the statistical engine runs
 in shadow: it records fill, completion, and failed-exit behavior but does not
 gate entries. The live quote policy posts exactly two near-touch maker orders:
-one 10-share Up order and one 10-share Down order whose combined raw
-price targets 99c. The exact price split keeps both quotes as close to their
+one Up order and one Down order whose combined raw
+price targets 98c. The exact price split keeps both quotes as close to their
 respective touches as possible. Prices are calculated on integer ticks.
 
-V14 completes one cycle before starting the next. Equal partial fills remain
-on the current cycle and quote only its unfinished quantity. Once both sides
-are confirmed complete, the next full 10-share pair can start. There is never
-more than one ordinary opening price per outcome.
+With `LADDER_V14_LIQUIDITY_SIZING=true`, the pair quantity uses the weaker side's
+flow/queue reachability and available hedge or sale depth. Cold starts use the
+existing conservative depth-based pseudo-flow. There is one aggregate price per
+outcome, no tail-price search and no capital-driven quantity expansion. Resting
+orders can shrink as liquidity falls but do not grow on every acknowledgment.
+Equal partial fills finish the current quantity before refreshing. Set liquidity
+sizing false to retain the legacy `LADDER_V14_CYCLE_SHARES` sizing.
 
 As soon as `R = abs(YES - NO) > 0`, V14 cancels **all** ordinary opening orders
 on both sides, waits for cancellation reconciliation, and recomputes R. It
 then buys only the missing side, with no cycle quantity added and no surplus
 orders during repair.
 
-If buying the missing quantity now locks a positive pair after entry and
-taker fees, V14 takes it immediately. Otherwise it posts one repair maker for
-exactly R at the most aggressive post-only price that leaves positive pair
-profit after both legs' fees and rounding. It does **not** chase a loss-making
-maker price or automatically cross at a loss after five seconds. Repair-only
-mode remains active until balance returns or its repair deadline arrives.
-`LADDER_V14_QUOTE_LIFETIME_SECONDS` remains the statistical quote horizon; it
-is not a forced-loss timer. The profitable-repair deadline is 240 seconds after
-the residual episode begins, configured by
-`LADDER_V14_REPAIR_MAX_WAIT_SECONDS`. If the market's final cleanup window
-begins sooner, that earlier deadline applies. A timer wakes repair even on a
-quiet book. At the deadline it cancels the maker and compares executable
-`1 - opposite all-in ask` with `surplus net bid`, choosing the greater value
-(hedge on a tie), even if hedging locks a loss. Entry cost is sunk in this
-deadline decision. Partial depth/fills are handled by replanning the actual
-remaining quantity after each acknowledgment.
+With `LADDER_V14_VALUE_REPAIR=true`, repair compares equal executable quantities:
+`hedgeValue = 1 - allInOppositeAsk` and `sellValue = netHeldBid`.
+A profitable immediate hedge is eligible at any age, but a better sale wins.
+The maker target preserves normal edge for 15 seconds, then relaxes linearly
+toward breakeven at 60 seconds. After 60 seconds the maker may accept a gradually
+increasing loss (1 cent per additional minute, capped at 2 cents).
+
+Elapsed time alone never triggers a taker trade. After the 60-second transition
+(`LADDER_V14_REPAIR_MAX_WAIT_SECONDS`), an exit must beat estimated wait value
+by `LADDER_V14_REPAIR_EXIT_MARGIN=0.005` per share. The deterministic wait estimate
+uses a maximum 30-second horizon, completion flow divided by queue plus quantity,
+maker proceeds including fees, and current executable recovery minus a volatility
+allowance. It does not use the old fixed historical recovery ratio. These are
+model assumptions, not proof of positive expectancy. At final cleanup (default
+30 seconds before settlement), waiting is removed and the better executable
+hedge or sale is selected. Missing liquidity still prevents a guaranteed fill.
+
+Partial fills and replacements retain the first unmatched fill's clock. Quiet
+books wake at 15 seconds and every second afterward to reassess. Value repair
+can be disabled to reproduce the old maximum-wait policy. Existing environment
+overrides remain effective: update old 240-second settings to 60 for this run.
+
+Run `npm run report:ladder-v14 -- <paper-directory>` after markets settle to
+measure opening-pair P&L, maker/taker repair pair P&L, taker hedge losses,
+residual-sale losses, and time/share-seconds unpaired. Reports persist in V14
+history before fills are pruned. FIFO pair attribution is explicit; all-in fees
+are included, residual settlement P&L is separate, and pre-upgrade markets
+without lifecycle records are excluded rather than reported as zero.
 
 Partial repair fills never resume opening cycles: a 100-share residual still
 needs repair after 1 or 99 shares fill. Only confirmed inventory returning to

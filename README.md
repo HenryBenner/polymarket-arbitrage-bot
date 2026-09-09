@@ -434,34 +434,35 @@ The paper engine tracks items such as:
 - execution callbacks
 
 RAM is the active trading state. Book updates, maker fills, positions, and strategy
-wakes do not await disk writes. Dirty state is checkpointed to `paper-state.json`
-under `PAPER_STATE_PATH` every five seconds; a quiet account is not rewritten.
+wakes do not await disk writes. Dirty restart state is checkpointed under the hidden
+`PAPER_STATE_PATH/.runtime` directory every five seconds; a quiet account is not rewritten.
 Changes arriving during a checkpoint remain dirty for the next one, and a failed
 write is retried at the next interval.
 
-`paper-events.jsonl` uses one buffered, append-only stream for submitted, amended,
-and cancelled orders, fills, settlements, stale trades, and errors. V14 paper
-evaluation/candidate/status messages are suppressed. One `health` record every
-30 seconds reports `processingLagMs`, `averageLag`, `maxLag` (milliseconds),
-`openOrders`, `fillsProcessed`, `eventsProcessed`, `staleEventsSkipped`,
-`logQueueSize` (pending records), and `stateDirty`. Lag averages/maxima reset each
-report; event/fill/stale counters cover the current process lifetime.
+Normal paper logging uses three fixed files: `trades.jsonl` for meaningful orders,
+fills, cancellations, and material residual decisions; `markets.jsonl` for one compact
+settlement summary per market; and `run-summary.json` for periodic run P&L, volume,
+risk, assets, hold calibration, and simulator-health counters. Logs do not rotate.
+Routine amendments and delayed events increment summary counters rather than producing
+individual lines. Set `PAPER_LOG_LEVEL=debug` to additionally write `debug.jsonl`.
 
-Trades more than 1,000 ms old by their exchange timestamp cannot generate maker
-fills or consume queue position. The normal operating target is processing lag
-below 100 ms, with essentially no events above one second.
+Exchange-to-receipt latency does not disqualify a market trade. Kalshi's socket
+receipt time is captured before its processing queue, and only a trade waiting
+inside the program for more than 1,000 ms is prevented from generating maker
+fills or consuming queue position. The exchange timestamp still prevents a
+trade from filling an order placed or amended after that trade occurred.
+In normal mode, skipped-event details are counted rather than logged individually.
+Debug mode retains the full skipped-trade audit record.
 
-Settlement flushes the event log and saves immediately, lets strategy history
+Settlement flushes the compact logs and saves immediately, lets strategy history
 consume the settled fills, then removes the market's orders, fills, positions,
 and fee accumulators and saves the compact checkpoint. Settlement summaries and
-active markets remain. Older checkpoints are compacted on startup too. Detailed
-history lives in the append-only log, which is no longer automatically rotated
-or deleted by the paper trader.
+active markets remain. Older checkpoints are compacted on startup too.
 
 Manual stop, SIGINT/SIGTERM, and fatal-error shutdown drain pending work, flush the
-log stream, and save a final checkpoint. An abrupt kill or power loss can lose
-changes since the last checkpoint; the event log is historical output and is not
-automatically replayed into the checkpoint on startup.
+log streams, finalize `run-summary.json`, and save a final checkpoint. An abrupt
+kill or power loss can lose changes since the last checkpoint; compact analysis
+logs are historical output and are not replayed into runtime state.
 
 Each concurrently running strategy should use its own state directory.
 

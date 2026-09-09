@@ -422,7 +422,7 @@ test("Kalshi stream publishes unified two-outcome books atomically", async () =>
     (event) => events.push(event),
   );
   const internals = stream as unknown as {
-    handleMessage(data: unknown): Promise<void>;
+    handleMessage(data: unknown, receivedAtMs?: number): Promise<void>;
   };
   await internals.handleMessage(
     Buffer.from(
@@ -437,9 +437,11 @@ test("Kalshi stream publishes unified two-outcome books atomically", async () =>
         },
       }),
     ),
+    12_345,
   );
   assert.equal(events.length, 1);
   assert.equal(events[0]?.event_type, "market_books");
+  assert.equal(events[0]?.received_at_ms, 12_345);
   const books = events[0]?.books as Array<Record<string, unknown>>;
   assert.equal(books.length, 2);
   assert.deepEqual(books[0]?.bids, [{ price: "0.3", size: "12" }]);
@@ -471,6 +473,44 @@ test("Kalshi stream publishes unified two-outcome books atomically", async () =>
     { price: "0.45", size: "4" },
     { price: "0.4", size: "9" },
   ]);
+});
+
+test("Kalshi stream carries socket receipt time on normalized trades", async () => {
+  const events: Array<Record<string, unknown>> = [];
+  const stream = new KalshiMarketStream(
+    testConfig({ exchange: "kalshi" }),
+    (event) => events.push(event),
+  );
+  const internals = stream as unknown as {
+    handleMessage(data: unknown, receivedAtMs?: number): Promise<void>;
+  };
+  await internals.handleMessage(
+    Buffer.from(JSON.stringify({
+      type: "trade",
+      msg: {
+        market_ticker: "KXBTC15M-ONE",
+        taker_outcome_side: "no",
+        yes_price_dollars: "0.80",
+        no_price_dollars: "0.20",
+        count_fp: "12",
+        ts_ms: 98_500,
+        trade_id: "trade-receipt-test",
+      },
+    })),
+    100_000,
+  );
+  assert.deepEqual(events[0], {
+    event_type: "last_trade_price",
+    market_ticker: "KXBTC15M-ONE",
+    taker_outcome_side: "no",
+    asset_id: "KXBTC15M-ONE::yes",
+    side: "SELL",
+    price: "0.8",
+    size: "12",
+    timestamp: "98500",
+    transaction_hash: "trade-receipt-test",
+    received_at_ms: 100_000,
+  });
 });
 
 test("Kalshi stream invalidates books and requests snapshots on a sequence gap", async () => {

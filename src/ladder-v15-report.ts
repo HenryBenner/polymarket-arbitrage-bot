@@ -48,7 +48,7 @@ export function summarizeV15(state: V15ReportState) {
 }
 
 export async function readV15Report(directory: string) {
-  return summarizeV15(JSON.parse(await readFile(join(directory, "paper-state.json"), "utf8")) as V15ReportState);
+  return summarizeV15(JSON.parse(await readFile(join(directory, ".runtime", "paper-state.json"), "utf8")) as V15ReportState);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

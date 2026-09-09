@@ -96,7 +96,7 @@ export async function runV15Comparison(base: BotConfig, root: string): Promise<v
       await Promise.all(bots.map(bot => bot.runOnce()));
       if (Date.now() - startedAt >= 7 * 86400_000) {
         const ledgers = await Promise.all(variants.map(async ({ config }) => JSON.parse(
-          await readFile(join(config.paperStatePath, "paper-state.json"), "utf8")) as { settlements: PaperSettlement[] }));
+          await readFile(join(config.paperStatePath, ".runtime", "paper-state.json"), "utf8")) as { settlements: PaperSettlement[] }));
         const common = ledgers[0]!.settlements.filter(s => ledgers.every(ledger => ledger.settlements.some(other => other.marketSlug === s.marketSlug)));
         const assetBySeries = new Map(events.map(event => [event.market.seriesTicker!, event.slug.split("-")[0]!]));
         if (base.kalshiSeriesTickers.every(series => common.filter(s => s.marketSlug.startsWith(`${assetBySeries.get(series) ?? series.slice(2, -3).toLowerCase()}-`)).length >= 200)) stopped = true;
@@ -110,7 +110,7 @@ export async function runV15Comparison(base: BotConfig, root: string): Promise<v
     process.off("SIGINT", stop); process.off("SIGTERM", stop);
     const rejected = results.find(result => result.status === "rejected");
     if (rejected?.status === "rejected") throw rejected.reason;
-    const states = await Promise.all(variants.map(async ({ config }) => JSON.parse(await readFile(join(config.paperStatePath, "paper-state.json"), "utf8")) as V15ReportState));
+    const states = await Promise.all(variants.map(async ({ config }) => JSON.parse(await readFile(join(config.paperStatePath, ".runtime", "paper-state.json"), "utf8")) as V15ReportState));
     const common = new Set(states[0]!.settlements.filter(s => states.every(state => state.settlements.some(other => other.marketSlug === s.marketSlug))).map(s => s.marketSlug));
     const reports = await Promise.all(variants.map(async ({ name, config }, index) => ({ name,
       ...await readV15Report(config.paperStatePath), commonMarkets: summarizeV15({ ...states[index]!,

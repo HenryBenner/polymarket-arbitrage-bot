@@ -1,7 +1,7 @@
 import { v15Exposure, v15OrderGuard, v15Inventory, v15NetPositions, v15CycleReports, type V15CycleReport } from "./ladder-v15-inventory.js";
 import { randomUUID } from "node:crypto";
-import { readFile, rename, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { ClobClient } from "@polymarket/clob-client-v2";
 import type { BotConfig } from "./config.js";
 import { KalshiClient, kalshiTokenId } from "./kalshi-api.js";
@@ -16,6 +16,8 @@ import {
   validateOrderMinimum,
 } from "./utils/order-validation.js";
 import { AppendOnlyJsonl } from "./utils/append-only-jsonl.js";
+import { PaperRunLog } from "./paper-run-log.js";
+import { v14LifecycleReport } from "./ladder-v14-report.js";
 import type {
   GammaMarket,
   MarketExecutionSnapshot,
@@ -33,7 +35,7 @@ import type {
 
 export const PAPER_CHECKPOINT_INTERVAL_MS = 5_000;
 export const PAPER_HEALTH_INTERVAL_MS = 30_000;
-export const PAPER_MAX_MAKER_EVENT_AGE_MS = 1_000;
+export const PAPER_MAX_PROCESSING_LAG_MS = 1_000;
 
 interface PaperState {
   v15Markets?: Record<string, UpDownEvent>;
@@ -187,6 +189,7 @@ export class PaperTrader implements OrderExecutor {
   private persistenceQueue: Promise<void> = Promise.resolve();
   private executionQueue: Promise<void> = Promise.resolve();
   private eventLog: AppendOnlyJsonl | undefined;
+  private runLog: PaperRunLog | undefined;
   private checkpointTimer: NodeJS.Timeout | undefined;
   private healthTimer: NodeJS.Timeout | undefined;
   private stateDirty = false;
@@ -200,17 +203,21 @@ export class PaperTrader implements OrderExecutor {
   private lagTotal = 0;
   private lagCount = 0;
   private lagMax = 0;
+  private transportLagMs = 0;
+  private transportLagTotal = 0;
+  private transportLagCount = 0;
+  private transportLagMax = 0;
   private eventsProcessed = 0;
   private fillsProcessed = 0;
-  private staleEventsSkipped = 0;
+  private processingLagEventsSkipped = 0;
 
   constructor(
     private readonly config: BotConfig,
     private readonly options: PaperTraderOptions = {},
   ) {
     this.state = emptyState(config.paperStartingUsdc);
-    this.statePath = join(config.paperStatePath, "paper-state.json");
-    this.eventLogPath = join(config.paperStatePath, "paper-events.jsonl");
+    this.statePath = join(config.paperStatePath, ".runtime", "paper-state.json");
+    this.eventLogPath = join(config.paperStatePath, "debug.jsonl");
     this.stream =
       options.stream ??
       (config.exchange === "kalshi"
@@ -231,32 +238,41 @@ export class PaperTrader implements OrderExecutor {
 
   async init(): Promise<void> {
     let needsCheckpoint = false;
-    try {
-      const parsed = JSON.parse(await readFile(this.statePath, "utf8")) as PaperState;
-      if (parsed.version !== 1) {
-        throw new Error(`Unsupported paper state version: ${parsed.version}`);
-      }
+    const restore = (parsed: PaperState) => {
+      if (parsed.version !== 1) throw new Error(`Unsupported paper state version: ${parsed.version}`);
       this.state = parsed;
       this.state.positions ??= this.derivePositions(parsed.fills);
       this.state.feeAccumulators ??= {};
       this.state.theoreticalCash ??= this.state.startingBalance;
       this.state.grossCapitalDeployed ??= 0;
       for (const key of parsed.seenEventKeys) this.seenEvents.add(key);
+    };
+    try {
+      restore(JSON.parse(await readFile(this.statePath, "utf8")) as PaperState);
     } catch (error) {
       const code =
         error && typeof error === "object" && "code" in error
           ? String(error.code)
           : "";
       if (code !== "ENOENT") throw error;
-      needsCheckpoint = true;
+      try {
+        restore(JSON.parse(await readFile(join(this.config.paperStatePath, "paper-state.json"), "utf8")) as PaperState);
+        needsCheckpoint = true;
+      } catch (legacyError) {
+        const legacyCode = legacyError && typeof legacyError === "object" && "code" in legacyError
+          ? String(legacyError.code) : "";
+        if (legacyCode !== "ENOENT") throw legacyError;
+        needsCheckpoint = true;
+      }
     }
     this.stateReady = true;
     if (this.closing) return;
-    this.eventLog = await AppendOnlyJsonl.open(this.eventLogPath, (error) => {
-      log("Paper event log failed", { error: error.message });
+    this.runLog = await PaperRunLog.open(this.config.paperStatePath);
+    if (this.config.paperLogLevel === "debug") this.eventLog = await AppendOnlyJsonl.open(this.eventLogPath, (error) => {
+      log("Paper debug log failed", { error: error.message });
     });
     if (this.closing) {
-      await this.eventLog.close();
+      await Promise.all([this.eventLog?.close(), this.runLog?.close()]);
       return;
     }
     // Compact checkpoints created by older versions as well as new settlements.
@@ -312,6 +328,10 @@ export class PaperTrader implements OrderExecutor {
     handler: (marketSlug: string) => void | Promise<void>,
   ): void {
     this.executionWakeHandler = handler;
+  }
+
+  recordPaperStrategyEvent(event: Record<string, unknown>): void {
+    this.runLog?.residual(event);
   }
 
   async observeMarket(event: UpDownEvent, books: TokenBook[]): Promise<void> {
@@ -900,6 +920,7 @@ export class PaperTrader implements OrderExecutor {
       .reduce((sum, level) => sum + level.size, 0);
     const now = new Date().toISOString();
     this.record("order_amended", order);
+    this.runLog?.amendment();
     for (const level of asks) {
       if (
         order.remainingSize <= 1e-8 ||
@@ -1141,7 +1162,7 @@ export class PaperTrader implements OrderExecutor {
     await this.executionQueue;
     const settlements = await Promise.allSettled([...this.pendingSettlements]);
     // Attempt both outputs even if a disk error affects one of them.
-    const logResult = await Promise.allSettled([this.eventLog?.close()]);
+    const logResult = await Promise.allSettled([this.eventLog?.close(), this.runLog?.close()]);
     // Do not overwrite an unreadable/unsupported checkpoint after init fails.
     const checkpointResult = await Promise.allSettled([this.stateReady ? this.persist() : undefined]);
     const failures = [...settlements, ...logResult, ...checkpointResult].filter(
@@ -1238,23 +1259,49 @@ export class PaperTrader implements OrderExecutor {
 
   async ingestMarketEvent(event: MarketStreamEvent): Promise<void> {
     if (this.closing) return;
-    const receivedAtMs = Date.now();
+    const suppliedReceivedAtMs = parseNumber(event.received_at_ms);
+    const receivedAtMs = suppliedReceivedAtMs ?? Date.now();
     let settlement: Promise<void> | undefined;
     const ingest = (): void => {
-      this.processingLagMs = Math.max(0, Date.now() - receivedAtMs);
+      const processingStartedAtMs = Date.now();
+      this.processingLagMs = Math.max(0, processingStartedAtMs - receivedAtMs);
       this.lagTotal += this.processingLagMs;
       this.lagCount += 1;
       this.lagMax = Math.max(this.lagMax, this.processingLagMs);
       this.eventsProcessed += 1;
-      // Check before chronology/deduplication so stale trades are counted even
-      // when a newer book has already arrived. Never consume their queue volume.
+      this.runLog?.countEvent(this.processingLagMs);
+      const eventTimestampMs = marketEventTimestampMs(event);
+      if (eventTimestampMs !== null) {
+        this.transportLagMs = Math.max(0, receivedAtMs - eventTimestampMs);
+        this.transportLagTotal += this.transportLagMs;
+        this.transportLagCount += 1;
+        this.transportLagMax = Math.max(this.transportLagMax, this.transportLagMs);
+      }
+      // Exchange-to-receipt latency is diagnostic only. A trade is unusable for
+      // paper execution only when it waited too long inside this process.
       if (event.event_type === "last_trade_price") {
-        const atMs = marketEventTimestampMs(event);
-        const eventAgeMs = atMs === null ? 0 : Date.now() - atMs;
-        if (eventAgeMs > PAPER_MAX_MAKER_EVENT_AGE_MS) {
-          this.staleEventsSkipped += 1;
-          this.record("stale_event_skipped", {
-            tokenId: event.asset_id, eventTimestampMs: atMs, eventAgeMs,
+        if (this.processingLagMs > PAPER_MAX_PROCESSING_LAG_MS) {
+          this.processingLagEventsSkipped += 1;
+          this.runLog?.skippedEvent();
+          this.record("processing_lag_event_skipped", {
+            marketSlug: String(event.asset_id ?? "")
+              ? this.tokenToMarket.get(String(event.asset_id))
+              : undefined,
+            marketTicker: event.market_ticker,
+            tokenId: event.asset_id,
+            sourceTimestamp: event.source_timestamp,
+            eventTimestampMs,
+            receivedAtMs,
+            processingStartedAtMs,
+            transportLagMs:
+              eventTimestampMs === null
+                ? null
+                : Math.max(0, receivedAtMs - eventTimestampMs),
+            processingLagMs: this.processingLagMs,
+            price: parseNumber(event.price),
+            size: parseNumber(event.size),
+            side: event.side,
+            transactionHash: event.transaction_hash,
           });
           return;
         }
@@ -1295,10 +1342,9 @@ export class PaperTrader implements OrderExecutor {
       const context = slug ? this.contexts.get(slug) : undefined;
       if (!context) return true;
       const previous = context.lastTradeTimestampMs.get(tokenId) ?? 0;
-      if (atMs + 1e-6 < previous) return false;
-      context.lastTradeTimestampMs.set(tokenId, atMs);
-      // Book and trade channels have independent timestamps. A fresh trade
-      // must not disappear merely because a newer book arrived first.
+      context.lastTradeTimestampMs.set(tokenId, Math.max(previous, atMs));
+      // Trade arrival order drives the simulation. Exchange time is still used
+      // below to reject fills against orders placed or amended after the trade.
       return true;
     }
     const tokenIds = new Set<string>();
@@ -2038,10 +2084,37 @@ export class PaperTrader implements OrderExecutor {
       if (order.status === "open" || order.status === "partial") {
         order.status = "cancelled";
         this.refreshOpenOrder(order);
+        if (order.originalSize - order.remainingSize <= 1e-8 && order.pairId?.includes("opening")) this.runLog?.trade({
+          t: Date.now(), m: order.marketSlug, e: "order_cancelled_important",
+          side: order.outcome.toLowerCase(), px: order.limitPrice, qty: order.remainingSize,
+          role: order.pairId?.includes("opening") ? "opening" : "repair",
+          reason: "market_ended", order: order.id.replace(/^paper-/, "").slice(0, 12),
+        });
         this.record("order_cancelled", order);
       }
     }
     this.record("settlement", settlement);
+    const settledSnapshot = this.getMarketExecutionSnapshot(marketSlug);
+    if (settledSnapshot) {
+      const v14 = this.config.strategyMode === "ladder_v14"
+        ? v14LifecycleReport(settledSnapshot, Date.parse(settlement.settledAt)) : null;
+      const event = this.contexts.get(marketSlug)?.event;
+      this.runLog?.market({ m: marketSlug,
+        asset: (event?.market.seriesTicker ?? marketSlug.split("-")[0] ?? "unknown").replace(/^KX/i, "").replace(/15M$/i, "").toLowerCase(),
+        start: event?.windowStart, winner: settlement.winningOutcome.toLowerCase(),
+        openingShares: v14?.openingShares ?? marketFills.filter(f => (f.side ?? "BUY") === "BUY").reduce((s, f) => s + f.size, 0),
+        openingCost: v14?.openingCost,
+        grossCapital: v14?.grossCapitalDeployed ?? totalCost + totalFees,
+        makerPairShares: (v14?.openingPairShares ?? 0) + (v14?.makerRepairShares ?? 0),
+        takerPairShares: v14?.takerRepairShares ?? 0,
+        heldShares: v14?.endingUnpairedShares ?? 0,
+        pairedPnl: v14?.pairedPnl ?? 0, residualPnl: v14?.settlementResidualPnl ?? 0,
+        makerPairPnl: v14?.makerRepairPairPnl ?? 0, takerPairPnl: v14?.takerRepairPairPnl ?? 0,
+        fees: totalFees, pnl: settlement.realizedPnl, episodes: v14?.episodes ?? 0,
+        maxResidual: v14?.maxResidualShares ?? 0, maxOpeningFill: v14?.maxOpeningFill ?? 0,
+        maxGrossMarketExposure: v14?.grossCapitalDeployed ?? totalCost + totalFees,
+        unpairedSeconds: v14?.unpairedSeconds ?? 0 });
+    }
     this.schedulePersist();
     await this.eventLog?.flush();
     await this.persist();
@@ -2060,29 +2133,67 @@ export class PaperTrader implements OrderExecutor {
     payload: PaperOrder | PaperFill | PaperSettlement | Record<string, unknown>,
   ): void {
     this.eventLog?.write({ type, timestamp: new Date().toISOString(), payload });
+    const order = "orderId" in payload ? this.orderById.get(String(payload.orderId))
+      : "id" in payload ? payload as PaperOrder : undefined;
+    const role = order?.pairId?.includes("opening") ? "opening"
+      : order?.pairId?.includes("sale") ? "sale"
+      : order?.pairId?.includes("repair") || order?.pairId?.includes("completion") ? "repair" : undefined;
+    if (type === "fill") {
+      const fill = payload as PaperFill;
+      const e = (fill.side ?? "BUY") === "SELL" ? "residual_sale_fill"
+        : role === "opening" ? "opening_fill"
+        : fill.liquidity === "taker" ? "repair_taker_fill" : "repair_maker_fill";
+      this.runLog?.trade({ t: Date.parse(fill.timestamp), m: fill.marketSlug, e,
+        side: fill.outcome.toLowerCase(), px: fill.price, qty: fill.size, fee: fill.fee,
+        liq: fill.liquidity, role, order: fill.orderId.replace(/^paper-/, "").slice(0, 12) });
+    } else if (type === "order_submitted" && order &&
+      (role === "opening" || (role === "repair" && order.orderPolicy === "post_only"))) {
+      this.runLog?.trade({ t: Date.parse(order.createdAt), m: order.marketSlug,
+        e: role === "opening" ? "opening_submitted" : "repair_maker_submitted",
+        side: order.outcome.toLowerCase(), px: order.limitPrice, qty: order.originalSize,
+        role, order: order.id.replace(/^paper-/, "").slice(0, 12) });
+    } else if (type === "order_cancelled" && order &&
+      (order.originalSize - order.remainingSize > 1e-8 || role === "repair")) {
+      this.runLog?.trade({ t: Date.now(), m: order.marketSlug, e: "order_cancelled_important",
+        side: order.outcome.toLowerCase(), px: order.limitPrice, qty: order.remainingSize,
+        role, order: order.id.replace(/^paper-/, "").slice(0, 12) });
+    }
   }
 
   private recordError(operation: string, error: unknown): void {
     const payload = { operation, error: error instanceof Error ? error.message : String(error) };
     this.record("error", payload);
+    this.runLog?.error();
     log("Paper trader error", payload);
   }
 
   private recordHealth(): void {
-    this.record("health", {
+    if (this.config.paperLogLevel === "debug") this.record("health", {
       processingLagMs: this.processingLagMs,
       averageLag: this.lagCount ? round(this.lagTotal / this.lagCount, 3) : 0,
       maxLag: this.lagMax,
+      transportLagMs: this.transportLagMs,
+      averageTransportLag: this.transportLagCount
+        ? round(this.transportLagTotal / this.transportLagCount, 3)
+        : 0,
+      maxTransportLag: this.transportLagMax,
       openOrders: this.openOrders.size,
       fillsProcessed: this.fillsProcessed,
       eventsProcessed: this.eventsProcessed,
-      staleEventsSkipped: this.staleEventsSkipped,
+      processingLagEventsSkipped: this.processingLagEventsSkipped,
+      // Compatibility alias for existing health parsers. The value now counts
+      // receive-to-process backlog skips, not exchange-age skips.
+      staleEventsSkipped: this.processingLagEventsSkipped,
       logQueueSize: this.eventLog?.queueSize ?? 0,
       stateDirty: this.stateDirty,
     });
+    void this.runLog?.writeSummary();
     this.lagTotal = 0;
     this.lagCount = 0;
     this.lagMax = 0;
+    this.transportLagTotal = 0;
+    this.transportLagCount = 0;
+    this.transportLagMax = 0;
   }
 
   private pruneSettledState(
@@ -2221,6 +2332,7 @@ export class PaperTrader implements OrderExecutor {
   }
 
   private async writeCheckpoint(serialized: string): Promise<void> {
+    await mkdir(dirname(this.statePath), { recursive: true });
     const temporaryPath = `${this.statePath}.${process.pid}.tmp`;
     await writeFile(temporaryPath, serialized, "utf8");
     try {

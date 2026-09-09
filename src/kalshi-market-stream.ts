@@ -143,7 +143,7 @@ export class KalshiMarketStream {
         log("Kalshi market stream connected", { markets: this.tickers.size });
       });
       socket.on("message", (data: unknown) => {
-        this.enqueueMessage(data);
+        this.enqueueMessage(data, Date.now());
       });
       socket.on("error", (error: Error) => {
         log("Kalshi market stream error", { error: error.message });
@@ -172,12 +172,13 @@ export class KalshiMarketStream {
     }
   }
 
-  private enqueueMessage(data: unknown): void {
-    const operation = () => this.handleMessage(data);
+  private enqueueMessage(data: unknown, receivedAtMs = Date.now()): void {
+    const operation = () => this.handleMessage(data, receivedAtMs);
     this.processingQueue = this.processingQueue.then(operation, operation);
   }
 
   private enqueueEvent(event: MarketStreamEvent): void {
+    event.received_at_ms ??= Date.now();
     const operation = async () => {
       try {
         await this.onEvent(event);
@@ -257,7 +258,10 @@ export class KalshiMarketStream {
     }, 10_000);
   }
 
-  private async handleMessage(data: unknown): Promise<void> {
+  private async handleMessage(
+    data: unknown,
+    receivedAtMs = Date.now(),
+  ): Promise<void> {
     const text =
       typeof data === "string"
         ? data
@@ -285,15 +289,16 @@ export class KalshiMarketStream {
           this.updateSubscriptions([...this.pendingAdditions]);
         }
       } else if (event.type === "orderbook_snapshot") {
-        await this.handleSnapshot(event);
+        await this.handleSnapshot(event, receivedAtMs);
       } else if (event.type === "orderbook_delta") {
-        await this.handleDelta(event);
+        await this.handleDelta(event, receivedAtMs);
       } else if (event.type === "trade") {
-        await this.handleTrade(event.msg ?? {});
+        await this.handleTrade(event.msg ?? {}, receivedAtMs);
       } else if (event.type === "fill" || event.type === "user_order") {
         await this.onEvent({
           event_type: event.type,
           ...(event.msg ?? {}),
+          received_at_ms: receivedAtMs,
         });
       } else if (event.type === "error") {
         log("Kalshi stream subscription error", { details: event.msg });
@@ -304,7 +309,10 @@ export class KalshiMarketStream {
     }
   }
 
-  private async handleSnapshot(event: KalshiMessage): Promise<void> {
+  private async handleSnapshot(
+    event: KalshiMessage,
+    receivedAtMs = Date.now(),
+  ): Promise<void> {
     const message = event.msg ?? {};
     const ticker = String(message.market_ticker ?? "");
     if (!ticker) return;
@@ -319,14 +327,18 @@ export class KalshiMarketStream {
     await this.emitBooks(ticker, state, {
       telemetry_type: "snapshot",
       sequence: event.seq,
+      received_at_ms: receivedAtMs,
     });
   }
 
-  private async handleDelta(event: KalshiMessage): Promise<void> {
+  private async handleDelta(
+    event: KalshiMessage,
+    receivedAtMs = Date.now(),
+  ): Promise<void> {
     const message = event.msg ?? {};
     const ticker = String(message.market_ticker ?? "");
     if (!ticker || !this.hasConsecutiveSequence(event)) {
-      if (ticker) await this.recoverFromSequenceGap(event);
+      if (ticker) await this.recoverFromSequenceGap(event, receivedAtMs);
       return;
     }
     this.recordSequence(event);
@@ -350,6 +362,7 @@ export class KalshiMarketStream {
       telemetry_delta: delta,
       sequence: event.seq,
       source_timestamp: message.ts_ms ?? message.ts,
+      received_at_ms: receivedAtMs,
     });
   }
 
@@ -369,7 +382,10 @@ export class KalshiMarketStream {
     }
   }
 
-  private async recoverFromSequenceGap(event: KalshiMessage): Promise<void> {
+  private async recoverFromSequenceGap(
+    event: KalshiMessage,
+    receivedAtMs = Date.now(),
+  ): Promise<void> {
     const sid = Number(event.sid);
     const seq = Number(event.seq);
     const previous = Number.isFinite(sid)
@@ -392,10 +408,14 @@ export class KalshiMarketStream {
       event_type: "market_books_invalid",
       market_tickers: [...this.invalidTickers],
       reason: "sequence_gap",
+      received_at_ms: receivedAtMs,
     });
   }
 
-  private async handleTrade(message: Record<string, unknown>): Promise<void> {
+  private async handleTrade(
+    message: Record<string, unknown>,
+    receivedAtMs = Date.now(),
+  ): Promise<void> {
     const ticker = String(message.market_ticker ?? "");
     const takerOutcome = String(
       message.taker_outcome_side ?? message.taker_side ?? "",
@@ -419,6 +439,7 @@ export class KalshiMarketStream {
       size: String(size),
       timestamp: String(message.ts_ms ?? message.ts ?? Date.now()),
       transaction_hash: String(message.trade_id ?? ""),
+      received_at_ms: receivedAtMs,
     });
   }
 

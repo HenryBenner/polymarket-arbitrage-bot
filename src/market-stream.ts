@@ -92,7 +92,7 @@ export class MarketStream {
     });
 
     socket.addEventListener("message", (message) => {
-      void this.handleMessage(message.data);
+      void this.handleMessage(message.data, Date.now());
     });
 
     socket.addEventListener("error", () => {
@@ -114,7 +114,10 @@ export class MarketStream {
     }, 10_000);
   }
 
-  private async handleMessage(data: unknown): Promise<void> {
+  private async handleMessage(
+    data: unknown,
+    receivedAtMs = Date.now(),
+  ): Promise<void> {
     let text: string;
     if (typeof data === "string") {
       text = data;
@@ -135,6 +138,7 @@ export class MarketStream {
     }
     for (const event of Array.isArray(parsed) ? parsed : [parsed]) {
       try {
+        event.received_at_ms = receivedAtMs;
         await this.onEvent(event);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);

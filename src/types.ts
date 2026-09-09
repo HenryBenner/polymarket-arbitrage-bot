@@ -269,6 +269,7 @@ export interface OrderExecutor {
     marketSlug: string,
   ): Readonly<MarketExecutionSnapshot> | null;
   reportMarket?(marketSlug: string): void;
+  recordPaperStrategyEvent?(event: Record<string, unknown>): void;
   cancelOrders?(orderIds: string[]): Promise<void>;
   close?(): Promise<void>;
 }

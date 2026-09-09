@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { WriteStream } from "node:fs";
@@ -42,7 +42,7 @@ async function within<T>(operation: Promise<T>): Promise<T> {
 
 async function fixture(t: TestContext) {
   const directory = await mkdtemp(join(tmpdir(), "paper-checkpoint-"));
-  const config = testConfig({ paperStatePath: directory, strategyMode: "ladder_v14" });
+  const config = testConfig({ paperStatePath: directory, strategyMode: "ladder_v14", paperLogLevel: "debug" });
   const options = {
     stream: { subscribe() {}, close() {} },
     feeLoader: async () => ({ rate: 0, exponent: 1 }),
@@ -63,8 +63,8 @@ async function fixture(t: TestContext) {
     tickSize: "0.01", negRisk: false, tradeKey: "opening",
     strategyMode: "ladder_v14", pairId: "ladder-v14:opening", orderPolicy: "post_only",
   };
-  const readState = async () => JSON.parse(await readFile(join(directory, "paper-state.json"), "utf8")) as ReturnType<PaperTrader["snapshot"]>;
-  const readLog = async () => (await readFile(join(directory, "paper-events.jsonl"), "utf8"))
+  const readState = async () => JSON.parse(await readFile(join(directory, ".runtime", "paper-state.json"), "utf8")) as ReturnType<PaperTrader["snapshot"]>;
+  const readLog = async () => (await readFile(join(directory, "debug.jsonl"), "utf8"))
     .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
   return { directory, config, options, trader, event, books, opportunity, readState, readLog };
 }
@@ -182,29 +182,74 @@ test("a failed checkpoint remains dirty and the next five-second checkpoint reco
   assert.ok((await f.readLog()).some((record) => record.type === "error"));
 });
 
-test("stale exchange trades cannot consume queue position or fill; the 1000 ms boundary is accepted", async (t) => {
+test("transport-delayed trades fill, while internally backlogged trades are fully logged and skipped", async (t) => {
   const now = Math.floor(Date.now() / 1_000) * 1_000;
   t.mock.timers.enable({ apis: ["Date", "setInterval"], now });
   const f = await fixture(t);
   f.books[0]!.bids = [{ price: 0.4, size: 2 }];
   await f.trader.placeBuy(f.opportunity);
-  t.mock.timers.tick(1_001);
-  for (const source of [String(now), String(now / 1_000), new Date(now).toISOString()]) {
-    await f.trader.ingestMarketEvent({
-      event_type: "last_trade_price", asset_id: "up-token", side: "SELL",
-      price: "0.4", size: "10", timestamp: String(Date.now()), source_timestamp: source,
-    });
-  }
-  assert.equal(f.trader.snapshot().fills.length, 0);
-  assert.equal(f.trader.snapshot().orders[0]!.queueAhead, 2);
+  t.mock.timers.tick(2_000);
+  // This trade is 1.5 seconds old when it arrives but occurred after the order.
+  // Transport delay does not make it stale inside the paper simulator.
   await f.trader.ingestMarketEvent({
     event_type: "last_trade_price", asset_id: "up-token", side: "SELL",
-    price: "0.4", size: "3", timestamp: String(now + 1),
+    price: "0.4", size: "3", timestamp: String(now + 500),
+    transaction_hash: "transport-delayed",
   });
   assert.equal(f.trader.snapshot().fills[0]!.size, 1);
   assert.equal(f.trader.snapshot().orders[0]!.queueAhead, 0);
+
+  const io = internals(f.trader);
+  const boundaryRelease = deferred();
+  io.executionQueue = boundaryRelease.promise;
+  const boundary = f.trader.ingestMarketEvent({
+    event_type: "last_trade_price", asset_id: "up-token", side: "SELL",
+    price: "0.4", size: "1", timestamp: String(Date.now()),
+    transaction_hash: "processing-boundary",
+  });
+  t.mock.timers.tick(1_000);
+  boundaryRelease.resolve();
+  await boundary;
+  assert.equal(f.trader.snapshot().fills.length, 2, "the 1000 ms boundary is accepted");
+
+  const release = deferred();
+  io.executionQueue = release.promise;
+  const queued = f.trader.ingestMarketEvent({
+    event_type: "last_trade_price", market_ticker: "KXBTC15M-TEST",
+    asset_id: "up-token", side: "SELL", price: "0.4", size: "4",
+    timestamp: String(Date.now()), transaction_hash: "internally-backlogged",
+  });
+  t.mock.timers.tick(1_001);
+  release.resolve();
+  await queued;
+  assert.equal(f.trader.snapshot().fills.length, 2);
   await f.trader.close();
-  assert.equal((await f.readLog()).filter((record) => record.type === "stale_event_skipped").length, 3);
+  const skipped = (await f.readLog()).filter(
+    (record) => record.type === "processing_lag_event_skipped",
+  );
+  assert.equal(skipped.length, 1);
+  assert.deepEqual(
+    {
+      marketTicker: skipped[0].payload.marketTicker,
+      tokenId: skipped[0].payload.tokenId,
+      processingLagMs: skipped[0].payload.processingLagMs,
+      price: skipped[0].payload.price,
+      size: skipped[0].payload.size,
+      side: skipped[0].payload.side,
+      transactionHash: skipped[0].payload.transactionHash,
+    },
+    {
+      marketTicker: "KXBTC15M-TEST",
+      tokenId: "up-token",
+      processingLagMs: 1_001,
+      price: 0.4,
+      size: 4,
+      side: "SELL",
+      transactionHash: "internally-backlogged",
+    },
+  );
+  assert.equal(skipped[0].payload.transportLagMs, 0);
+  assert.equal(skipped[0].payload.processingStartedAtMs - skipped[0].payload.receivedAtMs, 1_001);
 });
 
 test("health records report receive-to-process lag every 30 seconds and reset the lag window", async (t) => {
@@ -224,7 +269,8 @@ test("health records report receive-to-process lag every 30 seconds and reset th
   assert.equal(first.averageLag, 125);
   assert.equal(first.maxLag, 250);
   assert.equal(first.eventsProcessed, 2);
-  for (const field of ["processingLagMs", "openOrders", "fillsProcessed", "logQueueSize", "stateDirty", "staleEventsSkipped"]) {
+  for (const field of ["processingLagMs", "transportLagMs", "averageTransportLag", "maxTransportLag",
+    "openOrders", "fillsProcessed", "logQueueSize", "stateDirty", "processingLagEventsSkipped"]) {
     assert.ok(field in first);
   }
   t.mock.timers.tick(PAPER_HEALTH_INTERVAL_MS);
@@ -288,7 +334,7 @@ test("startup compacts legacy settled orders, fills, positions and fee accumulat
   await f.trader.ingestMarketEvent({ event_type: "market_resolved", winning_asset_id: "up-token" });
   await f.trader.close();
   const settled = await f.readState();
-  await writeFile(join(f.directory, "paper-state.json"), JSON.stringify({
+  await writeFile(join(f.directory, ".runtime", "paper-state.json"), JSON.stringify({
     ...settled, orders: active.orders, fills: active.fills, positions: active.positions,
     feeAccumulators: { [active.orders[0]!.id]: 0.5 },
   }));
@@ -328,10 +374,11 @@ test("manual bot stop flushes the paper log and final checkpoint before five sec
 
 test("shutdown after failed startup preserves the unreadable checkpoint", async () => {
   const directory = await mkdtemp(join(tmpdir(), "paper-invalid-checkpoint-"));
-  const statePath = join(directory, "paper-state.json");
+  const statePath = join(directory, ".runtime", "paper-state.json");
+  await mkdir(join(directory, ".runtime"));
   const corrupt = '{"version":1,"cash":';
   await writeFile(statePath, corrupt);
-  const trader = new PaperTrader(testConfig({ paperStatePath: directory }), {
+  const trader = new PaperTrader(testConfig({ paperStatePath: directory, paperLogLevel: "debug" }), {
     stream: { subscribe() {}, close() {} },
   });
   try {

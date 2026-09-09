@@ -1,4 +1,5 @@
 import { planLadderV15 } from "./ladder-v15.js";
+import { join } from "node:path";
 import { v15Exposure } from "./ladder-v15-inventory.js";
 import type { BotConfig } from "./config.js";
 import {
@@ -244,7 +245,7 @@ export class ReverseBot {
         const snapshot = this.trader.getMarketExecutionSnapshot?.(
           settlement.marketSlug,
         );
-        if (snapshot) this.ladderV14History?.finalize(snapshot, Date.now(), settlement);
+        if (snapshot) this.ladderV14History?.finalize(snapshot);
         await this.ladderV14History?.flush();
         this.ladderV14Events.delete(settlement.marketSlug);
         this.ladderV14WakePending = true;
@@ -282,7 +283,8 @@ export class ReverseBot {
     }
     if (this.config.strategyMode === "ladder_v14") {
       this.ladderV14History = await LadderV14HistoryStore.load(
-        this.config.paperStatePath,
+        this.config.paperLogLevel === "normal"
+          ? join(this.config.paperStatePath, ".runtime") : this.config.paperStatePath,
         this.config,
       );
     }
@@ -1752,6 +1754,20 @@ export class ReverseBot {
         snapshot,
         { ...plan, placementContexts: {} },
       );
+      for (const decision of plan.residualDecisions) {
+        this.trader.recordPaperStrategyEvent?.({
+          t: Math.round(nowSeconds * 1_000), m: event.slug,
+          side: decision.context.side.toLowerCase(), qty: decision.size,
+          entry: decision.context.entryPrice, hold: decision.holdValue,
+          sell: decision.sellValue, hedge: decision.hedgeValue,
+          wait: decision.context.secondsRemaining <= this.config.ladderV14FinalCleanupSeconds
+            ? undefined : decision.waitValue,
+          action: decision.action, reason: decision.reason,
+          repairPx: plan.opportunities.find(order => order.orderPolicy === "post_only")?.price,
+          age: decision.context.residualAgeSeconds,
+          left: decision.context.secondsRemaining,
+        });
+      }
       planned.push({ event, snapshot, plan });
     }
 

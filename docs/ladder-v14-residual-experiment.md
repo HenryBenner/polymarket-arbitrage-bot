@@ -14,13 +14,13 @@ During the final `LADDER_V14_FINAL_CLEANUP_SECONDS`, new maker waiting is disabl
 
 Restart with a fresh, separately named `PAPER_STATE_PATH` to isolate this experiment. Keep old run directories for comparison. The implementation does not start a bot or change an active run.
 
-Each residual decision is appended asynchronously to `ladder-v14-residual-shadow.jsonl`. Records include both books, lot entry prices and costs, decision quantity, age, time remaining, hold/wait/executable values, per-share hedge/sale P&L and total proceeds values. Settlement records use the same market slug and supply the winner and actual residual settlement P&L. Counterfactual hold P&L is `(winningTokenId === heldTokenId ? 1 : 0) - entryPrice`; multiply per-share P&L by decision size for its dollar value. These are historical counterfactuals, not a strategy backtest.
+Material residual decisions are appended asynchronously to `trades.jsonl`. Records include entry cost, decision quantity, age, time remaining, hold/wait/executable values, selected action, and reason. `markets.jsonl` links the final decision to the winner and actual residual settlement P&L. Counterfactual hold P&L is `(winner === held side ? 1 : 0) - entry`; multiply per-share P&L by decision quantity for its dollar value. These are historical counterfactuals, not a strategy backtest.
 
 Run:
 
 ```powershell
 npm run report:ladder-v14 -- ./data/paper-ladder-v14
-npx tsx src/ladder-v14-calibration.ts ./data/paper-ladder-v14
+npm run calibrate:ladder-v14 -- ./data/paper-ladder-v14
 ```
 
 The lifecycle report separates paired profit, sales, held residual settlement results, maker/taker repair quantities, exposure time, P&L per opening share and deployed dollar, and the ten worst markets. All-in costs already include fees; do not subtract fees again.
@@ -29,4 +29,4 @@ The calibration report joins shadow decisions with settlement and reports ten pr
 
 The supplied prior 0-for-92 history is a reason to test calibration, not evidence that midpoint estimates are accurate for new residuals. Holding can remain adversely selected. This experiment measures that risk; it does not establish profitability.
 
-Shadow logging preserves every evaluation and can create large files during long runs. Collection is buffered outside order planning; calibration streams the file in two passes instead of loading evaluations into RAM. Preserve the shadow file alongside history when archiving a run.
+Normal logging produces `trades.jsonl`, `markets.jsonl`, and `run-summary.json`. Equivalent repeated decisions are suppressed; calibration streams the compact files instead of loading them into RAM. Internal checkpoint and learner state remain restart-only implementation data.

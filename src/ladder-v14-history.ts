@@ -1,5 +1,4 @@
-import { appendFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { ladderV14Inventory } from "./ladder-v14-inventory.js";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { v14LifecycleReport, type V14LifecycleReport } from "./ladder-v14-report.js";
 import type { BotConfig } from "./config.js";
@@ -17,7 +16,6 @@ import type {
 import type {
   MarketExecutionSnapshot,
   PaperFill,
-  PaperSettlement,
   UpDownEvent,
 } from "./types.js";
 
@@ -116,7 +114,6 @@ export class LadderV14HistoryStore {
   private persistenceTimer: NodeJS.Timeout | null = null;
   private dirty = false;
   private writing = false;
-  private shadowLines: string[] = [];
   private readonly lifecycleReports: Map<string, V14LifecycleReport>;
 
   private constructor(
@@ -171,6 +168,16 @@ export class LadderV14HistoryStore {
         ? String(error.code)
         : "";
       if (code !== "ENOENT") throw error;
+      if (directory.endsWith(".runtime")) {
+        try {
+          const legacy = JSON.parse(await readFile(join(dirname(directory), "ladder-v14-history.json"), "utf8")) as Partial<HistoryState>;
+          return new LadderV14HistoryStore(path, config, legacy.version === 1 ? legacy : undefined);
+        } catch (legacyError) {
+          const legacyCode = legacyError && typeof legacyError === "object" && "code" in legacyError
+            ? String(legacyError.code) : "";
+          if (legacyCode !== "ENOENT") throw legacyError;
+        }
+      }
       return new LadderV14HistoryStore(path, config);
     }
   }
@@ -252,25 +259,6 @@ export class LadderV14HistoryStore {
     nowMs = Date.now(),
   ): void {
     let changed = false;
-    if (plan.residualDecisions.length) {
-      const inventory = ladderV14Inventory(snapshot, nowMs / 1000);
-      for (const decision of plan.residualDecisions) {
-        const held = snapshot.books.find(book => book.outcome === decision.context.side);
-        const opposite = snapshot.books.find(book => book.tokenId !== held?.tokenId);
-        this.shadowLines.push(JSON.stringify({ type: "evaluation", timestamp: new Date(nowMs).toISOString(),
-          marketSlug: event.slug, asset: decision.context.series, heldTokenId: held?.tokenId,
-          heldBid: held?.bestBid, heldAsk: held?.bestAsk,
-          oppositeBid: opposite?.bestBid, oppositeAsk: opposite?.bestAsk,
-          lots: inventory.residualLots, ...decision,
-          holdEV: decision.holdValue == null ? null : decision.holdValue - decision.context.entryPrice,
-          hedgePnl: decision.hedgeValue === null ? null : decision.hedgeValue - decision.context.entryPrice,
-          sellPnl: decision.sellValue === null ? null : decision.sellValue - decision.context.entryPrice,
-          hedgeTotalValue: decision.hedgeValue === null ? null : decision.hedgeValue * decision.size,
-          sellTotalValue: decision.sellValue === null ? null : decision.sellValue * decision.size,
-        }));
-      }
-      changed = true;
-    }
     for (const [tradeKey, placement] of Object.entries(plan.placementContexts)) {
       this.planned.set(tradeKey, structuredClone(placement));
       changed = true;
@@ -414,9 +402,7 @@ export class LadderV14HistoryStore {
     return changed;
   }
 
-  finalize(snapshot: MarketExecutionSnapshot, nowMs = Date.now(), settlement?: PaperSettlement): void {
-    if (settlement) this.shadowLines.push(JSON.stringify({ type: "settlement", ...settlement,
-      lifecycle: v14LifecycleReport(snapshot, nowMs) }));
+  finalize(snapshot: MarketExecutionSnapshot, nowMs = Date.now()): void {
     if (!this.lifecycleReports.has(snapshot.marketSlug)) {
       const match = /-updown-(\d+)m-(\d+)$/.exec(snapshot.marketSlug);
       const endMs = match ? (Number(match[2]) + Number(match[1]) * 60) * 1000 : nowMs;
@@ -473,7 +459,6 @@ export class LadderV14HistoryStore {
     if (this.writing) return this.persistence;
     this.writing = true;
     this.dirty = false;
-    const shadowLines = this.shadowLines.splice(0);
     const state: HistoryState = {
       version: 1,
       model: this.model.toJSON(),
@@ -485,15 +470,6 @@ export class LadderV14HistoryStore {
     };
     const operation = async (): Promise<void> => {
       await mkdir(dirname(this.path), { recursive: true });
-      if (shadowLines.length) {
-        try {
-          await appendFile(join(dirname(this.path), "ladder-v14-residual-shadow.jsonl"),
-            shadowLines.join("\n") + "\n", "utf8");
-        } catch (error) {
-          this.shadowLines.unshift(...shadowLines);
-          throw error;
-        }
-      }
       const temporary = `${this.path}.${process.pid}.tmp`;
       await writeFile(temporary, JSON.stringify(state), "utf8");
       try {

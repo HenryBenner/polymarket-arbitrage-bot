@@ -311,7 +311,7 @@ export function comparePaperStrategies(
 async function loadLedger(path: string): Promise<PaperLedger> {
   const statePath = path.endsWith(".json")
     ? resolve(path)
-    : resolve(path, "paper-state.json");
+    : resolve(path, ".runtime", "paper-state.json");
   const parsed = JSON.parse(await readFile(statePath, "utf8")) as Partial<PaperLedger>;
   return {
     fills: parsed.fills ?? [],

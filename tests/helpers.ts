@@ -102,6 +102,7 @@ export function testConfig(overrides: Partial<BotConfig> = {}): BotConfig {
     ladderV15EmergencyPairCost: 1.02,
     paperStartingUsdc: 100,
     paperStatePath: "./data/test-paper",
+    paperLogLevel: "normal",
     ...overrides,
   };
 }

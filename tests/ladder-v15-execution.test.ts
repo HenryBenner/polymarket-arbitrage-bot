@@ -55,7 +55,7 @@ test("V15 paper nets filled pairs immediately, survives restart and settles with
     assert.equal(v15Inventory(snapshot)[0]!.pairedShares, 40);
     await trader.ingestMarketEvent({ event_type: "market_resolved", winning_asset_id: books[0]!.tokenId });
     await trader.close();
-    const state = JSON.parse(await readFile(join(directory, "paper-state.json"), "utf8"));
+    const state = JSON.parse(await readFile(join(directory, ".runtime", "paper-state.json"), "utf8"));
     assert.equal(state.theoreticalCash, before);
     assert.ok(Math.abs(state.settlements[0].realizedPnl - expected) < 1e-8);
     assert.equal(state.v15Cycles[0].bucket, "15-10");
@@ -99,7 +99,7 @@ test("V15 bot dispatch uses fill-driven cycles and shuts down deadline timers", 
     assert.equal(v15Inventory(snapshot)[0]!.pairedShares, 40);
     assert.equal(snapshot.openOrders.length, 0);
     await bot.stop();
-    const state = JSON.parse(await readFile(join(directory, "paper-state.json"), "utf8"));
+    const state = JSON.parse(await readFile(join(directory, ".runtime", "paper-state.json"), "utf8"));
     assert.equal(state.orders.length, 2);
   } finally { await bot.stop(); await rm(directory, { recursive: true, force: true }); }
 });

@@ -26,6 +26,10 @@ Four immediate attempts are allowed per price/depth fingerprint, separated by
 Cycles can repeat throughout 15–2. Filled residuals and outstanding entry orders
 count against the 40-contract market and 120-contract portfolio limits. Cash is
 accounting-only; liquidity, queue priority, stale-data checks and fees still apply.
+Exchange delivery age is recorded but does not suppress maker fills. Paper trades
+are skipped only if they wait inside the program for more than one second; the
+exchange timestamp separately prevents pre-order or pre-amendment trades from
+filling. Skipped records retain complete trade details for later replay.
 At two minutes, pending entries cancel. At 30 seconds, makers cancel before a
 fee-aware comparison of executable residual sale and complementary hedge. The
 hedge pair-cost ceiling is $1.02; unavailable quantities remain exposed through

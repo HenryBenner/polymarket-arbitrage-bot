@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { LadderV14HistoryStore } from "../src/ladder-v14-history.js";
-import { residualCalibration } from "../src/ladder-v14-calibration.js";
 import { LadderV14ConditionalModel, ladderV14Parameters } from "../src/ladder-v14-model.js";
 import { planLadderV14, type LadderV14PlacementContext } from "../src/ladder-v14.js";
 import type { MarketExecutionSnapshot, PaperFill, PaperOrder } from "../src/types.js";
@@ -12,42 +11,6 @@ import { testBooks, testConfig, testEvent } from "./helpers.js";
 
 const parameters = ladderV14Parameters({
   priorStrength: 5, flowWindowSeconds: 60, volatilityWindowSeconds: 60, finalCleanupSeconds: 30,
-});
-
-test("V14 shadow decisions join settlement across restart and calibrate only settled observations", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "v14-shadow-"));
-  const f = repairFixture();
-  let store = await LadderV14HistoryStore.load(directory, f.config);
-  try {
-    f.order.status = "filled";
-    f.snapshot.openOrders = [];
-    f.snapshot.fills = [f.fill(100, 0)];
-    f.plan.residualDecisions = [{ action: "hold", size: 100, holdValue: 0.29,
-      hedgeValue: 0.13, sellValue: 0.22, waitValue: 0.28,
-      context: { ...f.placement.context, entryPrice: 0.4 }, reason: "hold-has-best-value" }];
-    store.observe(f.event, f.snapshot, f.plan, f.atMs);
-    await store.flush();
-    assert.equal((await residualCalibration(directory)).buckets[2]!.settled, 0);
-    store = await LadderV14HistoryStore.load(directory, f.config);
-    f.snapshot.settledPnl = 60;
-    store.finalize(f.snapshot, f.atMs + 900000, { marketSlug: f.event.slug,
-      winningTokenId: "down-token", winningOutcome: "Down", payout: 100, totalCost: 40,
-      totalFees: 0, realizedPnl: 60, settledAt: new Date(f.atMs + 900000).toISOString() });
-    await store.flush();
-    const report = await residualCalibration(directory);
-    const bucket = report.buckets[2]!;
-    assert.equal(bucket.observations, 1);
-    assert.equal(bucket.settled, 1);
-    assert.equal(bucket.actualWinRate, 1);
-    assert.equal(bucket.averageEstimatedProbability, 0.29);
-    assert.ok(Math.abs(bucket.averageHoldPnl! - 0.6) < 1e-10);
-    assert.ok(Math.abs(bucket.averageSellCounterfactualPnl! + 0.18) < 1e-10);
-    assert.ok(Math.abs(bucket.averageHedgeCounterfactualPnl! + 0.27) < 1e-10);
-    assert.equal(report.actualResidualSettlementPnl, 60);
-  } finally {
-    await store.flush();
-    await rm(directory, { recursive: true, force: true });
-  }
 });
 
 function repairFixture(kind: LadderV14PlacementContext["kind"] = "completion") {

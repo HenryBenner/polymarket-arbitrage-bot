@@ -207,6 +207,7 @@ export interface BotConfig {
   ladderV15EmergencyPairCost: number;
   paperStartingUsdc: number;
   paperStatePath: string;
+  paperLogLevel: "normal" | "debug";
 }
 
 export function kalshiFeeRatesForSeries(
@@ -469,6 +470,7 @@ export function loadConfig(): BotConfig {
     ladderV15EmergencyPairCost: envNumber("LADDER_V15_EMERGENCY_PAIR_COST", 1.02),
     paperStartingUsdc: envNumber("PAPER_STARTING_USDC", 100),
     paperStatePath: envString("PAPER_STATE_PATH", strategyRaw === "ladder_v15" ? "./data/paper-ladder-v15" : "./data/paper"),
+    paperLogLevel: envString("PAPER_LOG_LEVEL", "normal") === "debug" ? "debug" : "normal",
   };
 }
 

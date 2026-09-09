@@ -15,6 +15,8 @@ export function v14LifecycleReport(snapshot: MarketExecutionSnapshot, endMs: num
   let unpairedSeconds = 0, unpairedShareSeconds = 0, episodes = 0;
   let previousMs: number | null = null;
   let priorQuantity = 0;
+  let openingShares = 0, grossCapitalDeployed = 0;
+  let makerRepairShares = 0, takerRepairShares = 0, soldResidualShares = 0;
   const advance = (atMs: number) => {
     if (previousMs !== null && priorQuantity > 1e-8) {
       const seconds = Math.max(0, atMs - previousMs) / 1000;
@@ -33,6 +35,8 @@ export function v14LifecycleReport(snapshot: MarketExecutionSnapshot, endMs: num
     const allIn = fill.price + (selling ? -1 : 1) * fill.fee / fill.size;
     const opening = order.pairId === "ladder-v14:opening";
     const taker = !opening && fill.liquidity === "taker";
+    if (!selling) grossCapitalDeployed += fill.price * fill.size + fill.fee;
+    if (opening && !selling) openingShares += fill.size;
     // Sales consume highest-cost residual lots, matching inventory replay.
     const eligible = lots.filter(lot => selling ? lot.token === fill.tokenId : lot.token !== fill.tokenId);
     if (selling) eligible.sort((a, b) => b.cost - a.cost);
@@ -40,13 +44,15 @@ export function v14LifecycleReport(snapshot: MarketExecutionSnapshot, endMs: num
       const size = Math.min(remaining, lot.size);
       const pnl = size * (selling ? allIn - lot.cost : 1 - allIn - lot.cost);
       if (selling) {
+        soldResidualShares += size;
         residualSalePnl += pnl;
         residualSaleLosses += Math.max(0, -pnl);
       } else if (opening && lot.opening) openingPairPnl += pnl;
       else if (taker || lot.taker) {
+        takerRepairShares += size;
         takerRepairPairPnl += pnl;
         takerHedgeLosses += Math.max(0, -pnl);
-      } else makerRepairPairPnl += pnl;
+      } else { makerRepairPairPnl += pnl; makerRepairShares += size; }
       remaining -= size;
       lot.size -= size;
       if (remaining <= 1e-8) break;
@@ -66,6 +72,9 @@ export function v14LifecycleReport(snapshot: MarketExecutionSnapshot, endMs: num
     repairLosses: takerHedgeLosses + residualSaleLosses,
     unpairedSeconds, unpairedShareSeconds, episodes,
     endingUnpairedShares: priorQuantity,
+    openingShares, grossCapitalDeployed, makerRepairShares, takerRepairShares, soldResidualShares,
+    pnlPerOpeningShare: snapshot.settledPnl === null || openingShares === 0 ? null : snapshot.settledPnl / openingShares,
+    pnlPerDeployedDollar: snapshot.settledPnl === null || grossCapitalDeployed === 0 ? null : snapshot.settledPnl / grossCapitalDeployed,
     settledPnl: snapshot.settledPnl,
     // Kept separate: settlement losses must not disappear from repair reporting.
     settlementResidualPnl: snapshot.settledPnl === null ? null
@@ -84,10 +93,15 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     "openingPairPnl", "makerRepairPairPnl", "takerRepairPairPnl", "pairedPnl",
     "takerHedgeLosses", "residualSalePnl", "residualSaleLosses", "repairLosses",
     "unpairedSeconds", "unpairedShareSeconds", "episodes", "settlementResidualPnl",
+    "openingShares", "grossCapitalDeployed", "makerRepairShares", "takerRepairShares", "soldResidualShares", "endingUnpairedShares", "settledPnl",
   ].map(key => [key, markets.reduce((sum, row) =>
     sum + Number(row[key as keyof V14LifecycleReport] ?? 0), 0)]));
   console.log(JSON.stringify({
     coverage: "Markets finalized by this version; historical markets without lifecycle reports are excluded.",
-    marketCount: markets.length, totals, markets,
+    marketCount: markets.length, totals,
+    pnlPerOpeningShare: totals.openingShares ? totals.settledPnl! / totals.openingShares : null,
+    pnlPerDeployedDollar: totals.grossCapitalDeployed ? totals.settledPnl! / totals.grossCapitalDeployed : null,
+    worstMarkets: [...markets].filter(m => m.settledPnl !== null).sort((a, b) => a.settledPnl! - b.settledPnl!).slice(0, 10),
+    markets,
   }, null, 2));
 }

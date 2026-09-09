@@ -244,7 +244,7 @@ export class ReverseBot {
         const snapshot = this.trader.getMarketExecutionSnapshot?.(
           settlement.marketSlug,
         );
-        if (snapshot) this.ladderV14History?.finalize(snapshot);
+        if (snapshot) this.ladderV14History?.finalize(snapshot, Date.now(), settlement);
         await this.ladderV14History?.flush();
         this.ladderV14Events.delete(settlement.marketSlug);
         this.ladderV14WakePending = true;

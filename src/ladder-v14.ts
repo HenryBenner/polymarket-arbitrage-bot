@@ -70,7 +70,9 @@ export interface LadderV14Amendment {
 }
 
 export interface LadderV14ResidualDecision {
-  action: "hedge" | "sell" | "wait";
+  action: "hedge" | "sell" | "wait" | "hold";
+  holdValue?: number | null;
+  reason?: string;
   size: number;
   hedgeValue: number | null;
   sellValue: number | null;
@@ -108,6 +110,16 @@ function midpoint(book: TokenBook): number | null {
   return book.bestBid === null || book.bestAsk === null
     ? null
     : (book.bestBid + book.bestAsk) / 2;
+}
+
+export function residualHoldValue(held: TokenBook, opposite: TokenBook): number | null {
+  for (const book of [held, opposite]) {
+    if (book.bestBid === null || book.bestAsk === null ||
+      !Number.isFinite(book.bestBid) || !Number.isFinite(book.bestAsk) ||
+      book.bestBid < 0 || book.bestAsk > 1 || book.bestBid > book.bestAsk) return null;
+  }
+  const heldMid = midpoint(held)!, oppositeMid = midpoint(opposite)!;
+  return heldMid + oppositeMid > 0 ? heldMid / (heldMid + oppositeMid) : null;
 }
 
 function series(event: UpDownEvent): string {
@@ -765,22 +777,36 @@ function planResidual(
       ? 1
       : model.expectedCompletionCost(context, makerPrice);
     const failedExit = model.expectedFailedExit(context);
+    const holdValue = residualHoldValue(surplus, deficient);
     const waitValue = completion.probability * (1 - completionCost) +
-      (1 - completion.probability) * failedExit;
+      (1 - completion.probability) * Math.max(failedExit, holdValue ?? 0);
     const cleanup = secondsRemaining <= config.ladderV14FinalCleanupSeconds;
     const choices = [
       ...(hedgeValue === null ? [] : [{ action: "hedge" as const, value: hedgeValue }]),
       ...(sellValue === null ? [] : [{ action: "sell" as const, value: sellValue }]),
       ...(cleanup ? [] : [{ action: "wait" as const, value: waitValue }]),
+      { action: "hold" as const, value: holdValue ?? 0 },
     ].sort((left, right) => right.value - left.value);
-    const action = choices[0]?.action ?? "wait";
-    decisions.push({ action, size, hedgeValue, sellValue, waitValue, context });
+    let action = choices[0]?.action ?? "hold";
+    if (!cleanup && hedgeValue !== null && hedgeValue > lot.allInPrice + EPSILON) {
+      action = sellValue !== null && sellValue > hedgeValue ? "sell" : "hedge";
+    }
+    if (action === "hedge" || action === "sell") {
+      const bestExit = Math.max(hedgeValue ?? -Infinity, sellValue ?? -Infinity);
+      const profitable = hedgeValue !== null && hedgeValue > lot.allInPrice + EPSILON;
+      if (!profitable && (holdValue === null || bestExit <= Math.max(holdValue,
+        cleanup ? -Infinity : waitValue) + (cleanup ? 0 : config.ladderV14RepairExitMargin))) {
+        action = !cleanup && waitValue > (holdValue ?? 0) ? "wait" : "hold";
+      }
+    }
+    decisions.push({ action, size, hedgeValue, sellValue, holdValue, waitValue,
+      reason: `${action}-has-best-value`, context });
     if (action === "wait") waitSize += size;
     consumed += size;
     if (consumed + EPSILON >= remaining) break;
   }
 
-  const immediate = decisions.find((decision) => decision.action !== "wait");
+  const immediate = decisions.find((decision) => decision.action === "hedge" || decision.action === "sell");
   if (immediate) {
     if (open.length > 0) {
       return {
@@ -895,10 +921,7 @@ function planVolumeFirstRepair(
   const finalCleanupAtMs =
     (event.windowEnd - config.ladderV14FinalCleanupSeconds) * 1_000;
   const episodeStartedAtMs = Date.parse(episode.residualStartedAt);
-  const maxRepairWaitAtMs = episodeStartedAtMs +
-    config.ladderV14RepairMaxWaitSeconds * 1_000;
-  const deadline = config.ladderV14ValueRepair ? finalCleanupAtMs
-    : Math.min(finalCleanupAtMs, maxRepairWaitAtMs);
+  const deadline = finalCleanupAtMs;
   const waiting = nowSeconds * 1_000 < deadline;
   const preserveSeconds = config.ladderV14RepairPreserveSeconds;
   const age = episode.residualAgeSeconds;
@@ -948,26 +971,6 @@ function planVolumeFirstRepair(
   let sale = sellDepth(quantity);
   let action: "hedge" | "sell" | null = null;
   let actionQuantity = askQuantity;
-  if (waiting && hedge && 1 - entry - hedge.total / askQuantity > EPSILON &&
-    (config.ladderV14ValueRepair || 1 - entry - hedge.total / askQuantity + EPSILON >= requiredEdge)) {
-    action = "hedge";
-    result.managementStage = "volume-first-repair-profitable-taker";
-  } else if (!waiting) {
-    // Compare executable values for the SAME quantity, not a full hedge
-    // against a shallow partial sale. Replan any remainder after each fill.
-    actionQuantity = hedge && sale ? Math.min(askQuantity, sale.size)
-      : hedge ? askQuantity : sale?.size ?? 0;
-    hedge = hedge && actionQuantity > EPSILON ? buyDepth(actionQuantity) : null;
-    sale = sale && actionQuantity > EPSILON ? sellDepth(actionQuantity) : null;
-    if (hedge || sale) {
-      action = hedge && (!sale ||
-        1 - hedge.total / actionQuantity + EPSILON >= sale.total / actionQuantity)
-        ? "hedge" : "sell";
-      result.managementStage = action === "hedge"
-        ? "volume-first-repair-deadline-hedge"
-        : "volume-first-repair-deadline-sale";
-    }
-  }
   const tick = Number(tickSizeFromMarket(event.market));
   const aggressivePrice = missing.bestAsk === null ? missing.bestBid
     : round(Math.floor((missing.bestAsk - EPSILON) / tick) * tick, 4);
@@ -989,7 +992,7 @@ function planVolumeFirstRepair(
       residualAgeSeconds: episode.residualAgeSeconds,
       priceMoveSinceFill: (midpoint(surplus) ?? entry) - entry,
     });
-  if (config.ladderV14ValueRepair) {
+  {
     // Always compare equal executable quantities. Time changes the maker
     // target and remaining horizon; only final cleanup removes waiting.
     actionQuantity = hedge && sale ? Math.min(askQuantity, sale.size)
@@ -999,7 +1002,8 @@ function planVolumeFirstRepair(
     const hedgeValue = hedge ? 1 - hedge.total / actionQuantity : null;
     const sellValue = sale ? sale.total / actionQuantity : null;
     const bestExit = Math.max(hedgeValue ?? -Infinity, sellValue ?? -Infinity);
-    const horizon = Math.max(0, Math.min(30, (finalCleanupAtMs - nowSeconds * 1000) / 1000));
+    const horizon = Math.max(0, (finalCleanupAtMs - nowSeconds * 1000) / 1000);
+    const holdValue = residualHoldValue(surplus, missing);
     const repairSize = actionQuantity > EPSILON ? actionQuantity : quantity;
     const makerCost = makerPrice === null ? null : makerPrice + exactKalshiOrderFee({
       price: makerPrice, size: repairSize, rate: snapshot.makerFeeRate ?? config.kalshiMakerFeeRate,
@@ -1021,19 +1025,25 @@ function planVolumeFirstRepair(
     const downside = Math.max(0, features.volatilityByToken[surplus.tokenId] ?? 0) *
       Math.sqrt(horizon / Math.max(1, config.ladderV14VolatilityWindowSeconds));
     const waitValue = completionProbability * (makerCost === null ? executable : 1 - makerCost) +
-      (1 - completionProbability) * Math.max(0, executable - downside);
+      (1 - completionProbability) * Math.max(holdValue ?? 0, executable - downside, 0);
     const profitableHedge = hedgeValue !== null && hedgeValue - entry > EPSILON;
-    const betterExit = bestExit > waitValue + config.ladderV14RepairExitMargin;
-    const mayExit = !waiting || profitableHedge ||
-      (age >= config.ladderV14RepairMaxWaitSeconds && betterExit);
+    const continuation = Math.max(holdValue ?? -Infinity, waiting ? waitValue : -Infinity);
+    const betterExit = bestExit > continuation + (waiting ? config.ladderV14RepairExitMargin : 0);
+    // Missing probability is not evidence that holding is worthless.
+    const mayExit = (waiting && profitableHedge) || (holdValue !== null && betterExit);
     action = Number.isFinite(bestExit) && mayExit
       ? hedgeValue !== null && (sellValue === null || hedgeValue + EPSILON >= sellValue)
         ? "hedge" : "sell"
       : null;
-    result.residualDecisions = [{ action: action ?? "wait", size: repairSize,
-      hedgeValue, sellValue, waitValue, context: { ...context, quantity: repairSize } }];
+    const passiveAction = waiting && makerPrice !== null && waitValue > (holdValue ?? 0) + EPSILON
+      ? "wait" : "hold";
+    result.residualDecisions = [{ action: action ?? passiveAction, size: repairSize,
+      hedgeValue, sellValue, holdValue, waitValue,
+      reason: action ? (profitableHedge ? "profitable-completion-or-better-sale" : "exit-beats-continuation")
+        : holdValue === null ? "hold-probability-unavailable" : `${passiveAction}-has-best-value`,
+      context: { ...context, quantity: repairSize } }];
     result.managementStage = action
-      ? `volume-first-repair-value-${action}` : "volume-first-repair-value-wait";
+      ? `volume-first-repair-value-${action}` : `volume-first-repair-value-${passiveAction}`;
   }
   if (action) {
     if (open.length > 0) return { ...result,
@@ -1053,7 +1063,7 @@ function planVolumeFirstRepair(
     };
     return result;
   }
-  if (!waiting || makerPrice === null || makerPrice < tick || makerPrice >= 1 ||
+  if (result.residualDecisions[0]?.action === "hold" || !waiting || makerPrice === null || makerPrice < tick || makerPrice >= 1 ||
     makerPrice >= (missing.bestAsk ?? 1)) {
     return { ...result, cancelOrderIds: open.map((order) => order.id) };
   }

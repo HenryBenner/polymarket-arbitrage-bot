@@ -291,7 +291,7 @@ test("V14 opens the next 10-share pair only after both sides of the cycle fill",
   }
 });
 
-test("V14 maximum repair wait wakes a quiet book, exits economically, and resumes", async () => {
+test("V14 quiet books do not force taker repair when residual age passes the old deadline", async () => {
   const directory = await mkdtemp(join(tmpdir(), "ladder-v14-deadline-"));
   const event = market("KXETH15M", "ETH", Math.floor(Date.now() / 1000) - 300);
   const executor = new V14Executor();
@@ -329,13 +329,10 @@ test("V14 maximum repair wait wakes a quiet book, exits economically, and resume
     // No book event or runOnce call: the bounded repair timer drives this.
     await new Promise((resolve) => setTimeout(resolve, 2200));
     assert.equal(bookReads, readsBeforeDeadline);
-    assert.equal(maker.status, "cancelled");
+    assert.equal(maker.status, "open");
     const hedges = state.orders.filter((order) => order.pairId === "ladder-v14:repair-taker");
-    assert.ok(hedges.length > 0);
-    assert.ok(hedges.every((order) => order.status === "filled"));
-    assert.equal(hedges.reduce((sum, order) => sum + order.originalSize, 0), opening.originalSize);
-    assert.equal(state.openOrders.length, 2, "the next cycle starts only after repair balances");
-    assert.ok(state.openOrders.every((order) => order.pairId === "ladder-v14:opening"));
+    assert.equal(hedges.length, 0);
+    assert.equal(state.openOrders.length, 1, "new openings remain blocked while unpaired");
   } finally {
     // Cancel a pending timer even if an assertion fails before the deadline.
     (bot as unknown as { scheduleLadderV14RepairWake(deadline: undefined): void })

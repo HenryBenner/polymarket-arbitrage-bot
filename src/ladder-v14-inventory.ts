@@ -97,6 +97,9 @@ export function ladderV14Inventory(
     [noId, 0],
   ]);
   let episode: LadderV14ResidualEpisode | null = null;
+  // Safeguard ledger: match on arrival (FIFO), permanently excluding paired lots.
+  // Keep the legacy aggregate accounting above/below unchanged for normal V14.
+  const currentResidualLots: LadderV14Lot[] = [];
 
   for (const fill of fills) {
     const tokenLots = lots.get(fill.tokenId);
@@ -112,11 +115,29 @@ export function ladderV14Inventory(
         orderId: fill.orderId,
         role: order?.pairId ?? "ladder-v14:unknown",
       });
+      let unmatched = fill.size;
+      while (unmatched > EPSILON && currentResidualLots.length > 0 &&
+        currentResidualLots[0]!.tokenId !== fill.tokenId) {
+        const lot = currentResidualLots[0]!;
+        const paired = Math.min(unmatched, lot.size);
+        unmatched = round(unmatched - paired);
+        lot.size = round(lot.size - paired);
+        if (lot.size <= EPSILON) currentResidualLots.shift();
+      }
+      if (unmatched > EPSILON) {
+        currentResidualLots.push({ ...tokenLots[tokenLots.length - 1]!, size: unmatched });
+      }
       quantities.set(
         fill.tokenId,
         round((quantities.get(fill.tokenId) ?? 0) + fill.size),
       );
     } else {
+      if (currentResidualLots[0]?.tokenId === fill.tokenId) {
+        const arrivalOrder = [...currentResidualLots];
+        takeHighestCostLots(currentResidualLots, fill.size);
+        currentResidualLots.splice(0, currentResidualLots.length,
+          ...arrivalOrder.filter(lot => lot.size > EPSILON));
+      }
       takeHighestCostLots(tokenLots, fill.size);
       quantities.set(
         fill.tokenId,
@@ -174,6 +195,10 @@ export function ladderV14Inventory(
     unpairedShares,
     episode,
     residualLots,
+    currentResidualLots,
+    residualEntryBasis: unpairedShares > EPSILON
+      ? currentResidualLots.reduce((sum, lot) => sum + lot.size * lot.allInPrice, 0) / unpairedShares
+      : null,
     unpairedCost: episode
       ? lotCost(lots.get(episode.surplusTokenId) ?? [], unpairedShares, true)
       : 0,

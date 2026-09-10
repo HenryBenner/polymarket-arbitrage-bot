@@ -572,6 +572,23 @@ test("ladder_v12 is BTC-only Kalshi paper/live mode with existing live safeguard
   );
 });
 
+test("V14 residual safeguard settings reject invalid thresholds", () => {
+  const config = testConfig({ exchange: "kalshi", strategyMode: "ladder_v14",
+    kalshiApiKeyId: "test-key", kalshiPrivateKeyPem: "test-private-key" });
+  assert.doesNotThrow(() => validateTradingConfig(config));
+  for (const key of ["ladderV14GuardMinShares", "ladderV14GuardGraceSeconds",
+    "ladderV14GuardAgedAdverse", "ladderV14MaxSettlementShares",
+    "ladderV14MaxSettlementCost"] as const) {
+    for (const value of [-1, NaN, Infinity]) {
+      assert.throws(() => validateTradingConfig({ ...config, [key]: value }), /LADDER_V14/);
+    }
+  }
+  for (const key of ["ladderV14GuardMinShares", "ladderV14MaxSettlementShares",
+    "ladderV14MaxSettlementCost"] as const) {
+    assert.throws(() => validateTradingConfig({ ...config, [key]: 0 }), /LADDER_V14/);
+  }
+});
+
 test("ladder_v13 is full-window BTC-only Kalshi paper/live mode", () => {
   const config = testConfig({
     exchange: "kalshi",

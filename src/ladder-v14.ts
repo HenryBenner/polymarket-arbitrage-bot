@@ -1098,6 +1098,110 @@ function planVolumeFirstRepair(
   return result;
 }
 
+/** Overlay only tail protection; normal opening, maker and continuation models stay intact. */
+function applyResidualSafeguard(
+  config: BotConfig, event: UpDownEvent, snapshot: MarketExecutionSnapshot,
+  inventory: ReturnType<typeof ladderV14Inventory>,
+  features: LadderV14MarketFeatures, nowSeconds: number, normal: LadderV14Plan,
+): LadderV14Plan {
+  const episode = inventory.episode!;
+  const basis = inventory.residualEntryBasis;
+  const quantity = inventory.unpairedShares;
+  if (basis === null || !Number.isFinite(basis) || basis <= 0) return normal;
+  const held = snapshot.books.find(book => book.tokenId === episode.surplusTokenId)!;
+  const opposite = snapshot.books.find(book => book.tokenId !== held.tokenId)!;
+  const holdValue = residualHoldValue(held, opposite);
+  const cleanup = event.windowEnd - nowSeconds <= config.ladderV14FinalCleanupSeconds;
+  const graceAtMs = Date.parse(episode.residualStartedAt) + config.ladderV14GuardGraceSeconds * 1000;
+  if (!cleanup && quantity + EPSILON >= config.ladderV14GuardMinShares &&
+    nowSeconds * 1000 < graceAtMs) {
+    normal = { ...normal, nextWakeAtMs: Math.min(normal.nextWakeAtMs ?? Infinity, graceAtMs) };
+  }
+  const aged = episode.residualAgeSeconds + EPSILON >= config.ladderV14GuardGraceSeconds &&
+    quantity + EPSILON >= config.ladderV14GuardMinShares &&
+    holdValue !== null && basis - holdValue + EPSILON >= config.ladderV14GuardAgedAdverse;
+  const terminalHold = cleanup && normal.residualDecisions.some(decision => decision.action === "hold");
+  const keep = Math.floor((Math.min(config.ladderV14MaxSettlementShares,
+    config.ladderV14MaxSettlementCost / basis) + EPSILON) * 100) / 100;
+  const excess = Math.floor((quantity - keep + EPSILON) * 100) / 100;
+  if ((!aged && !terminalHold) || excess <= EPSILON) return normal;
+
+  const asks = opposite.asks.filter(level => Number.isFinite(level.price) &&
+    level.price > 0 && level.price < 1 && Number.isFinite(level.size) && level.size > 0)
+    .sort((left, right) => left.price - right.price);
+  const buy = (size: number) => exactKalshiDepthCost({ levels: asks, size,
+    rate: snapshot.takerFeeRate, exponent: snapshot.takerFeeExponent });
+  const sell = (size: number) => exactKalshiDepthProceeds({ levels: held.bids, size,
+    rate: snapshot.takerFeeRate, exponent: snapshot.takerFeeExponent });
+  const floorSize = (size: number) => Math.floor((size + EPSILON) * 100) / 100;
+  // A profitable executable prefix gets priority even when deeper asks lose money.
+  // A passive quote (at any price) is deliberately not evidence of completion.
+  let profitableSize = 0;
+  let cumulative = 0;
+  for (const level of asks) {
+    cumulative += level.size;
+    const size = floorSize(Math.min(quantity, cumulative));
+    if (size + EPSILON >= opposite.minOrderSize) {
+      const depth = buy(size);
+      if (depth && size * (1 - basis) - depth.total > EPSILON) profitableSize = size;
+    }
+    if (cumulative + EPSILON >= quantity) break;
+  }
+  let size: number;
+  let action: "hedge" | "sell";
+  let hedge: ReturnType<typeof buy> = null;
+  let sale: ReturnType<typeof sell> = null;
+  if (profitableSize > EPSILON) {
+    size = profitableSize;
+    action = "hedge";
+    hedge = buy(size);
+    sale = sell(size);
+  } else {
+    const askSize = floorSize(Math.min(excess, asks.reduce((sum, level) => sum + level.size, 0)));
+    const bidSize = floorSize(sell(excess)?.size ?? 0);
+    const canBuy = askSize > EPSILON && askSize + EPSILON >= opposite.minOrderSize;
+    const canSell = bidSize > EPSILON && bidSize + EPSILON >= held.minOrderSize;
+    if (!canBuy && !canSell) return normal;
+    // Compare the same executable quantity and re-evaluate after the actual fill.
+    size = canBuy && canSell ? Math.min(askSize, bidSize) : canBuy ? askSize : bidSize;
+    hedge = canBuy && size + EPSILON >= opposite.minOrderSize ? buy(size) : null;
+    sale = canSell && size + EPSILON >= held.minOrderSize ? sell(size) : null;
+    if (!hedge && !sale) return normal;
+    action = hedge && (!sale || size - hedge.total + EPSILON >= sale.total) ? "hedge" : "sell";
+  }
+  const reason = profitableSize > EPSILON ? "profitable-taker-before-safeguard"
+    : cleanup ? "terminal-residual-excess" : "aged-adverse-residual-excess";
+  const context = contextFor(config, event, opposite, basis, size, 0, 0,
+    event.windowEnd - nowSeconds, features, {
+      side: held.outcome, entryPrice: basis, currentBid: held.bestBid,
+      currentMid: holdValue, priceMoveSinceFill: (holdValue ?? basis) - basis,
+      residualAgeSeconds: episode.residualAgeSeconds,
+    });
+  const decision: LadderV14ResidualDecision = {
+    action, size, hedgeValue: hedge ? 1 - hedge.total / size : null,
+    sellValue: sale && sale.size + EPSILON >= size ? sale.total / size : null,
+    holdValue, waitValue: normal.residualDecisions[0]?.waitValue ?? holdValue ?? 0,
+    reason, context,
+  };
+  const result: LadderV14Plan = { ...normal, opportunities: [], flattenOpportunities: [],
+    amendments: [], cancelOrderIds: [], placementContexts: {}, residualDecisions: [decision],
+    managementStage: reason };
+  const open = snapshot.openOrders.filter(isV14Order);
+  if (open.length > 0) {
+    return { ...result, cancelOrderIds: open.map(order => order.id),
+      managementStage: `${reason}-cancel-before-exit` };
+  }
+  const role = action === "hedge" ? "repair-taker" : "repair-sale";
+  const depth = action === "hedge" ? hedge! : sale!;
+  const key = `${V14_PREFIX}${event.slug}:${role}:${episode.id}:guard:q${size}:${Math.floor(nowSeconds * 1000)}`;
+  const target = opportunity(event, action === "hedge" ? opposite : held,
+    action === "hedge" ? "BUY" : "SELL", depth.limitPrice, size, "fak", role, key);
+  result.opportunities = action === "hedge" ? [target] : [];
+  result.flattenOpportunities = action === "sell" ? [target] : [];
+  result.placementContexts[key] = { kind: action === "hedge" ? "completion" : "failed_exit", context };
+  return result;
+}
+
 export function planLadderV14(
   config: BotConfig,
   event: UpDownEvent,
@@ -1143,9 +1247,10 @@ export function planLadderV14(
       managementStage: "market-expired" };
   }
   if (config.ladderV14VolumeFirstMode && inventory.unpairedShares > EPSILON) {
-    return { ...base, ...planVolumeFirstRepair(
+    return applyResidualSafeguard(config, event, snapshot, inventory, features, nowSeconds,
+      { ...base, ...planVolumeFirstRepair(
       config, event, snapshot, books, features, nowSeconds,
-    ) };
+    ) });
   }
   if (
     config.ladderV14VolumeFirstMode &&
@@ -1156,9 +1261,10 @@ export function planLadderV14(
         ? "volume-first-cancel-final-grid" : "volume-first-final-balanced" };
   }
   if (!config.ladderV14VolumeFirstMode && inventory.unpairedShares > EPSILON) {
-    return { ...base, ...planResidual(
+    return applyResidualSafeguard(config, event, snapshot, inventory, features, nowSeconds,
+      { ...base, ...planResidual(
       config, event, snapshot, books, features, model, nowSeconds,
-    ) };
+    ) });
   }
 
   // A completed repair may still have a cancellation/in-flight remainder.

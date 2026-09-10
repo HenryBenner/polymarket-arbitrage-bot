@@ -405,6 +405,179 @@ function postedRepair(state: MarketExecutionSnapshot): PaperOrder {
     pairId: target.pairId, orderPolicy: target.orderPolicy, pairLockRole: target.pairLockRole };
 }
 
+function guardState(entry = 0.4, size = 200) {
+  const state = residualState(entry, 0.87, 0.22, size);
+  state.books[0]!.bestAsk = 0.34;
+  state.books[0]!.asks = [{ price: 0.34, size: 500 }];
+  state.books[1]!.bestBid = 0.57;
+  state.books[1]!.bids = [{ price: 0.57, size: 500 }];
+  return state;
+}
+
+test("V14 safeguard basis excludes old pairs, includes fees, and resets on balance or side flip", () => {
+  const state = guardState();
+  const prior = [v14Order("old-up", "up-token", 0.8, 1000),
+    v14Order("old-down", "down-token", 0.1, 1000)];
+  const priorFills = prior.map((order, i) => ({ ...v14Fill(order),
+    timestamp: new Date((repairNow - 20 + i) * 1000).toISOString() }));
+  state.orders = [...prior, ...state.orders];
+  state.fills = [...priorFills, { ...state.fills[0]!, fee: 2 }];
+  let inv = ladderV14Inventory(state);
+  assert.equal(inv.residualEntryBasis, 0.41);
+  assert.ok(inv.unpairedCost / inv.unpairedShares > inv.residualEntryBasis!);
+  assert.deepEqual(inv.currentResidualLots.map(lot => lot.orderId), ["repair-up"]);
+  const repair = v14Order("new-repair", "down-token", 0.55, 200);
+  state.orders = [...state.orders, repair];
+  state.fills = [...state.fills, { ...v14Fill(repair),
+    timestamp: new Date((repairNow + 1) * 1000).toISOString() }];
+  inv = ladderV14Inventory(state);
+  assert.equal(inv.residualEntryBasis, null);
+  assert.equal(inv.currentResidualLots.length, 0);
+  const flip = v14Order("flip", "down-token", 0.2, 120);
+  state.orders = [...state.orders, flip];
+  state.fills = [...state.fills, { ...v14Fill(flip), fee: 1.2,
+    timestamp: new Date((repairNow + 2) * 1000).toISOString() }];
+  inv = ladderV14Inventory(state, repairNow + 5);
+  assert.ok(Math.abs(inv.residualEntryBasis! - 0.21) < 1e-8);
+  assert.equal(inv.episode!.surplusTokenId, "down-token");
+  assert.equal(inv.episode!.residualAgeSeconds, 3);
+});
+
+test("V14 safeguard requires size, age and adverse hold together, then sells only excess", () => {
+  const state = guardState();
+  for (const elapsed of [0, 59.99]) {
+    const plan = volumePlan(state, repairNow + elapsed);
+    assert.ok(!plan.managementStage.includes("residual-excess"));
+    assert.equal(plan.flattenOpportunities.length, 0);
+  }
+  assert.equal(volumePlan(state, repairNow).nextWakeAtMs, (repairNow + 60) * 1000);
+  const trim = volumePlan(state, repairNow + 60);
+  assert.equal(trim.managementStage, "aged-adverse-residual-excess");
+  assert.equal(trim.flattenOpportunities[0]!.size, 150);
+  assert.equal(trim.flattenOpportunities[0]!.price, 0.22);
+  assert.equal(trim.residualDecisions[0]!.context.entryPrice, 0.4);
+  assert.equal(trim.opportunities.length, 0);
+  assert.ok(!volumePlan(guardState(0.4, 99), repairNow + 120).managementStage.includes("residual-excess"));
+  // Hold is 28c: a 0.9c decline does not trigger; a full cent does.
+  assert.ok(!volumePlan(guardState(0.289), repairNow + 120).managementStage.includes("residual-excess"));
+  assert.equal(volumePlan(guardState(0.29), repairNow + 120).flattenOpportunities[0]!.size, 150);
+  assert.ok(!volumePlan(guardState(0.2), repairNow + 120).managementStage.includes("residual-excess"));
+});
+
+test("V14 safeguard rematches only current lots after partial repair and sells", () => {
+  const state = guardState(0.2, 100);
+  const expensive = v14Order("expensive-new", "up-token", 0.6, 100);
+  const repair = v14Order("partial-repair", "down-token", 0.3, 100);
+  const sale = v14Order("partial-sale", "up-token", 0.2, 40);
+  sale.side = "SELL";
+  state.orders = [...state.orders, expensive, repair, sale];
+  state.fills = [...state.fills,
+    { ...v14Fill(expensive), timestamp: new Date((repairNow + 1) * 1000).toISOString() },
+    { ...v14Fill(repair), timestamp: new Date((repairNow + 2) * 1000).toISOString() },
+    { ...v14Fill(sale), side: "SELL", timestamp: new Date((repairNow + 3) * 1000).toISOString() }];
+  const inventory = ladderV14Inventory(state);
+  assert.equal(inventory.unpairedShares, 60);
+  assert.equal(inventory.residualEntryBasis, 0.6);
+  assert.deepEqual(inventory.currentResidualLots.map(lot => [lot.orderId, lot.size]),
+    [["expensive-new", 60]]);
+  const flip = v14Order("overshoot", "down-token", 0.35, 80);
+  state.orders = [...state.orders, flip];
+  state.fills = [...state.fills, { ...v14Fill(flip), fee: 0.8,
+    timestamp: new Date((repairNow + 4) * 1000).toISOString() }];
+  const flipped = ladderV14Inventory(state, repairNow + 5);
+  assert.equal(flipped.unpairedShares, 20);
+  assert.equal(flipped.residualEntryBasis, 0.36);
+  assert.equal(flipped.episode!.residualAgeSeconds, 1);
+});
+
+test("V14 safeguard respects the dollar core and chooses a better loss-locking hedge", () => {
+  const state = guardState(0.6);
+  state.books[1]!.bestAsk = 0.7;
+  state.books[1]!.asks = [{ price: 0.7, size: 500 }];
+  const plan = volumePlan(state, repairNow + 60);
+  assert.equal(plan.opportunities[0]!.size, 158.34);
+  assert.equal(plan.opportunities[0]!.price, 0.7);
+  assert.equal(plan.flattenOpportunities.length, 0);
+  assert.ok((200 - plan.opportunities[0]!.size) * 0.6 <= 25 + 1e-8);
+});
+
+test("V14 safeguard prioritizes profitable live taker depth, including a partial prefix", () => {
+  const state = guardState();
+  state.books[1]!.bestAsk = 0.5;
+  state.books[1]!.bestBid = 0.49;
+  state.books[1]!.bids = [{ price: 0.49, size: 500 }];
+  state.books[1]!.asks = [{ price: 0.5, size: 200 }];
+  for (const now of [repairNow + 60, cleanupNow]) {
+    const plan = volumePlan(state, now);
+    assert.equal(plan.opportunities[0]!.size, 200);
+    assert.equal(plan.flattenOpportunities.length, 0);
+  }
+  state.books[1]!.asks = [{ price: 0.5, size: 20 }, { price: 0.9, size: 500 }];
+  const partial = volumePlan(state, repairNow + 60);
+  assert.equal(partial.managementStage, "profitable-taker-before-safeguard");
+  assert.equal(partial.opportunities[0]!.size, 20);
+  assert.equal(partial.opportunities[0]!.price, 0.5);
+  // Gross edge does not qualify when taker fees make it unprofitable.
+  state.books[1]!.asks = [{ price: 0.59, size: 500 }];
+  state.takerFeeRate = 0.07;
+  const fees = volumePlan(state, repairNow + 60);
+  assert.equal(fees.managementStage, "aged-adverse-residual-excess");
+  assert.equal(fees.opportunities[0]!.size, 150);
+});
+
+test("V14 safeguard cancels maker repair and recalculates after cancellation fills", () => {
+  const state = guardState();
+  const maker = v14Order("resting-repair", "down-token", 0.5, 200, "open");
+  maker.pairId = "ladder-v14:repair-maker:test";
+  state.orders = [...state.orders, maker];
+  state.openOrders = [maker];
+  const cancel = volumePlan(state, repairNow + 60);
+  assert.deepEqual(cancel.cancelOrderIds, [maker.id]);
+  assert.equal(cancel.opportunities.length + cancel.flattenOpportunities.length, 0);
+  maker.status = "cancelled";
+  maker.remainingSize = 0;
+  state.openOrders = [];
+  state.fills = [...state.fills, { ...v14Fill(maker, 80),
+    timestamp: new Date((repairNow + 60) * 1000).toISOString() }];
+  const trim = volumePlan(state, repairNow + 61);
+  assert.equal(trim.flattenOpportunities[0]!.size, 70);
+  const sale = v14Order("tail-sale", "up-token", 0.22, 70);
+  sale.side = "SELL";
+  sale.pairId = "ladder-v14:repair-sale";
+  state.orders = [...state.orders, sale];
+  state.fills = [...state.fills, { ...v14Fill(sale), side: "SELL",
+    timestamp: new Date((repairNow + 62) * 1000).toISOString() }];
+  assert.equal(ladderV14Inventory(state).unpairedShares, 50);
+  assert.ok(!volumePlan(state, repairNow + 63).managementStage.includes("residual-excess"));
+});
+
+test("V14 terminal cap applies below the aged size threshold and respects actual depth", () => {
+  const state = guardState(0.4, 80);
+  const terminal = volumePlan(state, cleanupNow);
+  assert.equal(terminal.managementStage, "terminal-residual-excess");
+  assert.equal(terminal.flattenOpportunities[0]!.size, 30);
+  state.books[0]!.bids = [{ price: 0.22, size: 7 }];
+  state.books[1]!.asks = [];
+  assert.equal(volumePlan(state, cleanupNow).flattenOpportunities[0]!.size, 7);
+  state.books[0]!.bids = [];
+  const empty = volumePlan(state, cleanupNow);
+  assert.equal(empty.flattenOpportunities.length + empty.opportunities.length, 0);
+  assert.equal(empty.residualDecisions[0]!.action, "hold");
+  assert.equal(volumePlan(guardState(0.4, 50), cleanupNow).flattenOpportunities.length, 0);
+});
+
+test("V14 safeguard settings are configurable and also apply to EV residual mode", () => {
+  const state = guardState();
+  const config = testConfig({ exchange: "kalshi", strategyMode: "ladder_v14",
+    ladderV14GuardMinShares: 150, ladderV14GuardGraceSeconds: 90,
+    ladderV14GuardAgedAdverse: 0.1, ladderV14MaxSettlementShares: 20,
+    ladderV14MaxSettlementCost: 5 });
+  const at = (age: number) => planLadderV14(config, event, state,
+    new LadderV14ConditionalModel(parameters), features([...state.books]), repairNow + age);
+  assert.ok(!at(89).managementStage.includes("residual-excess"));
+  assert.equal(at(90).flattenOpportunities[0]!.size, 187.5);
+});
+
 test("V14 holds the 28c residual instead of selling at 22c or hedging at 13c near expiry", () => {
   const state = residualState(0.4, 0.87, 0.22);
   state.books[0]!.bestAsk = 0.34;

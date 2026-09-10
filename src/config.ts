@@ -194,6 +194,11 @@ export interface BotConfig {
   ladderV14CycleShares: number;
   ladderV14MaxUnpairedCost: number;
   ladderV14MaxUnpairedShares: number;
+  ladderV14GuardMinShares: number;
+  ladderV14GuardGraceSeconds: number;
+  ladderV14GuardAgedAdverse: number;
+  ladderV14MaxSettlementShares: number;
+  ladderV14MaxSettlementCost: number;
   ladderV14VolumeFirstPairCost: number;
   ladderV15EntryMinutesMax: number;
   ladderV15EntryMinutesMin: number;
@@ -452,6 +457,11 @@ export function loadConfig(): BotConfig {
     ),
     ladderV14MaxUnpairedCost: envNumber("LADDER_V14_MAX_UNPAIRED_COST", 125),
     ladderV14MaxUnpairedShares: envNumber("LADDER_V14_MAX_UNPAIRED_SHARES", 250),
+    ladderV14GuardMinShares: envNumber("LADDER_V14_GUARD_MIN_SHARES", 100),
+    ladderV14GuardGraceSeconds: envNumber("LADDER_V14_GUARD_GRACE_SECONDS", 60),
+    ladderV14GuardAgedAdverse: envNumber("LADDER_V14_GUARD_AGED_ADVERSE", 0.01),
+    ladderV14MaxSettlementShares: envNumber("LADDER_V14_MAX_SETTLEMENT_SHARES", 50),
+    ladderV14MaxSettlementCost: envNumber("LADDER_V14_MAX_SETTLEMENT_COST", 25),
     ladderV14CycleShares: envNumber(
       "LADDER_V14_CYCLE_SHARES",
       10,
@@ -967,6 +977,11 @@ export function validateTradingConfig(config: BotConfig): void {
     config.ladderV14QuantityQueueWeight <= 0 ||
     !Number.isFinite(config.ladderV14ReachabilityMultiplier) ||
     config.ladderV14ReachabilityMultiplier <= 0 ||
+    !Number.isFinite(config.ladderV14GuardMinShares) || config.ladderV14GuardMinShares <= 0 ||
+    !Number.isFinite(config.ladderV14GuardGraceSeconds) || config.ladderV14GuardGraceSeconds < 0 ||
+    !Number.isFinite(config.ladderV14GuardAgedAdverse) || config.ladderV14GuardAgedAdverse < 0 ||
+    !Number.isFinite(config.ladderV14MaxSettlementShares) || config.ladderV14MaxSettlementShares <= 0 ||
+    !Number.isFinite(config.ladderV14MaxSettlementCost) || config.ladderV14MaxSettlementCost <= 0 ||
     !Number.isFinite(config.ladderV14MaxUnpairedCost) ||
     config.ladderV14MaxUnpairedCost <= 0 ||
     !Number.isFinite(config.ladderV14MaxUnpairedShares) ||

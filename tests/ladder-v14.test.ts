@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { LadderV14ConditionalModel, ladderV14Parameters, type LadderV14ConditionalContext } from "../src/ladder-v14-model.js";
-import { ladderV14BuyGuard, ladderV14Inventory, ladderV14SellGuard } from "../src/ladder-v14-inventory.js";
+import { ladderV14BuyGuard, ladderV14Inventory, ladderV14SellGuard, ladderV14ExposureSize } from "../src/ladder-v14-inventory.js";
 import { pairedMakerPrices, planLadderV14, residualHoldValue, type LadderV14MarketFeatures } from "../src/ladder-v14.js";
 import { PaperTrader } from "../src/paper-trader.js";
 import { v14LifecycleReport } from "../src/ladder-v14-report.js";
@@ -15,6 +15,36 @@ const event = {
   ...testEvent(),
   market: { ...testEvent().market, seriesTicker: "KXBTC15M" },
 };
+
+test("V14 limits fee-inclusive unpaired exposure and excludes completed pairs", () => {
+  const config = testConfig();
+  const books = testBooks(0.6, 0.4, 1);
+  const empty = snapshot(books);
+  assert.equal(ladderV14ExposureSize(config, empty, books[0]!.tokenId, 0.01, 1e6), 250);
+  assert.equal(ladderV14ExposureSize(config, empty, books[0]!.tokenId, 0.8, 1e6), 156.25);
+  const charged = { ...empty, makerFeeRate: 0.07 };
+  assert.ok(ladderV14ExposureSize(config, charged, books[0]!.tokenId, 0.8, 1e6) < 156.25);
+  const paired = books.map((book, i) => v14Order(`paired-${i}`, book.tokenId, 0.49, 1000));
+  const balanced = snapshot(books, paired, paired.map(order => v14Fill(order)));
+  assert.equal(ladderV14Inventory(balanced).unpairedCost, 0);
+  assert.equal(ladderV14ExposureSize(config, balanced, books[0]!.tokenId, 0.5, 1e6), 250);
+  const pending = v14Order("pending", books[0]!.tokenId, 0.5, 200, "open");
+  const state = snapshot(books, [pending]);
+  const order: TradeOpportunity = { event, token: books[0]!, kind: "maker",
+    price: 0.5, size: 51, tickSize: "0.01", negRisk: false,
+    strategyMode: "ladder_v14", pairId: "ladder-v14:opening",
+    orderPolicy: "post_only", tradeKey: "limit-test" };
+  assert.equal(ladderV14BuyGuard(state, order, undefined, config), "v14_unpaired_exposure_limit");
+  assert.equal(ladderV14BuyGuard(state, { ...order, size: 50 }, undefined, config), null);
+  assert.equal(ladderV14BuyGuard(state, { ...order, size: 250 }, pending.id, config), null);
+  assert.equal(ladderV14BuyGuard(empty, { ...order, size: 250 }, undefined, config), null);
+  const legacy = v14Order("legacy", books[0]!.tokenId, 0.8, 500);
+  const residual = snapshot(books, [legacy], [v14Fill(legacy)]);
+  assert.equal(ladderV14BuyGuard(residual, { ...order, token: books[1]!, size: 500,
+    pairId: "ladder-v14:repair-maker:test" }, undefined, config), null);
+  assert.equal(ladderV14ExposureSize(testConfig({ ladderV14MaxUnpairedCost: 10,
+    ladderV14MaxUnpairedShares: 100 }), empty, books[0]!.tokenId, 0.5, 1000), 20);
+});
 
 function features(books: readonly TokenBook[]): LadderV14MarketFeatures {
   return {

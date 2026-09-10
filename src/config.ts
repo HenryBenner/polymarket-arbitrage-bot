@@ -192,6 +192,8 @@ export interface BotConfig {
   ladderV14ReachabilityMultiplier: number;
   ladderV14VolumeFirstMode: boolean;
   ladderV14CycleShares: number;
+  ladderV14MaxUnpairedCost: number;
+  ladderV14MaxUnpairedShares: number;
   ladderV14VolumeFirstPairCost: number;
   ladderV15EntryMinutesMax: number;
   ladderV15EntryMinutesMin: number;
@@ -448,6 +450,8 @@ export function loadConfig(): BotConfig {
       "LADDER_V14_VOLUME_FIRST_MODE",
       true,
     ),
+    ladderV14MaxUnpairedCost: envNumber("LADDER_V14_MAX_UNPAIRED_COST", 125),
+    ladderV14MaxUnpairedShares: envNumber("LADDER_V14_MAX_UNPAIRED_SHARES", 250),
     ladderV14CycleShares: envNumber(
       "LADDER_V14_CYCLE_SHARES",
       10,
@@ -963,6 +967,10 @@ export function validateTradingConfig(config: BotConfig): void {
     config.ladderV14QuantityQueueWeight <= 0 ||
     !Number.isFinite(config.ladderV14ReachabilityMultiplier) ||
     config.ladderV14ReachabilityMultiplier <= 0 ||
+    !Number.isFinite(config.ladderV14MaxUnpairedCost) ||
+    config.ladderV14MaxUnpairedCost <= 0 ||
+    !Number.isFinite(config.ladderV14MaxUnpairedShares) ||
+    config.ladderV14MaxUnpairedShares <= 0 ||
     !Number.isFinite(config.ladderV14CycleShares) ||
     config.ladderV14CycleShares <= 0 ||
     !Number.isFinite(config.ladderV14VolumeFirstPairCost) ||

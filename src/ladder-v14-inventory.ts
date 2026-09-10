@@ -1,4 +1,6 @@
 import type { MarketExecutionSnapshot, PaperFill, TradeOpportunity } from "./types.js";
+import type { BotConfig } from "./config.js";
+import { exactKalshiOrderFee } from "./kalshi-fees.js";
 
 const EPSILON = 1e-8;
 const round = (value: number): number => Math.round(value * 1e8) / 1e8;
@@ -183,11 +185,40 @@ export function ladderV14Inventory(
   };
 }
 
+/** Maximum new same-side exposure. Opposite resting orders are never assumed filled. */
+export function ladderV14ExposureSize(
+  config: BotConfig, snapshot: MarketExecutionSnapshot, tokenId: string,
+  price: number, requested: number, reservedShares = 0, reservedCost = 0,
+  maker = true,
+): number {
+  const inventory = ladderV14Inventory(snapshot);
+  const held = inventory.episode?.surplusTokenId === tokenId;
+  const repair = inventory.episode && !held ? inventory.unpairedShares : 0;
+  const cost = (held ? inventory.unpairedCost : 0) + reservedCost;
+  const shares = (held ? inventory.unpairedShares : 0) + reservedShares;
+  const rate = maker ? snapshot.makerFeeRate ?? config.kalshiMakerFeeRate : snapshot.takerFeeRate;
+  let low = 0;
+  let high = Math.floor(Math.max(0, Math.min(requested,
+    repair + config.ladderV14MaxUnpairedShares - shares)) * 100);
+  // Fees round, so solve the cumulative cost boundary at the order size increment.
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    const extra = Math.max(0, mid / 100 - repair);
+    const total = cost + extra * price + exactKalshiOrderFee({
+      price, size: extra, rate, exponent: snapshot.takerFeeExponent,
+    });
+    if (extra === 0 || total <= config.ladderV14MaxUnpairedCost + EPSILON) low = mid;
+    else high = mid - 1;
+  }
+  return low / 100;
+}
+
 /** Volume-first state-machine invariant, rechecked inside the mutation lock. */
 export function ladderV14BuyGuard(
   snapshot: MarketExecutionSnapshot | null | undefined,
   opportunity: TradeOpportunity,
   replacingOrderId?: string,
+  config?: BotConfig,
 ): string | null {
   if (!snapshot || snapshot.marketDataValid === false) return "invalid_market_data";
   if (snapshot.executionPending) return "pending_execution_reconciliation";
@@ -195,6 +226,23 @@ export function ladderV14BuyGuard(
   const inventory = ladderV14Inventory(snapshot);
   const open = snapshot.openOrders.filter((order) =>
     order.id !== replacingOrderId && order.pairId?.startsWith("ladder-v14:"));
+  if (config) {
+    const sameSide = open.filter(order => order.tokenId === opportunity.token.tokenId &&
+      (order.side ?? "BUY") === "BUY");
+    const reservedShares = sameSide.reduce((sum, order) => sum + order.remainingSize, 0);
+    const reservedCost = sameSide.reduce((sum, order) => sum +
+      order.remainingSize * order.limitPrice + exactKalshiOrderFee({
+        price: order.limitPrice, size: order.remainingSize,
+        rate: snapshot.makerFeeRate ?? config.kalshiMakerFeeRate,
+        exponent: snapshot.takerFeeExponent,
+      }), 0);
+    if (opportunity.size > ladderV14ExposureSize(config, snapshot,
+      opportunity.token.tokenId, opportunity.price, opportunity.size,
+      reservedShares, reservedCost, opportunity.orderPolicy === "post_only") + EPSILON) {
+      return "v14_unpaired_exposure_limit";
+    }
+    if (!config.ladderV14VolumeFirstMode) return null;
+  }
   if (opportunity.pairId === "ladder-v14:opening") {
     if (inventory.unpairedShares > EPSILON) return "repair_only_while_unpaired";
     if (open.some((order) => order.pairId !== "ladder-v14:opening")) {

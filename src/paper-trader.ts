@@ -442,8 +442,8 @@ export class PaperTrader implements OrderExecutor {
       };
     }
 
-    if (this.config.ladderV14VolumeFirstMode && opportunity.strategyMode === "ladder_v14") {
-      const reason = ladderV14BuyGuard(this.getMarketExecutionSnapshot(opportunity.event.slug), opportunity);
+    if (opportunity.strategyMode === "ladder_v14") {
+      const reason = ladderV14BuyGuard(this.getMarketExecutionSnapshot(opportunity.event.slug), opportunity, undefined, this.config);
       if (reason) return { dryRun: true, accepted: false, tokenId: opportunity.token.tokenId,
         side: "BUY", price: opportunity.price, size: opportunity.size,
         response: { paper: true, status: "rejected", reason } };
@@ -872,8 +872,8 @@ export class PaperTrader implements OrderExecutor {
         response: { paper: true, status: "rejected", reason: "order_not_open" },
       };
     }
-    if (this.config.ladderV14VolumeFirstMode && opportunity.strategyMode === "ladder_v14") {
-      const reason = ladderV14BuyGuard(this.getMarketExecutionSnapshot(opportunity.event.slug), opportunity, orderId);
+    if (opportunity.strategyMode === "ladder_v14") {
+      const reason = ladderV14BuyGuard(this.getMarketExecutionSnapshot(opportunity.event.slug), opportunity, orderId, this.config);
       if (reason) return { dryRun: true, accepted: false, tokenId: opportunity.token.tokenId,
         side: "BUY", price: opportunity.price, size: opportunity.size,
         response: { paper: true, status: "rejected", reason } };

@@ -405,17 +405,17 @@ test("shutdown drains a settlement event already admitted to the RAM queue", asy
 
 test("a burst of maker events updates RAM and wakes V14 without per-event checkpoints", async (t) => {
   const f = await fixture(t);
-  await f.trader.placeBuy({ ...f.opportunity, size: 500 });
+  assert.equal((await f.trader.placeBuy({ ...f.opportunity, size: 250 })).accepted, true);
   let wakes = 0;
   f.trader.setExecutionWakeHandler(() => { wakes += 1; });
   const atMs = Date.now();
-  await Promise.all(Array.from({ length: 500 }, (_, index) => f.trader.ingestMarketEvent({
+  await Promise.all(Array.from({ length: 250 }, (_, index) => f.trader.ingestMarketEvent({
     event_type: "last_trade_price", asset_id: "up-token", side: "SELL",
     price: "0.4", size: "1", timestamp: String(atMs), transaction_hash: `burst-${index}`,
   })));
-  assert.equal(f.trader.snapshot().fills.length, 500);
-  assert.equal(wakes, 500);
+  assert.equal(f.trader.snapshot().fills.length, 250);
+  assert.equal(wakes, 250);
   assert.equal((await f.readState()).orders.length, 0);
   const io = internals(f.trader);
-  t.diagnostic(`500 maker events: average processing lag ${(io.lagTotal / io.lagCount).toFixed(2)} ms; max ${io.lagMax} ms`);
+  t.diagnostic(`250 maker events: average processing lag ${(io.lagTotal / io.lagCount).toFixed(2)} ms; max ${io.lagMax} ms`);
 });

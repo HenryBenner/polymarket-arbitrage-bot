@@ -182,8 +182,7 @@ export class KalshiTrader implements OrderExecutor {
   }
 
   private async placeBuysLocked(opportunities: readonly TradeOpportunity[]): Promise<OrderResult[]> {
-    if (this.config.ladderV14VolumeFirstMode &&
-      opportunities.some((opportunity) => opportunity.strategyMode === "ladder_v14")) {
+    if (opportunities.some((opportunity) => opportunity.strategyMode === "ladder_v14")) {
       const results: OrderResult[] = [];
       for (const opportunity of opportunities) results.push(await this.placeBuyLocked(opportunity));
       return results;
@@ -409,8 +408,8 @@ export class KalshiTrader implements OrderExecutor {
   private async placeBuyLocked(
     opportunity: TradeOpportunity,
   ): Promise<OrderResult> {
-    if (this.config.ladderV14VolumeFirstMode && opportunity.strategyMode === "ladder_v14") {
-      const reason = ladderV14BuyGuard(this.getMarketExecutionSnapshot(opportunity.event.slug), opportunity);
+    if (opportunity.strategyMode === "ladder_v14") {
+      const reason = ladderV14BuyGuard(this.getMarketExecutionSnapshot(opportunity.event.slug), opportunity, undefined, this.config);
       if (reason) return { dryRun: this.config.dryRun, accepted: false, tokenId: opportunity.token.tokenId,
         side: "BUY", price: opportunity.price, size: opportunity.size,
         response: { status: "rejected", reason } };
@@ -679,8 +678,8 @@ export class KalshiTrader implements OrderExecutor {
         response: { status: "rejected", reason: "order_not_open" },
       };
     }
-    if (this.config.ladderV14VolumeFirstMode && opportunity.strategyMode === "ladder_v14") {
-      const reason = ladderV14BuyGuard(this.getMarketExecutionSnapshot(opportunity.event.slug), opportunity, orderId);
+    if (opportunity.strategyMode === "ladder_v14") {
+      const reason = ladderV14BuyGuard(this.getMarketExecutionSnapshot(opportunity.event.slug), opportunity, orderId, this.config);
       if (reason) return { dryRun: this.config.dryRun, accepted: false, tokenId: opportunity.token.tokenId,
         side: "BUY", price: opportunity.price, size: opportunity.size,
         response: { status: "rejected", reason } };

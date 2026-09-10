@@ -4,7 +4,7 @@ import {
   exactKalshiDepthProceeds,
   exactKalshiOrderFee,
 } from "./kalshi-fees.js";
-import { ladderV14Inventory } from "./ladder-v14-inventory.js";
+import { ladderV14Inventory, ladderV14ExposureSize } from "./ladder-v14-inventory.js";
 import {
   ladderV14DistancePenalty,
   ladderV14EffectiveFlow,
@@ -507,6 +507,11 @@ function selectVolumeFirstTargets(
       return { selected, bestEvaluated };
     }
   }
+  quantity = Math.min(...books.map((book, index) => ladderV14ExposureSize(
+    config, snapshot, book.tokenId, prices[index]!, quantity)));
+  if (quantity <= EPSILON || books.some(book => quantity + EPSILON < book.minOrderSize)) {
+    return { selected, bestEvaluated };
+  }
   for (let sideIndex = 0; sideIndex < 2; sideIndex += 1) {
     const book = books[sideIndex]!;
     const opposite = books[1 - sideIndex]!;
@@ -569,8 +574,9 @@ function selectOpeningTargets(
     const book = books[sideIndex]!;
     const opposite = books[1 - sideIndex]!;
     let sweepPrefix = 0;
+    let sweepCost = 0;
     for (const price of makerPrices(book, tick)) {
-      const breakpoints = quantityBreakpoints(
+      const reachable = quantityBreakpoints(
         config,
         event,
         book,
@@ -581,6 +587,10 @@ function selectOpeningTargets(
         tick,
         features,
       );
+      const limit = ladderV14ExposureSize(config, snapshot, book.tokenId, price,
+        reachable.at(-1) ?? 0, sweepPrefix, sweepCost);
+      const breakpoints = [...new Set(reachable.map(size => Math.min(size, limit)))]
+        .filter(size => size > EPSILON && size + EPSILON >= book.minOrderSize);
       let previousValue = 0;
       let best: LadderV14Candidate | null = null;
       let marginalChainPositive = true;
@@ -634,6 +644,10 @@ function selectOpeningTargets(
         );
         selected.push(best);
         sweepPrefix += best.size;
+        sweepCost += best.size * price + exactKalshiOrderFee({
+          price, size: best.size, rate: snapshot.makerFeeRate ?? config.kalshiMakerFeeRate,
+          exponent: snapshot.takerFeeExponent,
+        });
       }
     }
   }

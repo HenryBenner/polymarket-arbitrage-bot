@@ -190,6 +190,7 @@ export interface BotConfig {
   ladderV14PseudoFlowDepthFraction: number;
   ladderV14QuantityQueueWeight: number;
   ladderV14ReachabilityMultiplier: number;
+  ladderV14LifecycleEvEnabled: boolean;
   ladderV14VolumeFirstMode: boolean;
   ladderV14CycleShares: number;
   ladderV14MaxUnpairedCost: number;
@@ -451,6 +452,7 @@ export function loadConfig(): BotConfig {
       "LADDER_V14_REACHABILITY_MULTIPLIER",
       1.5,
     ),
+    ladderV14LifecycleEvEnabled: envBoolean("LADDER_V14_LIFECYCLE_EV_ENABLED", true),
     ladderV14VolumeFirstMode: envBoolean(
       "LADDER_V14_VOLUME_FIRST_MODE",
       true,

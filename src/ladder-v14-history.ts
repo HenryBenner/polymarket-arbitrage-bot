@@ -1,5 +1,8 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { LadderV14LifecycleModel, type LifecycleState, type LifecycleEpisode, sizeBucket as sizeBucketForSubmitted, entryBucket as entryBucketForActual } from "./ladder-v14-lifecycle-ev.js";
+import { ladderV14Inventory } from "./ladder-v14-inventory.js";
+import { residualHoldValue } from "./ladder-v14.js";
 import { v14LifecycleReport, type V14LifecycleReport } from "./ladder-v14-report.js";
 import type { BotConfig } from "./config.js";
 import {
@@ -53,6 +56,7 @@ interface Exposure {
 
 interface HistoryState {
   version: 1;
+  lifecycle?: LifecycleState;
   model: LadderV14ModelState;
   planned: Array<[string, LadderV14PlacementContext]>;
   active: Array<[string, Exposure]>;
@@ -103,6 +107,8 @@ function standardDeviation(window: MidWindow): number {
  */
 export class LadderV14HistoryStore {
   readonly model: LadderV14ConditionalModel;
+  readonly lifecycle: LadderV14LifecycleModel;
+  onLifecycleRecord?: (row: Record<string, unknown>) => void;
   private readonly path: string;
   private readonly planned: Map<string, LadderV14PlacementContext>;
   private readonly active: Map<string, Exposure>;
@@ -122,6 +128,12 @@ export class LadderV14HistoryStore {
     state?: Partial<HistoryState>,
   ) {
     this.path = path;
+    this.lifecycle = new LadderV14LifecycleModel(state?.lifecycle);
+    if (!state?.lifecycle) {
+      // Historical reports already contributed to the economic calibration.
+      // Migration must not count them as newly settled post-update markets.
+      this.lifecycle.state.finalized = (state?.lifecycleReports ?? []).filter(r=>r.settledPnl !== null).map(r=>r.marketSlug);
+    }
     this.model = new LadderV14ConditionalModel(
       ladderV14Parameters({
         priorStrength: config.ladderV14PriorStrength,
@@ -259,6 +271,17 @@ export class LadderV14HistoryStore {
     nowMs = Date.now(),
   ): void {
     let changed = false;
+    if (this.config.ladderV14LifecycleEvEnabled &&
+      (event.market.seriesTicker ?? event.slug.split("-")[0]).toUpperCase() === "KXBTC15M") {
+      for (const [key, placement] of Object.entries(plan.placementContexts)) {
+        if (placement.lifecycle && !this.lifecycle.state.openings[key]) {
+          this.lifecycle.state.openings[key] = placement.lifecycle;
+
+        }
+      }
+      this.observeLifecycle(snapshot, nowMs, event.windowEnd);
+      changed = true;
+    }
     for (const [tradeKey, placement] of Object.entries(plan.placementContexts)) {
       this.planned.set(tradeKey, structuredClone(placement));
       changed = true;
@@ -275,6 +298,133 @@ export class LadderV14HistoryStore {
       }
     }
     if (changed) this.schedulePersist();
+  }
+
+  /** Replay only newly confirmed fills. Prefix inventory gives exact FIFO residual lots,
+   * including multiple fills delivered between planning passes and side flips. */
+  private observeLifecycle(
+    snapshot: MarketExecutionSnapshot,
+    nowMs: number,
+    endSeconds: number,
+  ): void {
+    const state = this.lifecycle.state,
+      slug = snapshot.marketSlug;
+    if (state.finalized.includes(slug)) return;
+    const processed = new Set(state.processed[slug] ?? []);
+    const orders = new Map(
+      snapshot.orders
+        .filter((o) => o.pairId?.startsWith("ladder-v14:"))
+        .map((o) => [o.id, o]),
+    );
+    const fills = [
+      ...new Map(
+        snapshot.fills
+          .filter((f) => orders.has(f.orderId))
+          .map((f) => [f.id, f]),
+      ).values(),
+    ].sort((a, b) => fillTimeMs(a, nowMs) - fillTimeMs(b, nowMs));
+    for (let i = 0; i < fills.length; i++) {
+      const fill = fills[i]!;
+      if (processed.has(fill.id)) continue;
+      const at = fillTimeMs(fill, nowMs) / 1000;
+      const before = { ...snapshot, fills: fills.slice(0, i) },
+        after = { ...snapshot, fills: fills.slice(0, i + 1) };
+      const oldInventory = ladderV14Inventory(before, at),
+        inventory = ladderV14Inventory(after, at);
+      let episode: LifecycleEpisode | undefined = state.active[slug];
+      if (episode) {
+        const priorReport = v14LifecycleReport(before, at * 1000),
+          report = v14LifecycleReport(after, at * 1000);
+        episode.ps +=
+          report.positivePairShares - priorReport.positivePairShares;
+        episode.pp += report.positivePairPnl - priorReport.positivePairPnl;
+        if ((fill.side ?? "BUY") === "SELL") episode.sold = true;
+        if (
+          report.negativePairShares - priorReport.negativePairShares >
+          EPSILON
+        )
+          episode.negative = true;
+        const flipped =
+          inventory.episode &&
+          inventory.episode.surplusTokenId !== episode.token;
+        if (inventory.unpairedShares <= EPSILON || flipped) {
+          const outcome = flipped
+            ? "c"
+            : episode.negative
+              ? "n"
+              : episode.sold
+                ? "s"
+                : episode.ps > EPSILON
+                  ? "p"
+                  : "c";
+          this.onLifecycleRecord?.(this.lifecycle.close(episode, at, outcome));
+          episode = undefined;
+        }
+      }
+      const order = orders.get(fill.orderId)!;
+      if (
+        !episode &&
+        inventory.unpairedShares > EPSILON &&
+        inventory.episode &&
+        ((oldInventory.unpairedShares <= EPSILON &&
+          order.pairId === "ladder-v14:opening" &&
+          (fill.side ?? "BUY") === "BUY") ||
+          (oldInventory.episode &&
+            oldInventory.episode.surplusTokenId !==
+              inventory.episode.surplusTokenId))
+      ) {
+        const book = snapshot.books.find(
+          (b) => b.tokenId === inventory.episode!.surplusTokenId,
+        )!;
+        const basis = inventory.residualEntryBasis!;
+        const admission =
+          state.openings[order.tradeKey] ??
+          this.lifecycle.evaluate(
+            basis,
+            order.originalSize,
+            endSeconds - at,
+            book.minOrderSize,
+          );
+        state.active[slug] = {
+          m: slug,
+          s: book.outcome.toLowerCase(),
+          token: book.tokenId,
+          t: at,
+          p: basis,
+          shares: inventory.unpairedShares,
+          q: order.originalSize,
+          originalQuantity: admission.baselineQuantity,
+          h: Math.max(0, endSeconds - at),
+          q0: admission.qOpen,
+          entryBucket: entryBucketForActual(basis),
+          sizeBucket: sizeBucketForSubmitted(order.originalSize),
+          g: null,
+          ps: 0,
+          pp: 0,
+          negative: false,
+          sold: false,
+        };
+      } else if (
+        episode &&
+        (fill.side ?? "BUY") === "BUY" &&
+        fill.tokenId === episode.token
+      ) {
+        episode.shares += fill.size;
+      }
+      processed.add(fill.id);
+    }
+    state.processed[slug] = [...processed];
+    const episode = state.active[slug];
+    if (episode && episode.g === null && snapshot.marketDataValid !== false) {
+      const held = snapshot.books.find((b) => b.tokenId === episode.token),
+        opposite = snapshot.books.find((b) => b.tokenId !== episode.token);
+      const hold = held && opposite ? residualHoldValue(held, opposite) : null;
+      const basis = ladderV14Inventory(
+        snapshot,
+        nowMs / 1000,
+      ).residualEntryBasis;
+      if (hold !== null && basis !== null) episode.g = basis - hold;
+    }
   }
 
   private observeOrders(snapshot: MarketExecutionSnapshot, nowMs: number): boolean {
@@ -403,6 +553,22 @@ export class LadderV14HistoryStore {
   }
 
   finalize(snapshot: MarketExecutionSnapshot, nowMs = Date.now()): void {
+    const btc = this.config.exchange === "kalshi" &&
+      (snapshot.marketSlug.toLowerCase().startsWith("btc-") || snapshot.marketSlug.toUpperCase().startsWith("KXBTC15M"));
+    if (this.config.ladderV14LifecycleEvEnabled && btc && !this.lifecycle.state.finalized.includes(snapshot.marketSlug)) {
+      const match = /-updown-(\d+)m-(\d+)$/.exec(snapshot.marketSlug);
+      const end = match ? Number(match[2])+Number(match[1])*60 : nowMs/1000;
+      this.observeLifecycle(snapshot,nowMs,end);
+      const report=v14LifecycleReport(snapshot,Math.min(nowMs,end*1000));
+      const episode=this.lifecycle.state.active[snapshot.marketSlug];
+      if (episode) this.onLifecycleRecord?.(this.lifecycle.close(episode,Math.min(nowMs/1000,end),snapshot.settledPnl === null ? "c" : "r",
+        report.endingUnpairedShares,report.settlementResidualPnl ?? 0));
+      if (snapshot.settledPnl !== null) this.lifecycle.settle(snapshot.marketSlug,{
+        positivePairPnl:report.positivePairPnl,positivePairShares:report.positivePairShares,
+        residualNetPnl:report.settlementResidualPnl ?? 0,residualShares:report.endingUnpairedShares});
+      for(const order of snapshot.orders) delete this.lifecycle.state.openings[order.tradeKey];
+      this.onLifecycleRecord?.({e:"v14_summary",btcLifecycle:this.lifecycle.summary()});
+    }
     if (!this.lifecycleReports.has(snapshot.marketSlug)) {
       const match = /-updown-(\d+)m-(\d+)$/.exec(snapshot.marketSlug);
       const endMs = match ? (Number(match[2]) + Number(match[1]) * 60) * 1000 : nowMs;
@@ -461,6 +627,7 @@ export class LadderV14HistoryStore {
     this.dirty = false;
     const state: HistoryState = {
       version: 1,
+      lifecycle: this.lifecycle.toJSON(),
       model: this.model.toJSON(),
       planned: [...this.planned],
       active: [...this.active],

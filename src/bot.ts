@@ -287,6 +287,10 @@ export class ReverseBot {
           ? join(this.config.paperStatePath, ".runtime") : this.config.paperStatePath,
         this.config,
       );
+      this.ladderV14History.onLifecycleRecord = row => {
+        this.trader.recordPaperStrategyEvent?.(row);
+        this.trader.recordPaperStrategyEvent?.({e:"v14_summary",btcLifecycle:this.ladderV14History!.lifecycle.summary()});
+      };
     }
   }
 
@@ -1746,7 +1750,9 @@ export class ReverseBot {
         this.ladderV14History.model,
         this.ladderV14History.marketFeatures(event, snapshot),
         nowSeconds,
+        this.ladderV14History.lifecycle,
       );
+      if(this.config.ladderV14LifecycleEvEnabled) this.trader.recordPaperStrategyEvent?.({e:"v14_summary",btcLifecycle:this.ladderV14History.lifecycle.summary()});
       // Observe existing orders now. Save a proposed placement context only
       // when that exact mutation wins the global allocator below.
       this.ladderV14History.observe(
@@ -1754,7 +1760,7 @@ export class ReverseBot {
         snapshot,
         { ...plan, placementContexts: {} },
       );
-      for (const decision of plan.residualDecisions) {
+      for (const decision of (this.config.ladderV14LifecycleEvEnabled && event.market.seriesTicker === "KXBTC15M" && this.config.paperLogLevel !== "debug" ? [] : plan.residualDecisions)) {
         this.trader.recordPaperStrategyEvent?.({
           t: Math.round(nowSeconds * 1_000), m: event.slug,
           side: decision.context.side.toLowerCase(), qty: decision.size,
@@ -1810,7 +1816,7 @@ export class ReverseBot {
     }
 
     const amendments = planned.flatMap((entry) =>
-      entry.plan.amendments.flatMap((amendment) => {
+      entry.plan.amendments.flatMap<{entry: typeof entry; amendment: LadderV14Plan["amendments"][number]; placement: LadderV14PlacementContext | undefined; releasedCash: number; score: number}>((amendment) => {
         const candidate = entry.plan.candidates.find((item) =>
           item.tokenId === amendment.opportunity.token.tokenId &&
           Math.abs(item.price - amendment.opportunity.price) <= 1e-8,
@@ -1856,6 +1862,7 @@ export class ReverseBot {
                 placement: {
                   kind: "fill" as const,
                   context: option.context,
+                  lifecycle: candidate.lifecycle,
                 },
                 releasedCash: currentOrder.limitPrice * currentOrder.remainingSize,
                 score: candidate.selectionMode === "volume"

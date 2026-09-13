@@ -274,10 +274,20 @@ Implementation:
 V14 is a Kalshi 15-minute crypto pair-collection and inventory-learning engine.
 It can run BTC, ETH, SOL, or any other configured `KX<ASSET>15M` series.
 
-V14 currently defaults to bootstrap collection mode with
-`LADDER_V14_VOLUME_FIRST_MODE=true`. In this mode the statistical engine runs
-in shadow: it records fill, completion, and failed-exit behavior but does not
-gate entries. The live quote policy posts exactly two near-touch maker orders:
+V14 defaults to `LADDER_V14_VOLUME_FIRST_MODE=true` and
+`LADDER_V14_LIFECYCLE_EV_ENABLED=true`. BTC openings use the dedicated
+[historically calibrated lifecycle EV gate](docs/ladder-v14-lifecycle-ev.md): each
+side independently rejects, probes at up to 10 shares, or keeps normal liquidity
+sizing. BTC repairs prioritize profitable exact taker depth, keep maker pairs
+positive, and allow losses only through the normal economic comparison by the
+configured margin. Age, adverse gap, size and cleanup cannot force a loss.
+The first valid adverse gap is frozen for risk classification; sufficient
+statistics and compact episode records persist across restart. The paper example
+selects BTC only; ETH/SOL keep their current models and behavior.
+
+The legacy behavior below applies to ETH/SOL and to BTC with lifecycle EV
+disabled. In legacy volume-first mode the conditional engine runs in shadow
+and the quote policy posts two near-touch maker orders:
 one Up order and one Down order whose combined raw
 price targets 98c. The exact price split keeps both quotes as close to their
 respective touches as possible. Prices are calculated on integer ticks.
@@ -344,7 +354,7 @@ is unchanged. Waiting longer preserves the chance of a profitable completion
 but can increase the eventual residual loss; these changes are not a validated
 profit guarantee. See [the supplied-run diagnosis](docs/v14-run-analysis-2026-09-03.md).
 
-Set `LADDER_V14_VOLUME_FIRST_MODE=false` to enable the stricter marginal-EV
+Disable lifecycle EV for BTC and set `LADDER_V14_VOLUME_FIRST_MODE=false` to enable the stricter marginal-EV
 entry and residual optimizer. For every passive price and economically distinct
 quantity breakpoint that optimizer estimates the conditional lifecycle value
 

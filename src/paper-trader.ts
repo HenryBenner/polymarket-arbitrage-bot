@@ -331,7 +331,15 @@ export class PaperTrader implements OrderExecutor {
   }
 
   recordPaperStrategyEvent(event: Record<string, unknown>): void {
-    this.runLog?.residual(event);
+    if (event.e === "v14_ep") this.runLog?.trade(event);
+    else if (event.e === "v14_summary") this.runLog?.lifecycleSummary(event.btcLifecycle as Record<string, unknown>);
+    else if (!this.skinnyLifecycleBtc(String(event.m))) this.runLog?.residual(event);
+  }
+
+  private skinnyLifecycleBtc(slug: string): boolean {
+    return this.config.exchange === "kalshi" && this.config.strategyMode === "ladder_v14" &&
+      this.config.ladderV14LifecycleEvEnabled && this.config.paperLogLevel === "normal" &&
+      /^btc-|^KXBTC15M/i.test(slug);
   }
 
   async observeMarket(event: UpDownEvent, books: TokenBook[]): Promise<void> {
@@ -2084,7 +2092,7 @@ export class PaperTrader implements OrderExecutor {
       if (order.status === "open" || order.status === "partial") {
         order.status = "cancelled";
         this.refreshOpenOrder(order);
-        if (order.originalSize - order.remainingSize <= 1e-8 && order.pairId?.includes("opening")) this.runLog?.trade({
+        if (!this.skinnyLifecycleBtc(order.marketSlug) && order.originalSize - order.remainingSize <= 1e-8 && order.pairId?.includes("opening")) this.runLog?.trade({
           t: Date.now(), m: order.marketSlug, e: "order_cancelled_important",
           side: order.outcome.toLowerCase(), px: order.limitPrice, qty: order.remainingSize,
           role: order.pairId?.includes("opening") ? "opening" : "repair",
@@ -2147,13 +2155,14 @@ export class PaperTrader implements OrderExecutor {
         side: fill.outcome.toLowerCase(), px: fill.price, qty: fill.size, fee: fill.fee,
         liq: fill.liquidity, role, order: fill.orderId.replace(/^paper-/, "").slice(0, 12) });
     } else if (type === "order_submitted" && order &&
+      !this.skinnyLifecycleBtc(order.marketSlug) &&
       (role === "opening" || (role === "repair" && order.orderPolicy === "post_only"))) {
       this.runLog?.trade({ t: Date.parse(order.createdAt), m: order.marketSlug,
         e: role === "opening" ? "opening_submitted" : "repair_maker_submitted",
         side: order.outcome.toLowerCase(), px: order.limitPrice, qty: order.originalSize,
         role, order: order.id.replace(/^paper-/, "").slice(0, 12) });
     } else if (type === "order_cancelled" && order &&
-      (order.originalSize - order.remainingSize > 1e-8 || role === "repair")) {
+      (order.originalSize - order.remainingSize > 1e-8 || (role === "repair" && !this.skinnyLifecycleBtc(order.marketSlug)))) {
       this.runLog?.trade({ t: Date.now(), m: order.marketSlug, e: "order_cancelled_important",
         side: order.outcome.toLowerCase(), px: order.limitPrice, qty: order.remainingSize,
         role, order: order.id.replace(/^paper-/, "").slice(0, 12) });

@@ -10,6 +10,9 @@ const clean = (row: Record<string, unknown>) => Object.fromEntries(Object.entrie
 
 export class PaperRunLog {
   readonly runId: string;
+  private btcLifecycle?: Record<string,unknown>;
+  private summaryWrites: Promise<void> = Promise.resolve();
+  lifecycleSummary(summary: Record<string,unknown>): void { this.btcLifecycle=summary; }
   private trades!: AppendOnlyJsonl;
   private markets!: AppendOnlyJsonl;
   private startedAt = new Date().toISOString();
@@ -117,7 +120,13 @@ export class PaperRunLog {
   amendment(): void { this.health.orderAmendments++; }
   error(): void { this.health.errors++; }
 
-  async writeSummary(endedAt?: string): Promise<void> {
+  writeSummary(endedAt?: string): Promise<void> {
+    const operation = () => this.writeSummaryOnce(endedAt);
+    this.summaryWrites = this.summaryWrites.then(operation, operation);
+    return this.summaryWrites;
+  }
+
+  private async writeSummaryOnce(endedAt?: string): Promise<void> {
     const sum = (key: string) => this.marketRows.reduce((total, row) => total + Number(row[key] ?? 0), 0);
     const pnls = this.marketRows.map(row => Number(row.pnl ?? 0)).sort((a, b) => a - b);
     const residual = sum("residualPnl"), paired = sum("pairedPnl"), opening = sum("openingShares");
@@ -136,7 +145,7 @@ export class PaperRunLog {
         n: selected.length, avgEstimate: selected.length ? n(selected.reduce((s, r) => s + Number(r.avgHoldEstimate), 0) / selected.length) : null,
         wins, winRate: selected.length ? n(wins / selected.length) : null };
     });
-    const summary = { runId: this.runId, version: "compact-paper-v1", startedAt: this.startedAt,
+    const summary = { btcLifecycle:this.btcLifecycle, runId: this.runId, version: "compact-paper-v1", startedAt: this.startedAt,
       ...(endedAt ? { endedAt } : {}), markets: this.marketRows.length,
       pnl: { totalPnl: n(sum("pnl")), pairedPnl: n(paired), residualPnl: n(residual), fees: n(sum("fees")),
         pairProfitToResidualLossRatio: residual < 0 ? n(Math.max(0, paired) / Math.abs(residual)) : null },

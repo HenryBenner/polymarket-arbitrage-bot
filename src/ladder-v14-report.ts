@@ -9,7 +9,9 @@ export function v14LifecycleReport(snapshot: MarketExecutionSnapshot, endMs: num
     order.pairId?.startsWith("ladder-v14:")).map(order => [order.id, order]));
   const fills = [...new Map(snapshot.fills.filter(fill => orders.has(fill.orderId))
     .map(fill => [fill.id, fill])).values()].sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
-  const lots: Array<{ token: string; size: number; cost: number; opening: boolean; taker: boolean }> = [];
+  const lots: Array<{ token: string; size: number; cost: number; opening: boolean; taker: boolean; forced: boolean }> = [];
+  let positivePairPnl = 0, positivePairShares = 0;
+  let negativePairShares = 0;
   let openingPairPnl = 0, makerRepairPairPnl = 0, takerRepairPairPnl = 0;
   let takerHedgeLosses = 0, residualSalePnl = 0, residualSaleLosses = 0;
   let unpairedSeconds = 0, unpairedShareSeconds = 0, episodes = 0;
@@ -47,6 +49,8 @@ export function v14LifecycleReport(snapshot: MarketExecutionSnapshot, endMs: num
     for (const lot of eligible) {
       const size = Math.min(remaining, lot.size);
       const pnl = size * (selling ? allIn - lot.cost : 1 - allIn - lot.cost);
+      if (!selling && pnl < -1e-8 && size > 1e-8) negativePairShares += size;
+      if (!selling && pnl > 1e-8 && !order.tradeKey.includes(":guard:") && !lot.forced) { positivePairPnl += pnl; positivePairShares += size; }
       if (selling) {
         soldResidualShares += size;
         residualSalePnl += pnl;
@@ -62,7 +66,7 @@ export function v14LifecycleReport(snapshot: MarketExecutionSnapshot, endMs: num
       if (remaining <= 1e-8) break;
     }
     if (!selling && remaining > 1e-8) lots.push({ token: fill.tokenId,
-      size: remaining, cost: allIn, opening, taker });
+      size: remaining, cost: allIn, opening, taker, forced: order.tradeKey.includes(":guard:") });
     const quantity = lots.reduce((sum, lot) => sum + lot.size, 0);
     maxResidualShares = Math.max(maxResidualShares, quantity);
     if (priorQuantity <= 1e-8 && quantity > 1e-8) episodes++;
@@ -72,6 +76,8 @@ export function v14LifecycleReport(snapshot: MarketExecutionSnapshot, endMs: num
   const pairedPnl = openingPairPnl + makerRepairPairPnl + takerRepairPairPnl;
   return {
     marketSlug: snapshot.marketSlug, asOf: new Date(endMs).toISOString(),
+    positivePairPnl, positivePairShares,
+    negativePairShares,
     openingPairPnl, makerRepairPairPnl, takerRepairPairPnl, pairedPnl,
     takerHedgeLosses, residualSalePnl, residualSaleLosses,
     repairLosses: takerHedgeLosses + residualSaleLosses,

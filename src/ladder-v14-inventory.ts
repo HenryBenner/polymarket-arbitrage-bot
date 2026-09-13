@@ -266,7 +266,7 @@ export function ladderV14BuyGuard(
       reservedShares, reservedCost, opportunity.orderPolicy === "post_only") + EPSILON) {
       return "v14_unpaired_exposure_limit";
     }
-    if (!config.ladderV14VolumeFirstMode) return null;
+    if (!config.ladderV14VolumeFirstMode && !(config.exchange === "kalshi" && config.ladderV14LifecycleEvEnabled && /^btc-|^KXBTC15M/i.test(snapshot.marketSlug))) return null;
   }
   if (opportunity.pairId === "ladder-v14:opening") {
     if (inventory.unpairedShares > EPSILON) return "repair_only_while_unpaired";
@@ -286,6 +286,12 @@ export function ladderV14BuyGuard(
   if (opportunity.orderPolicy === "post_only" &&
     Math.abs(opportunity.size - inventory.unpairedShares) > EPSILON) {
     return "repair_maker_must_match_residual";
+  }
+  if (config?.exchange === "kalshi" && config.ladderV14LifecycleEvEnabled && /^btc-|^KXBTC15M/i.test(snapshot.marketSlug) &&
+    opportunity.orderPolicy === "post_only") {
+    const repairAllIn=opportunity.price+exactKalshiOrderFee({price:opportunity.price,size:opportunity.size,
+      rate:snapshot.makerFeeRate ?? config.kalshiMakerFeeRate,exponent:snapshot.takerFeeExponent})/opportunity.size;
+    if(inventory.currentResidualLots.some(lot=>1-lot.allInPrice-repairAllIn<=EPSILON)) return "v14_negative_maker_pair";
   }
   return null;
 }

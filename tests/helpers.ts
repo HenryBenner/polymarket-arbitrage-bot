@@ -85,6 +85,7 @@ export function testConfig(overrides: Partial<BotConfig> = {}): BotConfig {
     ladderV14PseudoFlowDepthFraction: 1,
     ladderV14QuantityQueueWeight: 1,
     ladderV14ReachabilityMultiplier: 1.5,
+    ladderV14LifecycleEvEnabled: false,
     ladderV14VolumeFirstMode: false,
     ladderV14CycleShares: 10,
     ladderV14MaxUnpairedCost: 125,

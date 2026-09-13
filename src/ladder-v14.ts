@@ -1,3 +1,4 @@
+import { LadderV14LifecycleModel, type Admission } from "./ladder-v14-lifecycle-ev.js";
 import type { BotConfig } from "./config.js";
 import {
   exactKalshiDepthCost,
@@ -34,6 +35,7 @@ export interface LadderV14MarketFeatures {
 }
 
 export interface LadderV14Candidate {
+  lifecycle?: Admission;
   selectionMode: "ev" | "volume";
   priorityScore: number;
   tokenId: string;
@@ -70,6 +72,8 @@ export interface LadderV14Amendment {
 }
 
 export interface LadderV14ResidualDecision {
+  qRepair?: number | null;
+  lifecycleRisk?: "poor" | "borderline" | "healthy" | null;
   action: "hedge" | "sell" | "wait" | "hold";
   holdValue?: number | null;
   reason?: string;
@@ -81,6 +85,7 @@ export interface LadderV14ResidualDecision {
 }
 
 export interface LadderV14PlacementContext {
+  lifecycle?: Admission;
   kind: "fill" | "completion" | "failed_exit";
   context: LadderV14ConditionalContext;
 }
@@ -931,7 +936,8 @@ function planVolumeFirstRepair(
   const missing = books.find((book) => book.tokenId !== surplus.tokenId)!;
   const open = snapshot.openOrders.filter(isV14Order);
   const quantity = inventory.unpairedShares;
-  const entry = inventory.unpairedCost / quantity;
+  const lifecycle = config.ladderV14LifecycleEvEnabled && series(event) === "KXBTC15M";
+  const entry = lifecycle ? inventory.residualEntryBasis! : inventory.unpairedCost / quantity;
   const finalCleanupAtMs =
     (event.windowEnd - config.ladderV14FinalCleanupSeconds) * 1_000;
   const episodeStartedAtMs = Date.parse(episode.residualStartedAt);
@@ -943,7 +949,7 @@ function planVolumeFirstRepair(
   const positiveEdge = preserveSeconds <= 0 ? 0 : normalEdge * Math.max(0,
     1 - Math.max(0, age - preserveSeconds) /
       (config.ladderV14RepairMaxWaitSeconds - preserveSeconds));
-  const requiredEdge = config.ladderV14ValueRepair && age >= config.ladderV14RepairMaxWaitSeconds
+  const requiredEdge = !lifecycle && config.ladderV14ValueRepair && age >= config.ladderV14RepairMaxWaitSeconds
     ? -Math.min(0.02, 0.01 * (age - config.ladderV14RepairMaxWaitSeconds) / 60)
     : positiveEdge;
   const nextRelaxationMs = age < preserveSeconds
@@ -965,6 +971,102 @@ function planVolumeFirstRepair(
   if (open.some((order) => order.pairId !== `${V14_PREFIX}${makerRole}`)) {
     return { ...result, cancelOrderIds: open.map((order) => order.id),
       managementStage: "volume-first-repair-cancel-opening-grid" };
+  }
+
+  if (lifecycle) {
+    // Marginal FIFO residual lots and exact depth/rounded fees. Take profitable
+    // executable prefixes before estimating continuation, even at final cleanup.
+    let prefix = 0,
+      worstBasis = 0,
+      profitable = 0;
+    const asks = missing.asks
+      .filter(
+        (level) =>
+          Number.isFinite(level.price) &&
+          level.price > 0 &&
+          level.price < 1 &&
+          Number.isFinite(level.size) &&
+          level.size > 0,
+      )
+      .sort((a, b) => a.price - b.price);
+    const available = asks.reduce((sum, level) => sum + level.size, 0);
+    const depthFor = (size: number) =>
+      exactKalshiDepthCost({
+        levels: asks,
+        size,
+        rate: snapshot.takerFeeRate,
+        exponent: snapshot.takerFeeExponent,
+      });
+    for (const lot of inventory.currentResidualLots) {
+      worstBasis = Math.max(worstBasis, lot.allInPrice);
+      // Nonnegative fees cannot rescue an already losing best raw ask.
+      if (!asks[0] || 1 - worstBasis - asks[0].price <= EPSILON) break;
+      const upper =
+        Math.floor(Math.min(prefix + lot.size, quantity, available) * 100) /
+        100;
+      const good = (size: number) => {
+        const depth = depthFor(size);
+        return !!depth && 1 - worstBasis - depth.total / size > EPSILON;
+      };
+      if (upper <= prefix) break;
+      if (good(upper)) {
+        profitable = upper;
+        prefix = upper;
+        continue;
+      }
+      // Fee rounding can make very small prefixes nonmonotone; search exact
+      // legal cent quantities for this boundary lot (exposure cap is 250).
+      for (
+        let cents = Math.floor(upper * 100);
+        cents > Math.floor(prefix * 100);
+        cents--
+      ) {
+        if (good(cents / 100)) {
+          profitable = cents / 100;
+          break;
+        }
+      }
+      break;
+    }
+    if (profitable + EPSILON >= missing.minOrderSize && profitable > EPSILON) {
+      if (open.length)
+        return {
+          ...result,
+          cancelOrderIds: open.map((o) => o.id),
+          managementStage: "lifecycle-cancel-before-profitable-completion",
+        };
+      const depth = depthFor(profitable)!;
+      const key = `${V14_PREFIX}${event.slug}:repair-taker:${episode.id}:q${profitable}:${Math.floor(nowSeconds * 1000)}`;
+      const context = contextFor(
+        config,
+        event,
+        missing,
+        entry,
+        profitable,
+        0,
+        0,
+        event.windowEnd - nowSeconds,
+        features,
+        { side: surplus.outcome },
+      );
+      return {
+        ...result,
+        managementStage: "lifecycle-profitable-taker-completion",
+        opportunities: [
+          opportunity(
+            event,
+            missing,
+            "BUY",
+            depth.limitPrice,
+            profitable,
+            "fak",
+            "repair-taker",
+            key,
+          ),
+        ],
+        placementContexts: { [key]: { kind: "completion", context } },
+      };
+    }
   }
 
   const askQuantity = Math.min(quantity, missing.asks.reduce((sum, level) =>
@@ -995,7 +1097,8 @@ function planVolumeFirstRepair(
     const fee = exactKalshiOrderFee({price, size: quantity,
       rate: snapshot.makerFeeRate ?? config.kalshiMakerFeeRate, exponent: snapshot.takerFeeExponent});
     const edge = 1 - entry - price - fee / quantity;
-    if ((config.ladderV14ValueRepair || edge > EPSILON) &&
+    const marginalBasis = lifecycle ? Math.max(...inventory.currentResidualLots.map(lot => lot.allInPrice)) : entry;
+    if ((!lifecycle || 1 - marginalBasis - price - fee / quantity > EPSILON) && (config.ladderV14ValueRepair || edge > EPSILON) &&
       edge + EPSILON >= requiredEdge) { makerPrice = price; break; }
   }
   const context = contextFor(config, event, missing, entry, quantity,
@@ -1040,11 +1143,12 @@ function planVolumeFirstRepair(
       Math.sqrt(horizon / Math.max(1, config.ladderV14VolatilityWindowSeconds));
     const waitValue = completionProbability * (makerCost === null ? executable : 1 - makerCost) +
       (1 - completionProbability) * Math.max(holdValue ?? 0, executable - downside, 0);
-    const profitableHedge = hedgeValue !== null && hedgeValue - entry > EPSILON;
+    const marginalBasis = lifecycle ? Math.max(...inventory.currentResidualLots.map(lot=>lot.allInPrice)) : entry;
+    const profitableHedge = hedgeValue !== null && hedgeValue - marginalBasis > EPSILON;
     const continuation = Math.max(holdValue ?? -Infinity, waiting ? waitValue : -Infinity);
-    const betterExit = bestExit > continuation + (waiting ? config.ladderV14RepairExitMargin : 0);
+    const betterExit = bestExit > continuation + (lifecycle || waiting ? config.ladderV14RepairExitMargin : 0);
     // Missing probability is not evidence that holding is worthless.
-    const mayExit = (waiting && profitableHedge) || (holdValue !== null && betterExit);
+    const mayExit = ((lifecycle || waiting) && profitableHedge) || (holdValue !== null && betterExit);
     action = Number.isFinite(bestExit) && mayExit
       ? hedgeValue !== null && (sellValue === null || hedgeValue + EPSILON >= sellValue)
         ? "hedge" : "sell"
@@ -1105,6 +1209,7 @@ function applyResidualSafeguard(
   features: LadderV14MarketFeatures, nowSeconds: number, normal: LadderV14Plan,
 ): LadderV14Plan {
   const episode = inventory.episode!;
+  if (config.ladderV14LifecycleEvEnabled && series(event) === "KXBTC15M") return normal;
   const basis = inventory.residualEntryBasis;
   const quantity = inventory.unpairedShares;
   if (basis === null || !Number.isFinite(basis) || basis <= 0) return normal;
@@ -1213,7 +1318,10 @@ export function planLadderV14(
     midpointByToken: {},
   },
   nowSeconds = Date.now() / 1_000,
+  lifecycleModel = new LadderV14LifecycleModel(),
 ): LadderV14Plan {
+  const volumeFirst = config.ladderV14VolumeFirstMode ||
+    (config.ladderV14LifecycleEvEnabled && series(event) === "KXBTC15M");
   const inventory = ladderV14Inventory(snapshot, nowSeconds);
   const open = snapshot.openOrders.filter(isV14Order);
   const base: LadderV14Plan = {
@@ -1246,21 +1354,27 @@ export function planLadderV14(
     return { ...base, cancelOrderIds: open.map((order) => order.id),
       managementStage: "market-expired" };
   }
-  if (config.ladderV14VolumeFirstMode && inventory.unpairedShares > EPSILON) {
-    return applyResidualSafeguard(config, event, snapshot, inventory, features, nowSeconds,
+  if (volumeFirst && inventory.unpairedShares > EPSILON) {
+    const repair = applyResidualSafeguard(config, event, snapshot, inventory, features, nowSeconds,
       { ...base, ...planVolumeFirstRepair(
       config, event, snapshot, books, features, nowSeconds,
     ) });
+    if(config.ladderV14LifecycleEvEnabled && series(event) === "KXBTC15M") {
+      const gap=lifecycleModel.state.active[event.slug]?.g ?? null;
+      const qRepair=lifecycleModel.repair(gap,secondsRemaining);
+      for(const decision of repair.residualDecisions) { decision.qRepair=qRepair; decision.lifecycleRisk=lifecycleModel.risk(qRepair); }
+    }
+    return repair;
   }
   if (
-    config.ladderV14VolumeFirstMode &&
+    volumeFirst &&
     secondsRemaining <= config.ladderV14FinalCleanupSeconds
   ) {
     return { ...base, cancelOrderIds: open.map((order) => order.id),
       managementStage: open.length > 0
         ? "volume-first-cancel-final-grid" : "volume-first-final-balanced" };
   }
-  if (!config.ladderV14VolumeFirstMode && inventory.unpairedShares > EPSILON) {
+  if (!volumeFirst && inventory.unpairedShares > EPSILON) {
     return applyResidualSafeguard(config, event, snapshot, inventory, features, nowSeconds,
       { ...base, ...planResidual(
       config, event, snapshot, books, features, model, nowSeconds,
@@ -1269,7 +1383,7 @@ export function planLadderV14(
 
   // A completed repair may still have a cancellation/in-flight remainder.
   // Do not treat it as a normal cycle order merely because its price matches.
-  if (config.ladderV14VolumeFirstMode &&
+  if (volumeFirst &&
     open.some((order) => order.pairId !== `${V14_PREFIX}opening`)) {
     return { ...base,
       cancelOrderIds: open.filter((order) => order.pairId !== `${V14_PREFIX}opening`)
@@ -1294,7 +1408,7 @@ export function planLadderV14(
     unfinishedCycleShares + EPSILON >= minimumCycleOrder
     ? unfinishedCycleShares
     : config.ladderV14CycleShares;
-  const openingSelection = config.ladderV14VolumeFirstMode
+  const openingSelection = volumeFirst
     ? selectVolumeFirstTargets(
         config,
         event,
@@ -1316,7 +1430,67 @@ export function planLadderV14(
         features,
         model,
       );
-  const candidates = config.ladderV14VolumeFirstMode
+  if (config.ladderV14LifecycleEvEnabled && series(event) === "KXBTC15M") {
+    openingSelection.selected = openingSelection.selected.filter(
+      (candidate) => {
+        const resting = snapshot.openOrders.find(
+          (o) =>
+            o.tokenId === candidate.tokenId &&
+            o.limitPrice === candidate.price &&
+            o.pairId === `${V14_PREFIX}opening`,
+        );
+        const prior = resting
+          ? lifecycleModel.state.openings[resting.tradeKey]
+          : undefined;
+        // A resting probe must retain the pre-probe size hazard on later ticks.
+        const baseline =
+          prior?.classification === "probe"
+            ? prior.baselineQuantity
+            : candidate.size;
+        const fee = exactKalshiOrderFee({
+          price: candidate.price,
+          size: baseline,
+          rate: snapshot.makerFeeRate ?? config.kalshiMakerFeeRate,
+          exponent: snapshot.takerFeeExponent,
+        });
+        const admission = lifecycleModel.evaluate(
+          candidate.price + fee / baseline,
+          baseline,
+          secondsRemaining,
+          books.find((b) => b.tokenId === candidate.tokenId)!.minOrderSize,
+        );
+        admission.quantity = Math.min(admission.quantity, candidate.size);
+        lifecycleModel.recordCandidate(
+          `${event.slug}|${candidate.tokenId}`,
+          candidate.price,
+          baseline,
+          admission,
+        );
+        candidate.lifecycle = admission;
+        if (admission.classification === "reject") return false;
+        candidate.size = admission.quantity;
+        candidate.context.quantity = admission.quantity;
+        candidate.pairProbability = admission.qOpen;
+        candidate.expectedValuePerShare = admission.ev;
+        candidate.expectedValue = candidate.marginalValue =
+          admission.ev * admission.quantity;
+        candidate.quantityOptions = [
+          {
+            size: candidate.size,
+            expectedValue: candidate.expectedValue,
+            marginalValue: candidate.marginalValue,
+            expectedValuePerShare: admission.ev,
+            expectedProfitRate: candidate.expectedProfitRate,
+            expectedExposureSeconds: candidate.expectedExposureSeconds,
+            context: candidate.context,
+          },
+        ];
+        return true;
+      },
+    );
+  }
+
+  const candidates = volumeFirst
     ? openingSelection.selected
     : openingSelection.selected.sort(
         (left, right) => right.expectedProfitRate - left.expectedProfitRate,
@@ -1363,7 +1537,7 @@ export function planLadderV14(
       "opening",
       tradeKey,
     );
-    base.placementContexts[tradeKey] = { kind: "fill", context: candidate.context };
+    base.placementContexts[tradeKey] = { kind: "fill", context: candidate.context, lifecycle: candidate.lifecycle };
     if (!existing) {
       base.opportunities.push(target);
     } else if (
@@ -1374,18 +1548,18 @@ export function planLadderV14(
     }
   }
   base.managementStage = base.amendments.length > 0
-    ? config.ladderV14VolumeFirstMode
+    ? volumeFirst
       ? "volume-first-amend-pair-grid"
       : "amend-target-grid"
     : base.opportunities.length > 0
-      ? config.ladderV14VolumeFirstMode
+      ? volumeFirst
         ? "volume-first-post-pair-grid"
         : "post-positive-marginal-ev-grid"
       : candidates.length > 0
-        ? config.ladderV14VolumeFirstMode
+        ? volumeFirst
           ? "volume-first-pair-grid-resting"
           : "target-grid-resting"
-        : config.ladderV14VolumeFirstMode
+        : volumeFirst
           ? "volume-first-no-valid-pair-grid"
           : "no-positive-marginal-ev";
   return base;
